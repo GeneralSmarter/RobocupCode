@@ -16,7 +16,7 @@
 const bool DEBUG_DRIVE = true;
 const bool DEBUG_TURN  = false;
 
-const char ROBOT_BUILD_LABEL[] = "V6-four-sector-fan";
+const char ROBOT_BUILD_LABEL[] = "V6.2b-direct-steering";
 
 // =====================================================
 // Bluetooth serial debug link
@@ -346,6 +346,22 @@ const int TURN_LEFT_RIGHT_SLOW_US = 1800;
 // Waypoints
 // =====================================================
 const float WAYPOINT_TOLERANCE_M = 0.06;
+const float WAYPOINT_LOOKAHEAD_M = 0.35;
+const float WAYPOINT_FINAL_APPROACH_M = 0.15;
+const float WAYPOINT_FINAL_SKIP_TURN_DEG = 15.0;
+const float WAYPOINT_STEER_SLOW_START_DEG = 5.0;
+const float WAYPOINT_PIVOT_TURN_DEG = 40.0;
+const float WAYPOINT_MIN_FORWARD_SCALE = 0.20;
+const float WAYPOINT_FINAL_MIN_FORWARD_SCALE = 0.40;
+const float WAYPOINT_STEER_GAIN_MULTIPLIER = 2.2;
+const float WAYPOINT_MAX_TURN_CORRECTION = 1400.0;
+const float WAYPOINT_TURN_US_PER_DEG = 8.0;
+const int WAYPOINT_MAX_TURN_US = 320;
+const unsigned long WAYPOINT_ACTION_PAUSE_MS = 250;
+const unsigned long WAYPOINT_HOME_PAUSE_MS = 250;
+const unsigned long WAYPOINT_TURN_SETTLE_MS = 25;
+const unsigned long TURN_SETTLE_MS = 75;
+const unsigned long DRIVE_COMPLETE_SETTLE_MS = 50;
 
 struct Waypoint {
   float x;

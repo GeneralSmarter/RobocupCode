@@ -98,7 +98,7 @@ void driveDistanceWithHeadingWallFallback(float distanceMetres, float targetHead
     if (avgTicks >= targetTicks) {
       stopMotors();
       updateOdometry();
-      delay(200);
+      delay(DRIVE_COMPLETE_SETTLE_MS);
       return;
     }
 
@@ -211,7 +211,7 @@ void driveDistanceWithHeading(float distanceMetres, float targetHeadingDeg) {
       Serial.println(readYawDeg());
       printPose();
 
-      delay(200);
+      delay(DRIVE_COMPLETE_SETTLE_MS);
       return;
     }
 
@@ -325,7 +325,7 @@ void driveDistanceWithHeadingNoAvoid(float distanceMetres, float targetHeadingDe
     if (avgTicks >= targetTicks) {
       stopMotors();
       updateOdometry();
-      delay(200);
+      delay(DRIVE_COMPLETE_SETTLE_MS);
       return;
     }
 

@@ -40,7 +40,7 @@ void turnAngle(float relativeTurnDeg) {
 
     if (absError <= TURN_TOLERANCE_DEG) {
       stopMotors();
-      delay(400);
+      delay(TURN_SETTLE_MS);
 
       robotTheta = readYawDeg();
 
@@ -49,7 +49,6 @@ void turnAngle(float relativeTurnDeg) {
       Serial.println(robotTheta);
       printPose();
 
-      delay(200);
       return;
     }
 

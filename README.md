@@ -134,6 +134,17 @@ avoidance has room to bypass and rejoin:
 - `(0.00, 0.80)` pause
 - `(0.00, 0.00)` home
 
+Normal waypoint travel uses lookahead steering: after any needed large initial
+turn, the robot keeps rolling while aiming at a short point up to `0.35 m`
+ahead on the line to the waypoint. Heading error is mixed directly into the
+left and right motor microsecond commands, and forward command is reduced as
+the error grows so medium corrections become steering arcs instead of
+stop-turn-drive steps.
+CSV logs include `event,waypoint_drive,lookahead` when a lookahead drive starts.
+Inside the final `0.15 m` of a waypoint, the robot skips small initial re-aim
+turns up to `15 deg`. Scripted waypoint `PAUSE` and `HOME` actions use short
+`250 ms` settles for route tests.
+
 ## Note
 
 This is a structural refactor, not a behavior rewrite. Known V3 issues from
