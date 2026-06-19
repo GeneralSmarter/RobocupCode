@@ -1,9 +1,116 @@
-﻿#include "Robot.h"
+#include "Robot.h"
 
 // =====================================================
 // TOF sensors
 // =====================================================
+const uint16_t TOF_NO_READING_MM = 9999;
+const uint16_t L0X_VALID_MAX_MM = 8191;
+
+static void updateFrontBlockState();
+
+static bool isPhysicalFanSensor(RangeSensorId id) {
+  return id == RANGE_RIGHT_OUTER ||
+         id == RANGE_RIGHT_INNER ||
+         id == RANGE_LEFT_INNER ||
+         id == RANGE_LEFT_OUTER;
+}
+
+static const char* fanModelName(RangeSensorId id) {
+  if (id == RANGE_RIGHT_OUTER || id == RANGE_LEFT_OUTER) {
+    return "VL53L0X";
+  }
+
+  return "VL53L1X";
+}
+
+static byte fanXshutPin(RangeSensorId id) {
+  switch (id) {
+    case RANGE_RIGHT_OUTER:
+      return RIGHT_OUTER_XSHUT;
+    case RANGE_RIGHT_INNER:
+      return RIGHT_INNER_XSHUT;
+    case RANGE_LEFT_INNER:
+      return LEFT_INNER_XSHUT;
+    case RANGE_LEFT_OUTER:
+      return LEFT_OUTER_XSHUT;
+    default:
+      return 255;
+  }
+}
+
+static uint8_t fanI2cAddress(RangeSensorId id) {
+  switch (id) {
+    case RANGE_RIGHT_OUTER:
+      return RIGHT_OUTER_ADDRESS;
+    case RANGE_RIGHT_INNER:
+      return RIGHT_INNER_ADDRESS;
+    case RANGE_LEFT_INNER:
+      return LEFT_INNER_ADDRESS;
+    case RANGE_LEFT_OUTER:
+      return LEFT_OUTER_ADDRESS;
+    default:
+      return 0;
+  }
+}
+
+static bool isValidL1XDistance(uint16_t distanceMm) {
+  return distanceMm >= FRONT_VALID_MIN_MM && distanceMm <= FRONT_VALID_MAX_MM;
+}
+
+static bool isValidL0XDistance(uint16_t distanceMm) {
+  return distanceMm >= FRONT_VALID_MIN_MM && distanceMm <= L0X_VALID_MAX_MM;
+}
+
+static unsigned long maxReadTime(unsigned long a, unsigned long b) {
+  return a > b ? a : b;
+}
+
+static bool isUsableAggregateReading(const RangeSensorState &sensor) {
+  if (sensor.valid) {
+    return true;
+  }
+
+  // VL53L1X can report very small values when an object is pressed close to
+  // the beam. Treat that as unsafe clearance even though it is below the
+  // normal calibrated distance window.
+  return sensor.distanceMm > 0 && sensor.distanceMm < FRONT_STOP_DISTANCE_MM;
+}
+
+static void combineFanAggregateSensor(RangeSensorId aggregateId, RangeSensorId innerId, RangeSensorId outerId) {
+  RangeSensorState &aggregate = rangeSensors[aggregateId];
+  RangeSensorState &inner = rangeSensors[innerId];
+  RangeSensorState &outer = rangeSensors[outerId];
+
+  bool innerUsable = isUsableAggregateReading(inner);
+  bool outerUsable = isUsableAggregateReading(outer);
+  bool anyValid = innerUsable || outerUsable;
+  uint16_t nearestMm = TOF_NO_READING_MM;
+
+  if (innerUsable && inner.distanceMm < nearestMm) {
+    nearestMm = inner.distanceMm;
+  }
+
+  if (outerUsable && outer.distanceMm < nearestMm) {
+    nearestMm = outer.distanceMm;
+  }
+
+  aggregate.distanceMm = anyValid ? nearestMm : TOF_NO_READING_MM;
+  aggregate.valid = anyValid;
+  aggregate.stale = !anyValid && (inner.stale || outer.stale);
+  aggregate.lastReadMs = maxReadTime(inner.lastReadMs, outer.lastReadMs);
+  aggregate.timeoutCount = inner.timeoutCount + outer.timeoutCount;
+  aggregate.invalidCount = inner.invalidCount + outer.invalidCount;
+}
+
+static void updateFanAggregateSensors() {
+  combineFanAggregateSensor(RANGE_RIGHT, RANGE_RIGHT_INNER, RANGE_RIGHT_OUTER);
+  combineFanAggregateSensor(RANGE_FRONT, RANGE_RIGHT_INNER, RANGE_LEFT_INNER);
+  combineFanAggregateSensor(RANGE_LEFT, RANGE_LEFT_INNER, RANGE_LEFT_OUTER);
+}
+
 static void syncLegacyTofGlobals() {
+  updateFanAggregateSensors();
+
   frontDistance = rangeSensors[RANGE_FRONT].distanceMm;
   leftDistance = rangeSensors[RANGE_LEFT].distanceMm;
   rightDistance = rangeSensors[RANGE_RIGHT].distanceMm;
@@ -36,14 +143,10 @@ static void setRangeSensorReading(RangeSensorId id, uint16_t distanceMm, bool va
 
 static void markRangeSensorTimeout(RangeSensorId id) {
   RangeSensorState &sensor = rangeSensors[id];
-  sensor.distanceMm = 9999;
+  sensor.distanceMm = TOF_NO_READING_MM;
   sensor.valid = false;
   sensor.stale = false;
   sensor.timeoutCount++;
-
-  if (id == RANGE_FRONT) {
-    sensor.blocked = true;
-  }
 
   syncLegacyTofGlobals();
   sendBluetoothEvent("tof_timeout", sensor.name);
@@ -56,32 +159,89 @@ static bool isTofStale(bool valid, unsigned long lastReadMs, unsigned long now) 
 static void updateTofStaleFlags() {
   unsigned long now = millis();
 
-  if (isTofStale(frontTofValid, lastFrontTofReadMs, now)) {
+  for (int i = 0; i < RANGE_SENSOR_COUNT; i++) {
+    RangeSensorId id = (RangeSensorId)i;
+
+    if (!isPhysicalFanSensor(id)) {
+      continue;
+    }
+
+    RangeSensorState &sensor = rangeSensors[id];
+    if (!isTofStale(sensor.valid, sensor.lastReadMs, now)) {
+      continue;
+    }
+
     stopMotors();
-    rangeSensors[RANGE_FRONT].valid = false;
-    rangeSensors[RANGE_FRONT].stale = true;
-    rangeSensors[RANGE_FRONT].blocked = true;
+    sensor.valid = false;
+    sensor.stale = true;
+
+    Serial.print(sensor.name);
+    Serial.println(" TOF stale. Motors stopped.");
+
     syncLegacyTofGlobals();
-    Serial.println("Front TOF stale. Motors stopped and front marked blocked.");
-    sendBluetoothEvent("tof_stale", rangeSensors[RANGE_FRONT].name);
+    sendBluetoothEvent("tof_stale", sensor.name);
   }
 
-  if (isTofStale(leftTofValid, lastLeftTofReadMs, now)) {
-    stopMotors();
-    rangeSensors[RANGE_LEFT].valid = false;
-    rangeSensors[RANGE_LEFT].stale = true;
-    syncLegacyTofGlobals();
-    Serial.println("Left TOF stale. Motors stopped.");
-    sendBluetoothEvent("tof_stale", rangeSensors[RANGE_LEFT].name);
-  }
+  updateFrontBlockState();
+}
 
-  if (isTofStale(rightTofValid, lastRightTofReadMs, now)) {
-    stopMotors();
-    rangeSensors[RANGE_RIGHT].valid = false;
-    rangeSensors[RANGE_RIGHT].stale = true;
-    syncLegacyTofGlobals();
-    Serial.println("Right TOF stale. Motors stopped.");
-    sendBluetoothEvent("tof_stale", rangeSensors[RANGE_RIGHT].name);
+static void connectL0XFanSensor(VL53L0X &sensor, RangeSensorId id) {
+  while (true) {
+    Serial.print("Starting ");
+    Serial.print(rangeSensors[id].name);
+    Serial.println(" VL53L0X...");
+
+    io.digitalWrite(fanXshutPin(id), HIGH);
+    delay(100);
+
+    sensor.setTimeout(100);
+
+    if (sensor.init()) {
+      sensor.setAddress(fanI2cAddress(id));
+      sensor.startContinuous(50);
+      setRangeSensorReading(id, TOF_NO_READING_MM, false);
+
+      Serial.print(rangeSensors[id].name);
+      Serial.print(" VL53L0X connected at 0x");
+      Serial.println(fanI2cAddress(id), HEX);
+      break;
+    }
+
+    Serial.print(rangeSensors[id].name);
+    Serial.println(" VL53L0X not detected. Retrying...");
+    io.digitalWrite(fanXshutPin(id), LOW);
+    delay(1000);
+  }
+}
+
+static void connectL1XFanSensor(VL53L1X &sensor, RangeSensorId id) {
+  while (true) {
+    Serial.print("Starting ");
+    Serial.print(rangeSensors[id].name);
+    Serial.println(" VL53L1X...");
+
+    io.digitalWrite(fanXshutPin(id), HIGH);
+    delay(100);
+
+    sensor.setTimeout(100);
+
+    if (sensor.init()) {
+      sensor.setAddress(fanI2cAddress(id));
+      sensor.setDistanceMode(VL53L1X::Long);
+      sensor.setMeasurementTimingBudget(50000);
+      sensor.startContinuous(50);
+      setRangeSensorReading(id, TOF_NO_READING_MM, false);
+
+      Serial.print(rangeSensors[id].name);
+      Serial.print(" VL53L1X connected at 0x");
+      Serial.println(fanI2cAddress(id), HEX);
+      break;
+    }
+
+    Serial.print(rangeSensors[id].name);
+    Serial.println(" VL53L1X not detected. Retrying...");
+    io.digitalWrite(fanXshutPin(id), LOW);
+    delay(1000);
   }
 }
 
@@ -98,131 +258,54 @@ void connectTOFSensors() {
     delay(1000);
   }
 
-  io.pinMode(FRONT_XSHUT, OUTPUT);
-  io.pinMode(LEFT_XSHUT, OUTPUT);
-  io.pinMode(RIGHT_XSHUT, OUTPUT);
+  const byte fanXshutPins[] = {
+    RIGHT_OUTER_XSHUT,
+    RIGHT_INNER_XSHUT,
+    LEFT_INNER_XSHUT,
+    LEFT_OUTER_XSHUT
+  };
 
-  io.digitalWrite(FRONT_XSHUT, LOW);
-  io.digitalWrite(LEFT_XSHUT, LOW);
-  io.digitalWrite(RIGHT_XSHUT, LOW);
+  for (unsigned int i = 0; i < sizeof(fanXshutPins) / sizeof(fanXshutPins[0]); i++) {
+    io.pinMode(fanXshutPins[i], OUTPUT);
+    io.digitalWrite(fanXshutPins[i], LOW);
+  }
+
   delay(100);
 
-  connectLeftTOF();
-  connectRightTOF();
-  connectFrontTOF();
+  connectRightOuterTOF();
+  connectRightInnerTOF();
+  connectLeftInnerTOF();
+  connectLeftOuterTOF();
 }
 
-void connectLeftTOF() {
-  while (true) {
-    Serial.println("Starting LEFT VL53L0X...");
-
-    io.digitalWrite(LEFT_XSHUT, HIGH);
-    delay(100);
-
-    leftTOF.setTimeout(100);
-
-    if (leftTOF.init()) {
-      leftTOF.setAddress(LEFT_L0_ADDRESS);
-      leftTOF.startContinuous(50);
-      setRangeSensorReading(RANGE_LEFT, 9999, false);
-
-      Serial.print("LEFT VL53L0X connected at 0x");
-      Serial.println(LEFT_L0_ADDRESS, HEX);
-      break;
-    }
-
-    Serial.println("LEFT VL53L0X not detected. Retrying...");
-    io.digitalWrite(LEFT_XSHUT, LOW);
-    delay(1000);
-  }
+void connectRightOuterTOF() {
+  connectL0XFanSensor(rightOuterTOF, RANGE_RIGHT_OUTER);
 }
 
-void connectRightTOF() {
-  while (true) {
-    Serial.println("Starting RIGHT VL53L0X...");
-
-    io.digitalWrite(RIGHT_XSHUT, HIGH);
-    delay(100);
-
-    rightTOF.setTimeout(100);
-
-    if (rightTOF.init()) {
-      rightTOF.setAddress(RIGHT_L0_ADDRESS);
-      rightTOF.startContinuous(50);
-      setRangeSensorReading(RANGE_RIGHT, 9999, false);
-
-      Serial.print("RIGHT VL53L0X connected at 0x");
-      Serial.println(RIGHT_L0_ADDRESS, HEX);
-      break;
-    }
-
-    Serial.println("RIGHT VL53L0X not detected. Retrying...");
-    io.digitalWrite(RIGHT_XSHUT, LOW);
-    delay(1000);
-  }
+void connectRightInnerTOF() {
+  connectL1XFanSensor(rightInnerTOF, RANGE_RIGHT_INNER);
 }
 
-void connectFrontTOF() {
-  while (true) {
-    Serial.println("Starting FRONT VL53L1X...");
-
-    io.digitalWrite(FRONT_XSHUT, HIGH);
-    delay(100);
-
-    if (frontTOF.init()) {
-      Serial.println("FRONT VL53L1X connected.");
-
-      frontTOF.setDistanceMode(VL53L1X::Long);
-      frontTOF.setMeasurementTimingBudget(50000);
-      frontTOF.startContinuous(50);
-      setRangeSensorReading(RANGE_FRONT, 9999, false);
-
-      break;
-    }
-
-    Serial.println("FRONT VL53L1X not detected. Retrying...");
-    io.digitalWrite(FRONT_XSHUT, LOW);
-    delay(1000);
-  }
+void connectLeftInnerTOF() {
+  connectL1XFanSensor(leftInnerTOF, RANGE_LEFT_INNER);
 }
 
-void updateTOFSensors() {
-  updateFrontTOF();
-  updateSideTOFSensors();
-  updateTofStaleFlags();
+void connectLeftOuterTOF() {
+  connectL0XFanSensor(leftOuterTOF, RANGE_LEFT_OUTER);
 }
 
-void updateFrontTOF() {
-  uint16_t rawDistance = frontTOF.read();
-
-  if (frontTOF.timeoutOccurred()) {
-    stopMotors();
-    markRangeSensorTimeout(RANGE_FRONT);
-    Serial.println("Front TOF timeout. Reconnecting...");
-    connectFrontTOF();
+static void updateFrontBlockState() {
+  if (!rangeSensors[RANGE_FRONT].valid) {
     frontBlockCounter = 0;
     frontClearCounter = 0;
-    return;
-  }
-
-  bool validFrontReading = rawDistance >= FRONT_VALID_MIN_MM && rawDistance <= FRONT_VALID_MAX_MM;
-
-  if (!validFrontReading) {
-    setRangeSensorReading(RANGE_FRONT, rawDistance, false);
-    frontBlockCounter = 0;
-    frontClearCounter = 0;
-
-    if (millis() - lastFrontInvalidPrintMs > 1000) {
-      Serial.print("Front TOF invalid reading ignored: ");
-      Serial.print(rawDistance);
-      Serial.println(" mm");
-      lastFrontInvalidPrintMs = millis();
+    if (!rangeSensors[RANGE_FRONT].blocked) {
+      rangeSensors[RANGE_FRONT].blocked = true;
+      syncLegacyTofGlobals();
+      Serial.println("FRONT BLOCKED: virtual front fan invalid.");
+      sendBluetoothEvent("front_blocked", "invalid");
     }
-
     return;
   }
-
-  setRangeSensorReading(RANGE_FRONT, rawDistance, true);
 
   if (!rangeSensors[RANGE_FRONT].blocked) {
     if (rangeSensors[RANGE_FRONT].distanceMm < FRONT_STOP_DISTANCE_MM) {
@@ -257,26 +340,48 @@ void updateFrontTOF() {
   }
 }
 
-void updateSideTOFSensors() {
-  uint16_t rawLeftDistance = leftTOF.readRangeContinuousMillimeters();
-  if (leftTOF.timeoutOccurred()) {
+static void updateL1XFanSensor(RangeSensorId id, VL53L1X &sensor, void (*reconnectSensor)()) {
+  uint16_t rawDistance = sensor.read();
+
+  if (sensor.timeoutOccurred()) {
     stopMotors();
-    markRangeSensorTimeout(RANGE_LEFT);
-    Serial.println("Left TOF timeout. Reconnecting...");
-    connectLeftTOF();
-  } else {
-    setRangeSensorReading(RANGE_LEFT, rawLeftDistance, true);
+    markRangeSensorTimeout(id);
+    Serial.print(rangeSensors[id].name);
+    Serial.println(" TOF timeout. Reconnecting...");
+    reconnectSensor();
+    return;
   }
 
-  uint16_t rawRightDistance = rightTOF.readRangeContinuousMillimeters();
-  if (rightTOF.timeoutOccurred()) {
+  bool validReading = isValidL1XDistance(rawDistance);
+  setRangeSensorReading(id, rawDistance, validReading);
+}
+
+static void updateL0XFanSensor(RangeSensorId id, VL53L0X &sensor, void (*reconnectSensor)()) {
+  uint16_t rawDistance = sensor.readRangeContinuousMillimeters();
+
+  if (sensor.timeoutOccurred()) {
     stopMotors();
-    markRangeSensorTimeout(RANGE_RIGHT);
-    Serial.println("Right TOF timeout. Reconnecting...");
-    connectRightTOF();
-  } else {
-    setRangeSensorReading(RANGE_RIGHT, rawRightDistance, true);
+    markRangeSensorTimeout(id);
+    Serial.print(rangeSensors[id].name);
+    Serial.println(" TOF timeout. Reconnecting...");
+    reconnectSensor();
+    return;
   }
+
+  setRangeSensorReading(id, rawDistance, isValidL0XDistance(rawDistance));
+}
+
+void updateTOFSensors() {
+  updateFanTOFSensors();
+  updateTofStaleFlags();
+}
+
+void updateFanTOFSensors() {
+  updateL0XFanSensor(RANGE_RIGHT_OUTER, rightOuterTOF, connectRightOuterTOF);
+  updateL1XFanSensor(RANGE_RIGHT_INNER, rightInnerTOF, connectRightInnerTOF);
+  updateL1XFanSensor(RANGE_LEFT_INNER, leftInnerTOF, connectLeftInnerTOF);
+  updateL0XFanSensor(RANGE_LEFT_OUTER, leftOuterTOF, connectLeftOuterTOF);
+  updateFrontBlockState();
 }
 
 bool isRangeSensorValid(RangeSensorId id) {
@@ -311,4 +416,52 @@ bool waitForFrontClear(unsigned long timeoutMs) {
 
   updateTOFSensors();
   return !isRangeSensorBlocked(RANGE_FRONT);
+}
+
+void printFanTelemetry() {
+  updateTOFSensors();
+
+  Serial2.println("fan_idx,name,model,angle_deg,xshut,address,distance_mm,valid,blocked,stale,timeouts,invalids");
+
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
+    RangeSensorId id = (RangeSensorId)i;
+    RangeSensorState &sensor = rangeSensors[id];
+
+    Serial2.print(i);
+    Serial2.print(",");
+    Serial2.print(sensor.name);
+    Serial2.print(",");
+    Serial2.print(fanModelName(id));
+    Serial2.print(",");
+    Serial2.print(sensor.angleDeg);
+    Serial2.print(",");
+    Serial2.print(fanXshutPin(id));
+    Serial2.print(",0x");
+    Serial2.print(fanI2cAddress(id), HEX);
+    Serial2.print(",");
+    Serial2.print(sensor.distanceMm);
+    Serial2.print(",");
+    Serial2.print(sensor.valid ? 1 : 0);
+    Serial2.print(",");
+    Serial2.print(sensor.blocked ? 1 : 0);
+    Serial2.print(",");
+    Serial2.print(sensor.stale ? 1 : 0);
+    Serial2.print(",");
+    Serial2.print(sensor.timeoutCount);
+    Serial2.print(",");
+    Serial2.println(sensor.invalidCount);
+  }
+
+  Serial2.print("fan_aggregate,right_mm=");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT));
+  Serial2.print(",right_valid=");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT) ? 1 : 0);
+  Serial2.print(",front_virtual_mm=");
+  Serial2.print(getRangeSensorDistance(RANGE_FRONT));
+  Serial2.print(",front_virtual_valid=");
+  Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
+  Serial2.print(",left_mm=");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT));
+  Serial2.print(",left_valid=");
+  Serial2.println(isRangeSensorValid(RANGE_LEFT) ? 1 : 0);
 }

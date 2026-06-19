@@ -16,7 +16,7 @@
 const bool DEBUG_DRIVE = true;
 const bool DEBUG_TURN  = false;
 
-const char ROBOT_BUILD_LABEL[] = "V5.1-fast-test-commands";
+const char ROBOT_BUILD_LABEL[] = "V6-four-sector-fan";
 
 // =====================================================
 // Bluetooth serial debug link
@@ -152,34 +152,43 @@ const float DEFAULT_HEADING_GAIN = 10.0;
 // =====================================================
 extern SX1509 io;
 
-extern VL53L1X frontTOF;
-extern VL53L0X leftTOF;
-extern VL53L0X rightTOF;
+extern VL53L0X rightOuterTOF;
+extern VL53L1X rightInnerTOF;
+extern VL53L1X leftInnerTOF;
+extern VL53L0X leftOuterTOF;
 
 const byte SX1509_ADDRESS = 0x3F;
 
-const byte FRONT_XSHUT = 0;
-const byte LEFT_XSHUT  = 1;
-const byte RIGHT_XSHUT = 2;
+// High fan XSHUT mapping, physically numbered right-to-left on the robot.
+const byte RIGHT_OUTER_XSHUT = 0;  // -45 deg, VL53L0X
+const byte RIGHT_INNER_XSHUT = 1;  // -20 deg, VL53L1X
+const byte LEFT_INNER_XSHUT  = 2;  // +20 deg, VL53L1X
+const byte LEFT_OUTER_XSHUT  = 3;  // +45 deg, VL53L0X
 
-const uint8_t LEFT_L0_ADDRESS  = 0x30;
-const uint8_t RIGHT_L0_ADDRESS = 0x31;
+const uint8_t RIGHT_OUTER_ADDRESS = 0x30;
+const uint8_t RIGHT_INNER_ADDRESS = 0x31;
+const uint8_t LEFT_INNER_ADDRESS  = 0x32;
+const uint8_t LEFT_OUTER_ADDRESS  = 0x33;
 
 const int FRONT_STOP_DISTANCE_MM  = 180;
 const int FRONT_CLEAR_DISTANCE_MM = 230;
 
 const int FRONT_VALID_MIN_MM = 20;
 const int FRONT_VALID_MAX_MM = 4000;
-const unsigned long TOF_STALE_TIMEOUT_MS = 250;
+const unsigned long TOF_STALE_TIMEOUT_MS = 750;
 
 const int FRONT_BLOCK_CONFIRM_READS = 2;
 const int FRONT_CLEAR_CONFIRM_READS = 3;
 const unsigned long FRONT_CLEAR_SETTLE_TIMEOUT_MS = 500;
 
 enum RangeSensorId {
+  RANGE_RIGHT_OUTER,
+  RANGE_RIGHT_INNER,
+  RANGE_LEFT_INNER,
+  RANGE_LEFT_OUTER,
   RANGE_FRONT,
-  RANGE_LEFT,
   RANGE_RIGHT,
+  RANGE_LEFT,
   RANGE_SENSOR_COUNT
 };
 
@@ -393,16 +402,17 @@ void zeroYaw();
 float readYawDeg();
 
 void connectTOFSensors();
-void connectLeftTOF();
-void connectRightTOF();
-void connectFrontTOF();
+void connectRightOuterTOF();
+void connectRightInnerTOF();
+void connectLeftInnerTOF();
+void connectLeftOuterTOF();
 void updateTOFSensors();
-void updateFrontTOF();
-void updateSideTOFSensors();
+void updateFanTOFSensors();
 bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 uint16_t getRangeSensorDistance(RangeSensorId id);
 bool waitForFrontClear(unsigned long timeoutMs);
+void printFanTelemetry();
 
 bool handleEmergencyStopPriority(const char* contextLabel);
 bool handleStuckPriority();

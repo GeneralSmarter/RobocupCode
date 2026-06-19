@@ -38,14 +38,19 @@ float K_heading = DEFAULT_HEADING_GAIN;
 
 SX1509 io;
 
-VL53L1X frontTOF;
-VL53L0X leftTOF;
-VL53L0X rightTOF;
+VL53L0X rightOuterTOF;
+VL53L1X rightInnerTOF;
+VL53L1X leftInnerTOF;
+VL53L0X leftOuterTOF;
 
 RangeSensorState rangeSensors[RANGE_SENSOR_COUNT] = {
-  {"front", 0, 9999, false, false, false, 0, 0, 0},
-  {"left", 45, 9999, false, false, false, 0, 0, 0},
-  {"right", -45, 9999, false, false, false, 0, 0, 0}
+  {"right_outer", -45, 9999, false, false, false, 0, 0, 0},
+  {"right_inner", -20, 9999, false, false, false, 0, 0, 0},
+  {"left_inner", 20, 9999, false, false, false, 0, 0, 0},
+  {"left_outer", 45, 9999, false, false, false, 0, 0, 0},
+  {"front_virtual", 0, 9999, false, false, false, 0, 0, 0},
+  {"right_fan", -30, 9999, false, false, false, 0, 0, 0},
+  {"left_fan", 30, 9999, false, false, false, 0, 0, 0}
 };
 
 bool frontBlocked = false;

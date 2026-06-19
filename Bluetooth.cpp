@@ -169,6 +169,7 @@ static void printBluetoothHelp() {
   Serial2.println("  TEST DRIVE <m> drive a fixed distance at current heading");
   Serial2.println("  TEST GOTO <x> <y>  go to one temporary absolute waypoint");
   Serial2.println("  TEST AVOID <m> run one straight-ahead avoidance scenario");
+  Serial2.println("  TEST FAN       print high fan ToF sector readings");
   Serial2.println("  TEST TURN <d>  turn a fixed signed angle in degrees");
   Serial2.println("  MARK <note>    print and log a test note");
   Serial2.println("  MANUAL ARM     allow live DRIVE commands");
@@ -242,6 +243,26 @@ void sendBluetoothStatus() {
   Serial2.print(leftTofValid ? 1 : 0);
   Serial2.print("/");
   Serial2.print(rightTofValid ? 1 : 0);
+  Serial2.print(" fanMm=");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_OUTER));
+  Serial2.print("/");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_INNER));
+  Serial2.print("/");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT_INNER));
+  Serial2.print("/");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT_OUTER));
+  Serial2.print(" frontVirtual=");
+  Serial2.print(getRangeSensorDistance(RANGE_FRONT));
+  Serial2.print(" fanValid=");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT_OUTER) ? 1 : 0);
+  Serial2.print("/");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT_INNER) ? 1 : 0);
+  Serial2.print("/");
+  Serial2.print(isRangeSensorValid(RANGE_LEFT_INNER) ? 1 : 0);
+  Serial2.print("/");
+  Serial2.print(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
+  Serial2.print(" frontVirtualValid=");
+  Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
   Serial2.print(" encL=");
   Serial2.print(leftCount);
   Serial2.print(" encR=");
@@ -920,6 +941,11 @@ static void handleBluetoothCommandLine(char* command) {
     }
 
     runBluetoothTestAvoid(distanceMetres);
+    return;
+  }
+
+  if (commandEquals(command, "TEST FAN") || commandEquals(command, "FAN")) {
+    printFanTelemetry();
     return;
   }
 

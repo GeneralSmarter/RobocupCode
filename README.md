@@ -54,6 +54,7 @@ Available commands:
   waypoint navigation and priorities.
 - `TEST AVOID <metres>` - create one temporary waypoint straight ahead and use
   normal navigation/avoidance to reach it.
+- `TEST FAN` or `FAN` - print the high forward ToF fan sector table.
 - `TEST TURN <degrees>` - turn a fixed signed angle.
 - `MARK <note>` - print and CSV-log a test note. Commas are replaced with
   semicolons in CSV event detail.
@@ -94,6 +95,26 @@ widths, encoder signs, ticks per metre, PID gains, heading gain, waypoint
 tolerance, and ToF safety thresholds. Copy that header into test notes so each
 run can be traced back to the exact settings used.
 
+## High Forward ToF Fan
+
+The V6 high fan is configured right-to-left by XSHUT/header number:
+
+| Index | Name | Angle | Model | XSHUT | Address |
+| --- | --- | ---: | --- | ---: | --- |
+| 0 | `right_outer` | `-45` | VL53L0X | 0 | `0x30` |
+| 1 | `right_inner` | `-20` | VL53L1X | 1 | `0x31` |
+| 2 | `left_inner` | `+20` | VL53L1X | 2 | `0x32` |
+| 3 | `left_outer` | `+45` | VL53L0X | 3 | `0x33` |
+
+Legacy `front`, `left`, and `right` telemetry remains available. `left` and
+`right` are aggregate fan readings using the nearest valid reading on that side,
+so existing avoidance can compare left-side and right-side clearance while the
+full fan is being validated. `front` is a virtual safety reading using the
+nearest valid `right_inner` or `left_inner` reading, since there is no physical
+0-degree front sensor in this layout. Very small nonzero readings below the
+normal calibrated window are treated as unsafe aggregate clearance rather than
+clear space. Use `TEST FAN` for the full sector table.
+
 ## Default START Route
 
 `START` follows a calibration route with a longer first leg so obstacle
@@ -113,8 +134,8 @@ upgrade rather than silently changed during modularisation.
 ## Planned ToF Experiment
 
 Before the paired-height object sensing work is folded into the navigation
-modules, run `TOFReturnSignalExperiment/TOFReturnSignalExperiment.ino` on the
-current front VL53L1X.
+modules, run `TOFReturnSignalExperiment/TOFReturnSignalExperiment.ino` on a
+VL53L1X channel outside the stable navigation build.
 
 That experiment logs range status, distance, return signal rate, ambient rate,
 and derived signal features for walls, ramps, steel weights, plastic weights,

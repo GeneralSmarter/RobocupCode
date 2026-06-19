@@ -98,6 +98,12 @@ void printCalibrationSummary() {
   Serial.println(FRONT_VALID_MAX_MM);
   Serial.print("ToF stale timeout ms: ");
   Serial.println(TOF_STALE_TIMEOUT_MS);
+  Serial.println("High ToF fan right-to-left:");
+  Serial.println("  0 right_outer -45 deg VL53L0X XSHUT0 addr 0x30");
+  Serial.println("  1 right_inner -20 deg VL53L1X XSHUT1 addr 0x31");
+  Serial.println("  2 left_inner  +20 deg VL53L1X XSHUT2 addr 0x32");
+  Serial.println("  3 left_outer  +45 deg VL53L0X XSHUT3 addr 0x33");
+  Serial.println("  front safety is virtual: nearest valid +/-20 deg inner beam");
   Serial.print("Wall follow enabled: ");
   Serial.println(ENABLE_SIDE_WALL_FOLLOW_FALLBACK ? "yes" : "no");
   Serial.print("Wall follow target mm: ");
