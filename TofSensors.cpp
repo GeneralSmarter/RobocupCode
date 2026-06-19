@@ -290,3 +290,25 @@ bool isRangeSensorBlocked(RangeSensorId id) {
 uint16_t getRangeSensorDistance(RangeSensorId id) {
   return rangeSensors[id].distanceMm;
 }
+
+bool waitForFrontClear(unsigned long timeoutMs) {
+  unsigned long startMs = millis();
+
+  while (millis() - startMs <= timeoutMs) {
+    if (handleBluetoothCommands()) {
+      stopMotors();
+      return false;
+    }
+
+    updateTOFSensors();
+
+    if (!isRangeSensorBlocked(RANGE_FRONT)) {
+      return true;
+    }
+
+    delay(50);
+  }
+
+  updateTOFSensors();
+  return !isRangeSensorBlocked(RANGE_FRONT);
+}

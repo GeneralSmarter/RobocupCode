@@ -64,7 +64,11 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
     return;
   }
 
-  updateTOFSensors();
+  waitForFrontClear(FRONT_CLEAR_SETTLE_TIMEOUT_MS);
+  if (!robotRunEnabled || currentState == END_MATCH) {
+    sendBluetoothEvent("obstacle_avoid_end", "aborted");
+    return;
+  }
 
   if (!isRangeSensorBlocked(RANGE_FRONT)) {
     float bypassHeading = readYawDeg();
@@ -107,7 +111,11 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
     }
   }
 
-  updateTOFSensors();
+  waitForFrontClear(FRONT_CLEAR_SETTLE_TIMEOUT_MS);
+  if (!robotRunEnabled || currentState == END_MATCH) {
+    sendBluetoothEvent("obstacle_avoid_end", "aborted");
+    return;
+  }
 
   if (!isRangeSensorBlocked(RANGE_FRONT)) {
     Serial.print("Avoid rejoin forward: ");

@@ -43,6 +43,10 @@ Available commands:
 - `CAL` - print the calibration summary again.
 - `SPEED <ticks/s>` - set a temporary base target speed for this boot.
 - `SPEED RESET` - restore the default base target speed.
+- `HGAIN <gain>` - set a temporary heading correction gain for this boot.
+- `HGAIN RESET` - restore the default heading correction gain.
+- `FBASE <left_us> <right_us>` - set temporary forward motor base pulses.
+- `FBASE RESET` - restore the default forward motor base pulses.
 - `TEST ARM` / `TEST DISARM` - enable or disable manual test motion commands.
 - `TEST DRIVE <metres>` - drive a fixed distance at the current heading.
 - `TEST TURN <degrees>` - turn a fixed signed angle.
@@ -72,6 +76,16 @@ At startup the sketch prints the current calibration summary: motor pulse
 widths, encoder signs, ticks per metre, PID gains, heading gain, waypoint
 tolerance, and ToF safety thresholds. Copy that header into test notes so each
 run can be traced back to the exact settings used.
+
+## Default START Route
+
+`START` follows a calibration route with a longer first leg so obstacle
+avoidance has room to bypass and rejoin:
+
+- `(1.20, 0.00)` pause
+- `(1.20, 0.80)` pause
+- `(0.00, 0.80)` pause
+- `(0.00, 0.00)` home
 
 ## Note
 

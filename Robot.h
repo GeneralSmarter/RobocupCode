@@ -80,11 +80,14 @@ const int STOP_US = 1500;
 const int MIN_US  = 1000;
 const int MAX_US  = 1993;
 
-const int LEFT_BASE_US  = 1900;
-const int RIGHT_BASE_US = 1860;
+const int LEFT_BASE_US  = 1885;
+const int RIGHT_BASE_US = 1890;
 
 const int LEFT_REVERSE_US  = 1130;
 const int RIGHT_REVERSE_US = 1190;
+
+extern int leftForwardBaseUs;
+extern int rightForwardBaseUs;
 
 // =====================================================
 // Encoders
@@ -106,7 +109,7 @@ extern long lastRightCount;
 extern long lastOdomLeftCount;
 extern long lastOdomRightCount;
 
-const float TICKS_PER_METRE = 9479.79;
+const float TICKS_PER_METRE = 8943.20;
 
 // =====================================================
 // Pose
@@ -140,6 +143,8 @@ extern Adafruit_BNO055 bno;
 extern float yawOffset;
 extern float K_heading;
 
+const float DEFAULT_HEADING_GAIN = 10.0;
+
 // =====================================================
 // TOF sensors
 // =====================================================
@@ -167,6 +172,7 @@ const unsigned long TOF_STALE_TIMEOUT_MS = 250;
 
 const int FRONT_BLOCK_CONFIRM_READS = 2;
 const int FRONT_CLEAR_CONFIRM_READS = 3;
+const unsigned long FRONT_CLEAR_SETTLE_TIMEOUT_MS = 500;
 
 enum RangeSensorId {
   RANGE_FRONT,
@@ -394,6 +400,7 @@ void updateSideTOFSensors();
 bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 uint16_t getRangeSensorDistance(RangeSensorId id);
+bool waitForFrontClear(unsigned long timeoutMs);
 
 bool handleEmergencyStopPriority(const char* contextLabel);
 bool handleStuckPriority();

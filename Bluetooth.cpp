@@ -23,6 +23,10 @@ const float TEST_TURN_MIN_DEG = -360.0;
 const float TEST_TURN_MAX_DEG = 360.0;
 const float SPEED_MIN_TICKS_PER_SEC = 300.0;
 const float SPEED_MAX_TICKS_PER_SEC = 3000.0;
+const float HGAIN_MIN = 0.0;
+const float HGAIN_MAX = 100.0;
+const float FBASE_MIN_US = STOP_US;
+const float FBASE_MAX_US = MAX_US;
 const float MANUAL_COMMAND_MIN = -100.0;
 const float MANUAL_COMMAND_MAX = 100.0;
 const unsigned long MANUAL_DRIVE_TIMEOUT_MS = 350;
@@ -151,6 +155,10 @@ static void printBluetoothHelp() {
   Serial2.println("  CAL            print calibration summary");
   Serial2.println("  SPEED <ticks>  set temporary base target speed");
   Serial2.println("  SPEED RESET    restore default base target speed");
+  Serial2.println("  HGAIN <gain>   set temporary heading correction gain");
+  Serial2.println("  HGAIN RESET    restore default heading correction gain");
+  Serial2.println("  FBASE <l> <r>  set temporary forward motor base pulses");
+  Serial2.println("  FBASE RESET    restore default forward motor base pulses");
   Serial2.println("  TEST ARM       allow one or more test motion commands");
   Serial2.println("  TEST DISARM    disable test motion commands");
   Serial2.println("  TEST DRIVE <m> drive a fixed distance at current heading");
@@ -173,7 +181,21 @@ void setupBluetooth() {
   printBluetoothHelp();
 }
 
+static int displayWaypointIndex() {
+  if (NUM_POINTS <= 0) {
+    return 0;
+  }
+
+  if (currentWaypointIndex >= NUM_POINTS) {
+    return NUM_POINTS;
+  }
+
+  return currentWaypointIndex + 1;
+}
+
 void sendBluetoothStatus() {
+  updateTOFSensors();
+
   long leftCount;
   long rightCount;
   readEncoderCounts(leftCount, rightCount);
@@ -189,7 +211,7 @@ void sendBluetoothStatus() {
   Serial2.print(" manualActive=");
   Serial2.print(bluetoothManualActive ? 1 : 0);
   Serial2.print(" waypoint=");
-  Serial2.print(currentWaypointIndex + 1);
+  Serial2.print(displayWaypointIndex());
   Serial2.print("/");
   Serial2.print(NUM_POINTS);
   Serial2.print(" x=");
@@ -224,8 +246,14 @@ void sendBluetoothStatus() {
   Serial2.print(lastLeftMotorUs);
   Serial2.print(" motorR=");
   Serial2.print(lastRightMotorUs);
+  Serial2.print(" fBase=");
+  Serial2.print(leftForwardBaseUs);
+  Serial2.print("/");
+  Serial2.print(rightForwardBaseUs);
   Serial2.print(" baseSpeed=");
   Serial2.print(baseTargetSpeed, 1);
+  Serial2.print(" hGain=");
+  Serial2.print(K_heading, 1);
   Serial2.print(" cmdForward=");
   Serial2.print(desiredForwardSpeed, 1);
   Serial2.print(" cmdTurn=");
@@ -255,7 +283,7 @@ static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName,
   Serial2.print(",");
   Serial2.print(bluetoothTestArmed ? 1 : 0);
   Serial2.print(",");
-  Serial2.print(currentWaypointIndex + 1);
+  Serial2.print(displayWaypointIndex());
   Serial2.print(",");
   Serial2.print(robotX, 3);
   Serial2.print(",");
@@ -382,8 +410,8 @@ static void runManualDriveCommand(float forwardPercent, float turnPercent) {
   float leftPercent = constrain(forwardPercent + turnPercent, MANUAL_COMMAND_MIN, MANUAL_COMMAND_MAX);
   float rightPercent = constrain(forwardPercent - turnPercent, MANUAL_COMMAND_MIN, MANUAL_COMMAND_MAX);
 
-  int leftUs = manualMotorPulseFromPercent(leftPercent, LEFT_BASE_US, LEFT_REVERSE_US);
-  int rightUs = manualMotorPulseFromPercent(rightPercent, RIGHT_BASE_US, RIGHT_REVERSE_US);
+  int leftUs = manualMotorPulseFromPercent(leftPercent, leftForwardBaseUs, LEFT_REVERSE_US);
+  int rightUs = manualMotorPulseFromPercent(rightPercent, rightForwardBaseUs, RIGHT_REVERSE_US);
 
   setMotionCommand(forwardPercent, turnPercent);
   writeMotorUS(leftUs, rightUs);
@@ -517,6 +545,38 @@ static void setBluetoothBaseSpeed(float speedTicksPerSecond) {
   sendBluetoothEvent("speed_set", "manual");
 }
 
+static void setBluetoothHeadingGain(float headingGain) {
+  if (headingGain < HGAIN_MIN || headingGain > HGAIN_MAX) {
+    printFloatRangeError("HGAIN", HGAIN_MIN, HGAIN_MAX);
+    return;
+  }
+
+  K_heading = headingGain;
+
+  Serial2.print("OK heading gain set to ");
+  Serial2.print(K_heading, 1);
+  Serial2.println(".");
+  sendBluetoothEvent("hgain_set", "manual");
+}
+
+static void setBluetoothForwardBase(float leftBaseUs, float rightBaseUs) {
+  if (leftBaseUs < FBASE_MIN_US || leftBaseUs > FBASE_MAX_US ||
+      rightBaseUs < FBASE_MIN_US || rightBaseUs > FBASE_MAX_US) {
+    printFloatRangeError("FBASE left/right", FBASE_MIN_US, FBASE_MAX_US);
+    return;
+  }
+
+  leftForwardBaseUs = (int)(leftBaseUs + 0.5);
+  rightForwardBaseUs = (int)(rightBaseUs + 0.5);
+
+  Serial2.print("OK forward base pulses set to ");
+  Serial2.print(leftForwardBaseUs);
+  Serial2.print("/");
+  Serial2.print(rightForwardBaseUs);
+  Serial2.println(" us.");
+  sendBluetoothEvent("fbase_set", "manual");
+}
+
 static void zeroRobotPoseFromBluetooth() {
   stopMotors();
   zeroYaw();
@@ -526,6 +586,10 @@ static void zeroRobotPoseFromBluetooth() {
   robotTheta = 0.0;
 
   resetEncodersAndPID();
+  currentWaypointIndex = 0;
+  stuckRecoveryCount = 0;
+  returnHomeRequested = false;
+  clearStuckFlags();
   robotRunEnabled = false;
   bluetoothTestArmed = false;
   bluetoothManualArmed = false;
@@ -611,6 +675,52 @@ static void handleBluetoothCommandLine(char* command) {
     Serial2.print(baseTargetSpeed, 1);
     Serial2.println(" ticks/s.");
     sendBluetoothEvent("speed_reset", "manual");
+    return;
+  }
+
+  if (commandEquals(command, "HGAIN RESET")) {
+    K_heading = DEFAULT_HEADING_GAIN;
+    Serial2.print("OK heading gain reset to ");
+    Serial2.print(K_heading, 1);
+    Serial2.println(".");
+    sendBluetoothEvent("hgain_reset", "manual");
+    return;
+  }
+
+  if (commandHasPrefix(command, "HGAIN")) {
+    float requestedHeadingGain = 0.0;
+
+    if (!parseFloatArgument(commandArgument(command, "HGAIN"), requestedHeadingGain)) {
+      Serial2.println("ERROR usage: HGAIN <gain> or HGAIN RESET");
+      return;
+    }
+
+    setBluetoothHeadingGain(requestedHeadingGain);
+    return;
+  }
+
+  if (commandEquals(command, "FBASE RESET")) {
+    leftForwardBaseUs = LEFT_BASE_US;
+    rightForwardBaseUs = RIGHT_BASE_US;
+    Serial2.print("OK forward base pulses reset to ");
+    Serial2.print(leftForwardBaseUs);
+    Serial2.print("/");
+    Serial2.print(rightForwardBaseUs);
+    Serial2.println(" us.");
+    sendBluetoothEvent("fbase_reset", "manual");
+    return;
+  }
+
+  if (commandHasPrefix(command, "FBASE")) {
+    float requestedLeftBase = 0.0;
+    float requestedRightBase = 0.0;
+
+    if (!parseTwoFloatArguments(commandArgument(command, "FBASE"), requestedLeftBase, requestedRightBase)) {
+      Serial2.println("ERROR usage: FBASE <left_us> <right_us> or FBASE RESET");
+      return;
+    }
+
+    setBluetoothForwardBase(requestedLeftBase, requestedRightBase);
     return;
   }
 

@@ -63,9 +63,9 @@ void printCalibrationSummary() {
   Serial.print("/");
   Serial.println(MAX_US);
   Serial.print("Motor base L/R us: ");
-  Serial.print(LEFT_BASE_US);
+  Serial.print(leftForwardBaseUs);
   Serial.print("/");
-  Serial.println(RIGHT_BASE_US);
+  Serial.println(rightForwardBaseUs);
   Serial.print("Motor reverse L/R us: ");
   Serial.print(LEFT_REVERSE_US);
   Serial.print("/");

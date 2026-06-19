@@ -64,6 +64,7 @@ void loop() {
   }
 
   if (!robotRunEnabled) {
+    updateTOFSensors();
     stopMotors();
     delay(50);
     return;

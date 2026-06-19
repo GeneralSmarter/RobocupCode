@@ -12,6 +12,9 @@ long lastRightCount = 0;
 long lastOdomLeftCount  = 0;
 long lastOdomRightCount = 0;
 
+int leftForwardBaseUs = LEFT_BASE_US;
+int rightForwardBaseUs = RIGHT_BASE_US;
+
 float robotX = 0.0;
 float robotY = 0.0;
 float robotTheta = 0.0;
@@ -31,7 +34,7 @@ float lastRightError = 0.0;
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 
 float yawOffset = 0.0;
-float K_heading = 10.0;
+float K_heading = DEFAULT_HEADING_GAIN;
 
 SX1509 io;
 
@@ -93,9 +96,9 @@ int lastLeftMotorUs = STOP_US;
 int lastRightMotorUs = STOP_US;
 
 Waypoint path[] = {
-  {0.50, 0.00, "PAUSE"},
-  {0.50, 0.50, "PAUSE"},
-  {0.00, 0.50, "PAUSE"},
+  {1.20, 0.00, "PAUSE"},
+  {1.20, 0.80, "PAUSE"},
+  {0.00, 0.80, "PAUSE"},
   {0.00, 0.00, "HOME"}
 };
 

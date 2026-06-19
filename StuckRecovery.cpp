@@ -100,7 +100,12 @@ void runStuckRecovery() {
     return;
   }
 
-  updateTOFSensors();
+  waitForFrontClear(FRONT_CLEAR_SETTLE_TIMEOUT_MS);
+  if (!robotRunEnabled || currentState == END_MATCH) {
+    inRecovery = false;
+    sendBluetoothEvent("stuck_recovery_end", "aborted_after_clear_wait");
+    return;
+  }
 
   if (!isRangeSensorBlocked(RANGE_FRONT)) {
     float recoveryHeading = readYawDeg();

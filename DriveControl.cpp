@@ -130,14 +130,14 @@ void driveDistanceWithHeadingWallFallback(float distanceMetres, float targetHead
       float wallCorrection = getWallFollowCorrection(followSide);
       float totalCorrection = constrain(headingCorrection + wallCorrection, -900.0, 900.0);
 
-      float leftTargetSpeed  = baseTargetSpeed - totalCorrection;
-      float rightTargetSpeed = baseTargetSpeed + totalCorrection;
+      float leftTargetSpeed  = baseTargetSpeed + totalCorrection;
+      float rightTargetSpeed = baseTargetSpeed - totalCorrection;
 
       leftTargetSpeed  = constrain(leftTargetSpeed, 0.0, 3000.0);
       rightTargetSpeed = constrain(rightTargetSpeed, 0.0, 3000.0);
 
-      int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, LEFT_BASE_US);
-      int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, RIGHT_BASE_US);
+      int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, leftForwardBaseUs);
+      int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, rightForwardBaseUs);
 
       writeMotorUS(leftCommand, rightCommand);
 
@@ -242,14 +242,14 @@ void driveDistanceWithHeading(float distanceMetres, float targetHeadingDeg) {
       float headingCorrection = K_heading * headingError;
       setMotionCommand(baseTargetSpeed, headingCorrection);
 
-      float leftTargetSpeed  = baseTargetSpeed - headingCorrection;
-      float rightTargetSpeed = baseTargetSpeed + headingCorrection;
+      float leftTargetSpeed  = baseTargetSpeed + headingCorrection;
+      float rightTargetSpeed = baseTargetSpeed - headingCorrection;
 
       leftTargetSpeed  = constrain(leftTargetSpeed, 0.0, 3000.0);
       rightTargetSpeed = constrain(rightTargetSpeed, 0.0, 3000.0);
 
-      int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, LEFT_BASE_US);
-      int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, RIGHT_BASE_US);
+      int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, leftForwardBaseUs);
+      int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, rightForwardBaseUs);
 
       writeMotorUS(leftCommand, rightCommand);
 
@@ -355,14 +355,14 @@ void driveDistanceWithHeadingNoAvoid(float distanceMetres, float targetHeadingDe
       float headingCorrection = K_heading * headingError;
       setMotionCommand(baseTargetSpeed, headingCorrection);
 
-      float leftTargetSpeed  = baseTargetSpeed - headingCorrection;
-      float rightTargetSpeed = baseTargetSpeed + headingCorrection;
+      float leftTargetSpeed  = baseTargetSpeed + headingCorrection;
+      float rightTargetSpeed = baseTargetSpeed - headingCorrection;
 
       leftTargetSpeed  = constrain(leftTargetSpeed, 0.0, 3000.0);
       rightTargetSpeed = constrain(rightTargetSpeed, 0.0, 3000.0);
 
-      int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, LEFT_BASE_US);
-      int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, RIGHT_BASE_US);
+      int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, leftForwardBaseUs);
+      int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, rightForwardBaseUs);
 
       writeMotorUS(leftCommand, rightCommand);
 
