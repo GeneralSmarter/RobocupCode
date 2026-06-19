@@ -55,6 +55,8 @@ Available commands:
 - `TEST AVOID <metres>` - create one temporary waypoint straight ahead and use
   normal navigation/avoidance to reach it.
 - `TEST FAN` or `FAN` - print the high forward ToF fan sector table.
+- `TEST SIDE <seconds>` - sample the avoidance side choice once per second
+  without moving the motors.
 - `TEST TURN <degrees>` - turn a fixed signed angle.
 - `MARK <note>` - print and CSV-log a test note. Commas are replaced with
   semicolons in CSV event detail.
@@ -66,9 +68,11 @@ Available commands:
 
 `TEST DRIVE` accepts `0.01` to `1.50` metres. `TEST AVOID` accepts `0.10` to
 `2.00` metres. `TEST GOTO` accepts coordinates from `-3.00` to `3.00` metres.
-`TEST TURN` accepts signed angles from `-360` to `360` degrees, excluding
-angles inside the turn tolerance. Motion tests require `TEST ARM` first and
-finish by stopping the motors and returning to `END_MATCH`.
+`TEST SIDE` accepts `1` to `30` seconds and does not require `TEST ARM` because
+it never drives the motors. `TEST TURN` accepts signed angles from `-360` to
+`360` degrees, excluding angles inside the turn tolerance. Motion tests require
+`TEST ARM` first and finish by stopping the motors and returning to
+`END_MATCH`.
 
 Use the smallest test that exercises the feature being changed:
 
@@ -76,7 +80,8 @@ Use the smallest test that exercises the feature being changed:
 - straight drive calibration: `TEST DRIVE`.
 - turn calibration: `TEST TURN`.
 - waypoint controller changes: `TEST GOTO`.
-- obstacle avoidance changes: `TEST AVOID`, then full `START` only as an
+- obstacle side-choice changes: `TEST SIDE`.
+- obstacle movement changes: `TEST AVOID`, then full `START` only as an
   acceptance test.
 
 `MANUAL ARM` enables live drive commands for the desktop serial UI. `DRIVE`
@@ -88,7 +93,9 @@ When `CSV ON` is active, rows start with `row_type,event,detail`. Regular
 once-per-second samples use `row_type=telemetry`. Event rows use
 `row_type=event` for front blocked/clear transitions, ToF timeout/stale
 transitions, obstacle-avoidance start/end, stuck-recovery start/end, log marks,
-and manual test motion starts/ends.
+and manual test motion starts/ends. CSV rows include the aggregate legacy
+`front/left/right` readings plus raw fan fields `fan0_mm` through `fan3_mm`,
+`fan0_valid` through `fan3_valid`, and `front_virtual_mm`.
 
 At startup the sketch prints the current calibration summary: motor pulse
 widths, encoder signs, ticks per metre, PID gains, heading gain, waypoint
@@ -113,7 +120,9 @@ full fan is being validated. `front` is a virtual safety reading using the
 nearest valid `right_inner` or `left_inner` reading, since there is no physical
 0-degree front sensor in this layout. Very small nonzero readings below the
 normal calibrated window are treated as unsafe aggregate clearance rather than
-clear space. Use `TEST FAN` for the full sector table.
+clear space. Use `TEST FAN` for the full sector table, and `TEST SIDE <seconds>`
+for a no-motion check of the side choice that avoidance would make from the
+current fan clearances.
 
 ## Default START Route
 

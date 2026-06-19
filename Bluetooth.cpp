@@ -25,6 +25,9 @@ const float TEST_AVOID_MIN_METRES = 0.10;
 const float TEST_AVOID_MAX_METRES = 2.00;
 const float TEST_TURN_MIN_DEG = -360.0;
 const float TEST_TURN_MAX_DEG = 360.0;
+const float TEST_SIDE_MIN_SECONDS = 1.0;
+const float TEST_SIDE_MAX_SECONDS = 30.0;
+const unsigned long TEST_SIDE_SAMPLE_INTERVAL_MS = 1000;
 const float SPEED_MIN_TICKS_PER_SEC = 300.0;
 const float SPEED_MAX_TICKS_PER_SEC = 3000.0;
 const float HGAIN_MIN = 0.0;
@@ -170,6 +173,7 @@ static void printBluetoothHelp() {
   Serial2.println("  TEST GOTO <x> <y>  go to one temporary absolute waypoint");
   Serial2.println("  TEST AVOID <m> run one straight-ahead avoidance scenario");
   Serial2.println("  TEST FAN       print high fan ToF sector readings");
+  Serial2.println("  TEST SIDE <s>  sample avoidance side choice without moving");
   Serial2.println("  TEST TURN <d>  turn a fixed signed angle in degrees");
   Serial2.println("  MARK <note>    print and log a test note");
   Serial2.println("  MANUAL ARM     allow live DRIVE commands");
@@ -292,7 +296,7 @@ void sendBluetoothStatus() {
 }
 
 static void sendBluetoothCsvHeader() {
-  Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn");
+  Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,front_virtual_mm,front_virtual_valid,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn");
 }
 
 static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName, const char* eventDetail) {
@@ -333,6 +337,26 @@ static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName,
   Serial2.print(leftTofValid ? 1 : 0);
   Serial2.print(",");
   Serial2.print(rightTofValid ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_OUTER));
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_INNER));
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT_INNER));
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT_OUTER));
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT_OUTER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT_INNER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_LEFT_INNER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_FRONT));
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
   Serial2.print(",");
   Serial2.print(leftCount);
   Serial2.print(",");
@@ -390,6 +414,95 @@ void sendBluetoothTelemetry() {
   if (bluetoothCsvStreamEnabled) {
     sendBluetoothCsvRow();
   }
+}
+
+static const char* avoidChoiceName(AvoidTurnChoice choice) {
+  return choice == AVOID_TURN_LEFT ? "left" : "right";
+}
+
+static AvoidTurnChoice sampleAvoidSideChoice(const char* &reason) {
+  bool leftValid = isRangeSensorValid(RANGE_LEFT);
+  bool rightValid = isRangeSensorValid(RANGE_RIGHT);
+  uint16_t leftMm = getRangeSensorDistance(RANGE_LEFT);
+  uint16_t rightMm = getRangeSensorDistance(RANGE_RIGHT);
+
+  if (leftValid && !rightValid) {
+    reason = "only_left_valid";
+    return AVOID_TURN_LEFT;
+  }
+
+  if (!leftValid && rightValid) {
+    reason = "only_right_valid";
+    return AVOID_TURN_RIGHT;
+  }
+
+  if (!leftValid && !rightValid) {
+    reason = "no_valid_side_default_right";
+    return AVOID_TURN_RIGHT;
+  }
+
+  if (leftMm > rightMm + AVOID_OPEN_MARGIN_MM) {
+    reason = "left_more_clearance";
+    return AVOID_TURN_LEFT;
+  }
+
+  if (rightMm > leftMm + AVOID_OPEN_MARGIN_MM) {
+    reason = "right_more_clearance";
+    return AVOID_TURN_RIGHT;
+  }
+
+  reason = "similar_clearance_default_right";
+  return AVOID_TURN_RIGHT;
+}
+
+static void printSideDecisionHeader() {
+  Serial2.println("side_decision,sample,ms,choice,reason,front_mm,front_valid,front_blocked,right_mm,right_valid,left_mm,left_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid");
+}
+
+static void printSideDecisionRow(int sampleNumber) {
+  updateTOFSensors();
+
+  const char* reason = "";
+  AvoidTurnChoice choice = sampleAvoidSideChoice(reason);
+
+  Serial2.print("side_decision,");
+  Serial2.print(sampleNumber);
+  Serial2.print(",");
+  Serial2.print(millis());
+  Serial2.print(",");
+  Serial2.print(avoidChoiceName(choice));
+  Serial2.print(",");
+  Serial2.print(reason);
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_FRONT));
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isRangeSensorBlocked(RANGE_FRONT) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT));
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT));
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_LEFT) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_OUTER));
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_INNER));
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT_INNER));
+  Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_LEFT_OUTER));
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT_OUTER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_RIGHT_INNER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_LEFT_INNER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.println(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
 }
 
 static void printFloatRangeError(const char* commandName, float minValue, float maxValue) {
@@ -591,6 +704,48 @@ static void runBluetoothTestAvoid(float distanceMetres) {
   bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
   finishBluetoothTestMotion(aborted);
   sendBluetoothEvent(aborted ? "test_avoid_abort" : "test_avoid_end", "manual");
+}
+
+static void runBluetoothTestSide(float durationSeconds) {
+  if (durationSeconds < TEST_SIDE_MIN_SECONDS || durationSeconds > TEST_SIDE_MAX_SECONDS) {
+    printFloatRangeError("TEST SIDE", TEST_SIDE_MIN_SECONDS, TEST_SIDE_MAX_SECONDS);
+    return;
+  }
+
+  stopMotors();
+  setMotionCommand(0.0, 0.0);
+  bluetoothManualActive = false;
+  bluetoothAbortMotionRequested = false;
+
+  unsigned long durationMs = (unsigned long)(durationSeconds * 1000.0);
+  unsigned long startMs = millis();
+  unsigned long nextSampleMs = startMs;
+  int sampleNumber = 0;
+
+  Serial2.print("OK side decision sampler for ");
+  Serial2.print(durationSeconds, 1);
+  Serial2.println(" s. Move the obstacle around the fan; motors stay stopped.");
+  printSideDecisionHeader();
+
+  while (millis() - startMs <= durationMs) {
+    if (handleBluetoothCommands()) {
+      stopMotors();
+      Serial2.println("TEST SIDE aborted.");
+      return;
+    }
+
+    unsigned long now = millis();
+    if (now >= nextSampleMs) {
+      printSideDecisionRow(sampleNumber);
+      sampleNumber++;
+      nextSampleMs = now + TEST_SIDE_SAMPLE_INTERVAL_MS;
+    }
+
+    delay(20);
+  }
+
+  stopMotors();
+  Serial2.println("TEST SIDE complete.");
 }
 
 static void runBluetoothTestTurn(float angleDeg) {
@@ -941,6 +1096,18 @@ static void handleBluetoothCommandLine(char* command) {
     }
 
     runBluetoothTestAvoid(distanceMetres);
+    return;
+  }
+
+  if (commandHasPrefix(command, "TEST SIDE")) {
+    float durationSeconds = 0.0;
+
+    if (!parseFloatArgument(commandArgument(command, "TEST SIDE"), durationSeconds)) {
+      Serial2.println("ERROR usage: TEST SIDE <seconds>");
+      return;
+    }
+
+    runBluetoothTestSide(durationSeconds);
     return;
   }
 
