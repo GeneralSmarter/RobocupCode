@@ -36,6 +36,7 @@ USB serial and the CH9143 terminal.
 Available commands:
 
 - `HELP` - show commands.
+- `BUILD` - print the firmware build label.
 - `START` - begin navigation from the waiting state.
 - `STATUS` - print state, pose, ToF readings, encoder counts, and flags.
 - `STREAM ON` / `STREAM OFF` - enable or disable one status line per second.
@@ -49,17 +50,33 @@ Available commands:
 - `FBASE RESET` - restore the default forward motor base pulses.
 - `TEST ARM` / `TEST DISARM` - enable or disable manual test motion commands.
 - `TEST DRIVE <metres>` - drive a fixed distance at the current heading.
+- `TEST GOTO <x> <y>` - go to one temporary absolute waypoint using normal
+  waypoint navigation and priorities.
+- `TEST AVOID <metres>` - create one temporary waypoint straight ahead and use
+  normal navigation/avoidance to reach it.
 - `TEST TURN <degrees>` - turn a fixed signed angle.
+- `MARK <note>` - print and CSV-log a test note. Commas are replaced with
+  semicolons in CSV event detail.
 - `MANUAL ARM` / `MANUAL DISARM` - enable or disable live manual drive.
 - `DRIVE <forward> <turn>` - live manual drive command, both values `-100` to `100`.
 - `HOME` - request the return-home state.
 - `ZERO` - stop and reset yaw, pose, encoders, and PID state.
 - `STOP` - stop motors and set `END_MATCH`.
 
-`TEST DRIVE` accepts `0.01` to `1.50` metres. `TEST TURN` accepts signed angles
-from `-360` to `360` degrees, excluding angles inside the turn tolerance.
-Both require `TEST ARM` first and finish by stopping the motors and returning
-to `END_MATCH`.
+`TEST DRIVE` accepts `0.01` to `1.50` metres. `TEST AVOID` accepts `0.10` to
+`2.00` metres. `TEST GOTO` accepts coordinates from `-3.00` to `3.00` metres.
+`TEST TURN` accepts signed angles from `-360` to `360` degrees, excluding
+angles inside the turn tolerance. Motion tests require `TEST ARM` first and
+finish by stopping the motors and returning to `END_MATCH`.
+
+Use the smallest test that exercises the feature being changed:
+
+- command/telemetry changes: `ZERO`, `BUILD`, `STATUS`, `MARK`.
+- straight drive calibration: `TEST DRIVE`.
+- turn calibration: `TEST TURN`.
+- waypoint controller changes: `TEST GOTO`.
+- obstacle avoidance changes: `TEST AVOID`, then full `START` only as an
+  acceptance test.
 
 `MANUAL ARM` enables live drive commands for the desktop serial UI. `DRIVE`
 uses signed percentages: positive forward drives forward, negative forward
@@ -69,8 +86,8 @@ stops motors if live drive commands stop arriving for about `350 ms`.
 When `CSV ON` is active, rows start with `row_type,event,detail`. Regular
 once-per-second samples use `row_type=telemetry`. Event rows use
 `row_type=event` for front blocked/clear transitions, ToF timeout/stale
-transitions, obstacle-avoidance start/end, stuck-recovery start/end, and manual
-test motion starts/ends.
+transitions, obstacle-avoidance start/end, stuck-recovery start/end, log marks,
+and manual test motion starts/ends.
 
 At startup the sketch prints the current calibration summary: motor pulse
 widths, encoder signs, ticks per metre, PID gains, heading gain, waypoint

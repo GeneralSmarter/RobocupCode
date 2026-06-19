@@ -16,6 +16,8 @@
 const bool DEBUG_DRIVE = true;
 const bool DEBUG_TURN  = false;
 
+const char ROBOT_BUILD_LABEL[] = "V5.1-fast-test-commands";
+
 // =====================================================
 // Bluetooth serial debug link
 // =====================================================

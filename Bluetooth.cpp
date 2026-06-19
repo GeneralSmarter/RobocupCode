@@ -19,6 +19,10 @@ static unsigned long lastBluetoothTelemetryMs = 0;
 
 const float TEST_DRIVE_MIN_METRES = 0.01;
 const float TEST_DRIVE_MAX_METRES = 1.50;
+const float TEST_GOTO_MIN_COORD_M = -3.00;
+const float TEST_GOTO_MAX_COORD_M = 3.00;
+const float TEST_AVOID_MIN_METRES = 0.10;
+const float TEST_AVOID_MAX_METRES = 2.00;
 const float TEST_TURN_MIN_DEG = -360.0;
 const float TEST_TURN_MAX_DEG = 360.0;
 const float SPEED_MIN_TICKS_PER_SEC = 300.0;
@@ -146,6 +150,7 @@ static void trimCommand(char* command) {
 static void printBluetoothHelp() {
   Serial2.println("Commands:");
   Serial2.println("  HELP or H      show this help");
+  Serial2.println("  BUILD          print firmware build label");
   Serial2.println("  START          start robot navigation");
   Serial2.println("  STATUS or P    print robot status");
   Serial2.println("  STREAM ON      send status once per second");
@@ -162,7 +167,10 @@ static void printBluetoothHelp() {
   Serial2.println("  TEST ARM       allow one or more test motion commands");
   Serial2.println("  TEST DISARM    disable test motion commands");
   Serial2.println("  TEST DRIVE <m> drive a fixed distance at current heading");
+  Serial2.println("  TEST GOTO <x> <y>  go to one temporary absolute waypoint");
+  Serial2.println("  TEST AVOID <m> run one straight-ahead avoidance scenario");
   Serial2.println("  TEST TURN <d>  turn a fixed signed angle in degrees");
+  Serial2.println("  MARK <note>    print and log a test note");
   Serial2.println("  MANUAL ARM     allow live DRIVE commands");
   Serial2.println("  MANUAL DISARM  stop and disable live DRIVE commands");
   Serial2.println("  DRIVE <f> <t>  live drive, forward/turn from -100 to 100");
@@ -202,6 +210,8 @@ void sendBluetoothStatus() {
 
   Serial2.print("STATUS state=");
   Serial2.print(robotStateName(currentState));
+  Serial2.print(" build=");
+  Serial2.print(ROBOT_BUILD_LABEL);
   Serial2.print(" run=");
   Serial2.print(robotRunEnabled ? 1 : 0);
   Serial2.print(" testArmed=");
@@ -504,6 +514,64 @@ static void runBluetoothTestDrive(float distanceMetres) {
   sendBluetoothEvent(aborted ? "test_drive_abort" : "test_drive_end", "manual");
 }
 
+static void runBluetoothTestGoto(float targetX, float targetY) {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+
+  if (targetX < TEST_GOTO_MIN_COORD_M || targetX > TEST_GOTO_MAX_COORD_M ||
+      targetY < TEST_GOTO_MIN_COORD_M || targetY > TEST_GOTO_MAX_COORD_M) {
+    printFloatRangeError("TEST GOTO x/y", TEST_GOTO_MIN_COORD_M, TEST_GOTO_MAX_COORD_M);
+    return;
+  }
+
+  Serial2.print("OK test goto x=");
+  Serial2.print(targetX, 3);
+  Serial2.print(" y=");
+  Serial2.print(targetY, 3);
+  Serial2.println(".");
+
+  beginBluetoothTestMotion();
+  sendBluetoothEvent("test_goto_start", "manual");
+  goToPoint(targetX, targetY);
+  bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
+  finishBluetoothTestMotion(aborted);
+  sendBluetoothEvent(aborted ? "test_goto_abort" : "test_goto_end", "manual");
+}
+
+static void runBluetoothTestAvoid(float distanceMetres) {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+
+  if (distanceMetres < TEST_AVOID_MIN_METRES || distanceMetres > TEST_AVOID_MAX_METRES) {
+    printFloatRangeError("TEST AVOID", TEST_AVOID_MIN_METRES, TEST_AVOID_MAX_METRES);
+    return;
+  }
+
+  float headingDeg = readYawDeg();
+  float headingRad = headingDeg * PI / 180.0;
+  float targetX = robotX + cos(headingRad) * distanceMetres;
+  float targetY = robotY + sin(headingRad) * distanceMetres;
+
+  Serial2.print("OK test avoid ");
+  Serial2.print(distanceMetres, 3);
+  Serial2.print(" m toward x=");
+  Serial2.print(targetX, 3);
+  Serial2.print(" y=");
+  Serial2.print(targetY, 3);
+  Serial2.print(" heading=");
+  Serial2.print(headingDeg, 2);
+  Serial2.println(" deg.");
+
+  beginBluetoothTestMotion();
+  sendBluetoothEvent("test_avoid_start", "manual");
+  goToPoint(targetX, targetY);
+  bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
+  finishBluetoothTestMotion(aborted);
+  sendBluetoothEvent(aborted ? "test_avoid_abort" : "test_avoid_end", "manual");
+}
+
 static void runBluetoothTestTurn(float angleDeg) {
   if (!requireBluetoothTestArm()) {
     return;
@@ -529,6 +597,30 @@ static void runBluetoothTestTurn(float angleDeg) {
   bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
   finishBluetoothTestMotion(aborted);
   sendBluetoothEvent(aborted ? "test_turn_abort" : "test_turn_end", "manual");
+}
+
+static void printBluetoothBuild() {
+  Serial2.print("BUILD ");
+  Serial2.println(ROBOT_BUILD_LABEL);
+}
+
+static void markBluetoothLog(const char* note) {
+  if (note[0] == '\0') {
+    Serial2.println("ERROR usage: MARK <note>");
+    return;
+  }
+
+  char safeNote[48];
+  int i = 0;
+  while (note[i] != '\0' && i < (int)sizeof(safeNote) - 1) {
+    safeNote[i] = note[i] == ',' ? ';' : note[i];
+    i++;
+  }
+  safeNote[i] = '\0';
+
+  Serial2.print("MARK ");
+  Serial2.println(safeNote);
+  sendBluetoothEvent("mark", safeNote);
 }
 
 static void setBluetoothBaseSpeed(float speedTicksPerSecond) {
@@ -610,6 +702,11 @@ static void handleBluetoothCommandLine(char* command) {
 
   if (commandEquals(command, "HELP") || commandEquals(command, "H")) {
     printBluetoothHelp();
+    return;
+  }
+
+  if (commandEquals(command, "BUILD")) {
+    printBluetoothBuild();
     return;
   }
 
@@ -743,7 +840,7 @@ static void handleBluetoothCommandLine(char* command) {
     robotRunEnabled = false;
     bluetoothAbortMotionRequested = false;
     stopMotors();
-    Serial2.println("OK test motion armed. TEST DRIVE and TEST TURN can move the robot.");
+    Serial2.println("OK test motion armed. TEST DRIVE, TEST TURN, TEST GOTO, and TEST AVOID can move the robot.");
     sendBluetoothEvent("test_arm", "manual");
     return;
   }
@@ -801,6 +898,31 @@ static void handleBluetoothCommandLine(char* command) {
     return;
   }
 
+  if (commandHasPrefix(command, "TEST GOTO")) {
+    float targetX = 0.0;
+    float targetY = 0.0;
+
+    if (!parseTwoFloatArguments(commandArgument(command, "TEST GOTO"), targetX, targetY)) {
+      Serial2.println("ERROR usage: TEST GOTO <x_m> <y_m>");
+      return;
+    }
+
+    runBluetoothTestGoto(targetX, targetY);
+    return;
+  }
+
+  if (commandHasPrefix(command, "TEST AVOID")) {
+    float distanceMetres = 0.0;
+
+    if (!parseFloatArgument(commandArgument(command, "TEST AVOID"), distanceMetres)) {
+      Serial2.println("ERROR usage: TEST AVOID <metres>");
+      return;
+    }
+
+    runBluetoothTestAvoid(distanceMetres);
+    return;
+  }
+
   if (commandHasPrefix(command, "TEST TURN")) {
     float angleDeg = 0.0;
 
@@ -810,6 +932,11 @@ static void handleBluetoothCommandLine(char* command) {
     }
 
     runBluetoothTestTurn(angleDeg);
+    return;
+  }
+
+  if (commandHasPrefix(command, "MARK")) {
+    markBluetoothLog(commandArgument(command, "MARK"));
     return;
   }
 
