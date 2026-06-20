@@ -3,7 +3,43 @@
 // =====================================================
 // Obstacle avoidance
 // =====================================================
-void runObstacleAvoidance(float originalPathHeadingDeg) {
+static float getAvoidTurnSweepRadiusMm();
+static bool restoreDiagonalClearance(AvoidTurnChoice turnChoice,
+                                    unsigned long startTime);
+
+static bool planAdaptiveBypass(const AvoidSideClearance &sideClearance,
+                                float targetX, float targetY,
+                                float &bypassDistanceM,
+                                float &targetHeadingDeg) {
+  float dx = targetX - robotX;
+  float dy = targetY - robotY;
+  float remainingDistanceM = sqrtf(dx * dx + dy * dy);
+  targetHeadingDeg = atan2(dy, dx) * 180.0 / PI;
+
+  const float turnSin = fabs(sinf(AVOID_TURN_ANGLE_DEG * DEG_TO_RAD));
+  if (!sideClearance.passable || turnSin < 0.01 || remainingDistanceM <= WAYPOINT_TOLERANCE_M) {
+    return false;
+  }
+
+  const float requiredLateralOffsetM =
+    (getAvoidTurnSweepRadiusMm() + AVOID_CLEARANCE_MARGIN_MM) / 1000.0;
+  const float footprintBypassM = requiredLateralOffsetM / turnSin;
+  const float targetLimitedBypassM = remainingDistanceM * AVOID_TARGET_BYPASS_FRACTION;
+  // The inner ray can continue to see the obstacle edge while the robot turns
+  // into a usable side gap. Keep it in the initial swept-turn check above, but
+  // use the outward ray to decide whether there is room to travel the bypass.
+  const float outerTravelClearanceM =
+    (sideClearance.outerSweepClearanceMm - AVOID_CLEARANCE_MARGIN_MM) / 1000.0;
+
+  bypassDistanceM = min(footprintBypassM, targetLimitedBypassM);
+  bypassDistanceM = constrain(bypassDistanceM,
+                              AVOID_MIN_BYPASS_DISTANCE_M,
+                              AVOID_MAX_BYPASS_DISTANCE_M);
+
+  return outerTravelClearanceM >= bypassDistanceM;
+}
+
+void runObstacleAvoidance(float targetX, float targetY, const char* trigger) {
   if (handleStuckPriority()) {
     return;
   }
@@ -26,7 +62,7 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
   Serial.print(" mm  Right: ");
   Serial.print(getRangeSensorDistance(RANGE_RIGHT));
   Serial.println(" mm");
-  sendBluetoothEvent("obstacle_avoid_start", "front_blocked");
+  sendBluetoothEvent("obstacle_avoid_start", trigger);
 
   reverseDistanceOpenLoop(AVOID_REVERSE_DISTANCE_M);
   if (!robotRunEnabled || currentState == END_MATCH) {
@@ -44,6 +80,41 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
   updateTOFSensors();
 
   AvoidTurnChoice turnChoice = chooseAvoidTurnDirection();
+
+  if (turnChoice == AVOID_TURN_NONE) {
+    Serial.println("Avoidance has no footprint-safe turn corridor. Starting stuck recovery.");
+    stopMotors();
+    sendBluetoothEvent("obstacle_avoid_end", "no_safe_corridor");
+    runStuckRecovery();
+    return;
+  }
+
+  AvoidSideClearance leftClearance;
+  AvoidSideClearance rightClearance;
+  const char* clearanceReason = "";
+  evaluateAvoidTurnDirection(leftClearance, rightClearance, clearanceReason);
+  const AvoidSideClearance &selectedClearance =
+    turnChoice == AVOID_TURN_LEFT ? leftClearance : rightClearance;
+
+  float bypassDistanceM = 0.0;
+  float targetHeadingDeg = 0.0;
+  if (!planAdaptiveBypass(selectedClearance, targetX, targetY,
+                           bypassDistanceM, targetHeadingDeg)) {
+    Serial.println("Avoidance has no outward clearance for the required adaptive bypass. Starting stuck recovery.");
+    stopMotors();
+    sendBluetoothEvent("obstacle_avoid_end", "insufficient_bypass_clearance");
+    runStuckRecovery();
+    return;
+  }
+
+  char planDetail[96];
+  snprintf(planDetail, sizeof(planDetail), "%s;%s;bypass=%.3f;score=%.0f;outer=%.0f;target=%.1f",
+           turnChoice == AVOID_TURN_LEFT ? "left" : "right",
+           clearanceReason, bypassDistanceM, selectedClearance.scoreMm,
+           selectedClearance.outerSweepClearanceMm, targetHeadingDeg);
+  sendBluetoothEvent("adaptive_bypass_plan", planDetail);
+  Serial.print("Adaptive bypass plan: ");
+  Serial.println(planDetail);
 
   if (turnChoice == AVOID_TURN_LEFT) {
     Serial.println("Avoid choice: turn left.");
@@ -64,6 +135,14 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
     return;
   }
 
+  if (!restoreDiagonalClearance(turnChoice, startTime)) {
+    Serial.println("Avoidance could not establish diagonal footprint clearance. Starting stuck recovery.");
+    stopMotors();
+    sendBluetoothEvent("obstacle_avoid_end", "diagonal_clearance_unresolved");
+    runStuckRecovery();
+    return;
+  }
+
   waitForFrontClear(FRONT_CLEAR_SETTLE_TIMEOUT_MS);
   if (!robotRunEnabled || currentState == END_MATCH) {
     sendBluetoothEvent("obstacle_avoid_end", "aborted");
@@ -74,9 +153,9 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
     float bypassHeading = readYawDeg();
 
     if (ENABLE_SIDE_WALL_FOLLOW_FALLBACK) {
-      driveDistanceWithHeadingWallFallback(AVOID_BYPASS_DISTANCE_M, bypassHeading);
+      driveDistanceWithHeadingWallFallback(bypassDistanceM, bypassHeading);
     } else {
-      driveDistanceWithHeadingNoAvoid(AVOID_BYPASS_DISTANCE_M, bypassHeading);
+      driveDistanceWithHeadingNoAvoid(bypassDistanceM, bypassHeading);
     }
     if (!robotRunEnabled || currentState == END_MATCH) {
       sendBluetoothEvent("obstacle_avoid_end", "aborted");
@@ -96,48 +175,37 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
     return;
   }
 
-  float rejoinTurn = wrapAngle(originalPathHeadingDeg - readYawDeg());
+  float targetRejoinHeadingDeg = atan2(targetY - robotY, targetX - robotX) * 180.0 / PI;
+  float currentHeadingDeg = readYawDeg();
+  float targetHeadingErrorDeg = wrapAngle(targetRejoinHeadingDeg - currentHeadingDeg);
+  float handoffHeadingDeg = targetRejoinHeadingDeg;
 
-  Serial.print("Avoid rejoin turn: ");
-  Serial.print(rejoinTurn, 2);
-  Serial.print(" deg back toward path heading ");
-  Serial.println(originalPathHeadingDeg, 2);
+  if (fabs(targetHeadingErrorDeg) > AVOID_REJOIN_HANDOFF_MAX_ERROR_DEG) {
+    handoffHeadingDeg = targetRejoinHeadingDeg -
+      (targetHeadingErrorDeg > 0.0 ? AVOID_REJOIN_HANDOFF_MAX_ERROR_DEG
+                                    : -AVOID_REJOIN_HANDOFF_MAX_ERROR_DEG);
+  }
 
-  if (fabs(rejoinTurn) > TURN_TOLERANCE_DEG) {
-    turnAngle(rejoinTurn);
+  float handoffTurnDeg = wrapAngle(handoffHeadingDeg - currentHeadingDeg);
+  Serial.print("Adaptive rejoin: target/handoff/turn=");
+  Serial.print(targetRejoinHeadingDeg, 2);
+  Serial.print("/");
+  Serial.print(handoffHeadingDeg, 2);
+  Serial.print("/");
+  Serial.print(handoffTurnDeg, 2);
+  Serial.println(" deg.");
+
+  char rejoinDetail[80];
+  snprintf(rejoinDetail, sizeof(rejoinDetail), "target=%.1f;handoff=%.1f;turn=%.1f",
+           targetRejoinHeadingDeg, handoffHeadingDeg, handoffTurnDeg);
+  sendBluetoothEvent("adaptive_rejoin", rejoinDetail);
+
+  if (fabs(handoffTurnDeg) > TURN_TOLERANCE_DEG) {
+    turnAngle(handoffTurnDeg);
     if (!robotRunEnabled || currentState == END_MATCH) {
       sendBluetoothEvent("obstacle_avoid_end", "aborted");
       return;
     }
-  }
-
-  waitForFrontClear(FRONT_CLEAR_SETTLE_TIMEOUT_MS);
-  if (!robotRunEnabled || currentState == END_MATCH) {
-    sendBluetoothEvent("obstacle_avoid_end", "aborted");
-    return;
-  }
-
-  if (!isRangeSensorBlocked(RANGE_FRONT)) {
-    Serial.print("Avoid rejoin forward: ");
-    Serial.print(AVOID_REJOIN_DISTANCE_M, 3);
-    Serial.println(" m along original path heading.");
-    driveDistanceWithHeadingNoAvoid(AVOID_REJOIN_DISTANCE_M, originalPathHeadingDeg);
-    if (!robotRunEnabled || currentState == END_MATCH) {
-      sendBluetoothEvent("obstacle_avoid_end", "aborted");
-      return;
-    }
-  } else {
-    Serial.println("Avoid rejoin skipped because front is blocked after turn.");
-  }
-
-  updateTOFSensors();
-  updateOdometry();
-
-  if (isRangeSensorBlocked(RANGE_FRONT)) {
-    Serial.println("OBSTACLE_AVOID rejoin ended blocked. Starting stuck recovery.");
-    sendBluetoothEvent("obstacle_avoid_end", "rejoin_blocked");
-    runStuckRecovery();
-    return;
   }
 
   Serial.println("OBSTACLE_AVOID complete. Resuming waypoint.");
@@ -145,47 +213,168 @@ void runObstacleAvoidance(float originalPathHeadingDeg) {
   sendBluetoothEvent("obstacle_avoid_end", "complete");
 }
 
+static bool restoreDiagonalClearance(AvoidTurnChoice turnChoice,
+                                    unsigned long startTime) {
+  for (int attempt = 0; attempt <= AVOID_ESCAPE_MAX_CLEARANCE_ATTEMPTS; attempt++) {
+    updateTOFSensors();
+
+    RangeSensorId sensorId;
+    float clearanceMm = 0.0;
+    if (!getDiagonalClearanceWarning(sensorId, clearanceMm)) {
+      if (attempt > 0) {
+        sendBluetoothEvent("diagonal_clearance_restored", "escape_complete");
+      }
+      return true;
+    }
+
+    Serial.print("DIAGONAL CLEARANCE warning: ");
+    Serial.print(rangeSensors[sensorId].name);
+    Serial.print(" sweep clearance ");
+    Serial.print(clearanceMm, 1);
+    Serial.println(" mm.");
+
+    char detail[64];
+    snprintf(detail, sizeof(detail), "%s;clearance=%.0f;attempt=%d",
+             rangeSensors[sensorId].name, clearanceMm, attempt + 1);
+    sendBluetoothEvent("diagonal_clearance_warning", detail);
+
+    if (attempt == AVOID_ESCAPE_MAX_CLEARANCE_ATTEMPTS ||
+        millis() - startTime > AVOID_TIMEOUT_MS) {
+      break;
+    }
+
+    Serial.print("Clearance escape: reverse ");
+    Serial.print(AVOID_ESCAPE_REVERSE_STEP_M, 3);
+    Serial.print(" m, then turn ");
+    Serial.print(AVOID_ESCAPE_TURN_STEP_DEG, 1);
+    Serial.println(" deg farther toward the selected side.");
+
+    reverseDistanceOpenLoop(AVOID_ESCAPE_REVERSE_STEP_M);
+    if (!robotRunEnabled || currentState == END_MATCH) {
+      return false;
+    }
+
+    const float signedTurnDeg = turnChoice == AVOID_TURN_LEFT
+                                  ? -AVOID_ESCAPE_TURN_STEP_DEG
+                                  : AVOID_ESCAPE_TURN_STEP_DEG;
+    turnAngle(signedTurnDeg);
+    if (!robotRunEnabled || currentState == END_MATCH) {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+static float getAvoidTurnSweepRadiusMm() {
+  const float frontLeft = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm * ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
+                                ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm * ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm);
+  const float frontRight = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm * ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
+                                 ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm);
+  const float rearLeft = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm +
+                               ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm * ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm);
+  const float rearRight = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm +
+                                ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm);
+  return max(max(frontLeft, frontRight), max(rearLeft, rearRight));
+}
+
+static float getSensorSweepClearanceMm(RangeSensorId id, float sweepRadiusMm) {
+  const FanSensorGeometry &sensor = FAN_SENSOR_GEOMETRY[(int)id];
+  const float rangeMm = (float)getRangeSensorDistance(id);
+  const float angleRad = sensor.angleDeg * DEG_TO_RAD;
+  const float endpointX = sensor.xMm + rangeMm * cosf(angleRad);
+  const float endpointY = sensor.yMm + rangeMm * sinf(angleRad);
+  return sqrtf(endpointX * endpointX + endpointY * endpointY) - sweepRadiusMm;
+}
+
+static void assessAvoidSideClearance(AvoidTurnChoice choice,
+                                     AvoidSideClearance &assessment) {
+  const RangeSensorId innerId = choice == AVOID_TURN_LEFT ? RANGE_LEFT_INNER : RANGE_RIGHT_INNER;
+  const RangeSensorId outerId = choice == AVOID_TURN_LEFT ? RANGE_LEFT_OUTER : RANGE_RIGHT_OUTER;
+
+  assessment.valid = isRangeSensorValid(innerId) && isRangeSensorValid(outerId);
+  assessment.passable = false;
+  assessment.innerSweepClearanceMm = -1.0;
+  assessment.outerSweepClearanceMm = -1.0;
+  assessment.scoreMm = -1.0;
+
+  if (!assessment.valid) {
+    return;
+  }
+
+  const float sweepRadiusMm = getAvoidTurnSweepRadiusMm();
+  assessment.innerSweepClearanceMm = getSensorSweepClearanceMm(innerId, sweepRadiusMm);
+  assessment.outerSweepClearanceMm = getSensorSweepClearanceMm(outerId, sweepRadiusMm);
+  assessment.scoreMm = min(assessment.innerSweepClearanceMm, assessment.outerSweepClearanceMm);
+  assessment.passable = assessment.scoreMm >= AVOID_CLEARANCE_MARGIN_MM;
+}
+
+AvoidTurnChoice evaluateAvoidTurnDirection(AvoidSideClearance &left,
+                                           AvoidSideClearance &right,
+                                           const char* &reason) {
+  assessAvoidSideClearance(AVOID_TURN_LEFT, left);
+  assessAvoidSideClearance(AVOID_TURN_RIGHT, right);
+
+  if (left.passable && !right.passable) {
+    reason = "only_left_footprint_safe";
+    return AVOID_TURN_LEFT;
+  }
+
+  if (!left.passable && right.passable) {
+    reason = "only_right_footprint_safe";
+    return AVOID_TURN_RIGHT;
+  }
+
+  if (!left.passable && !right.passable) {
+    reason = (!left.valid && !right.valid) ? "no_valid_side_corridor" : "no_footprint_safe_corridor";
+    return AVOID_TURN_NONE;
+  }
+
+  if (left.scoreMm > right.scoreMm + AVOID_SCORE_TIE_MARGIN_MM) {
+    reason = "left_more_footprint_clearance";
+    return AVOID_TURN_LEFT;
+  }
+
+  if (right.scoreMm > left.scoreMm + AVOID_SCORE_TIE_MARGIN_MM) {
+    reason = "right_more_footprint_clearance";
+    return AVOID_TURN_RIGHT;
+  }
+
+  reason = "similar_footprint_clearance_default_right";
+  return AVOID_TURN_RIGHT;
+}
+
 AvoidTurnChoice chooseAvoidTurnDirection() {
-  bool leftValid = isRangeSensorValid(RANGE_LEFT);
-  bool rightValid = isRangeSensorValid(RANGE_RIGHT);
-  uint16_t leftMm = getRangeSensorDistance(RANGE_LEFT);
-  uint16_t rightMm = getRangeSensorDistance(RANGE_RIGHT);
+  AvoidSideClearance left;
+  AvoidSideClearance right;
+  const char* reason = "";
+  AvoidTurnChoice choice = evaluateAvoidTurnDirection(left, right, reason);
 
   Serial.print("Avoid side check: left=");
-  Serial.print(leftMm);
-  Serial.print(leftValid ? " valid" : " invalid");
+  Serial.print(getRangeSensorDistance(RANGE_LEFT));
+  Serial.print(left.valid ? " valid" : " invalid");
   Serial.print(" mm  right=");
-  Serial.print(rightMm);
-  Serial.print(rightValid ? " valid" : " invalid");
+  Serial.print(getRangeSensorDistance(RANGE_RIGHT));
+  Serial.print(right.valid ? " valid" : " invalid");
   Serial.println(" mm");
 
-  if (leftValid && !rightValid) {
-    Serial.println("Avoid reason: only left side has valid clearance.");
-    return AVOID_TURN_LEFT;
-  }
+  Serial.print("Avoid footprint clearance: left inner/outer/score=");
+  Serial.print(left.innerSweepClearanceMm, 1);
+  Serial.print("/");
+  Serial.print(left.outerSweepClearanceMm, 1);
+  Serial.print("/");
+  Serial.print(left.scoreMm, 1);
+  Serial.print(" mm  right inner/outer/score=");
+  Serial.print(right.innerSweepClearanceMm, 1);
+  Serial.print("/");
+  Serial.print(right.outerSweepClearanceMm, 1);
+  Serial.print("/");
+  Serial.print(right.scoreMm, 1);
+  Serial.println(" mm");
 
-  if (!leftValid && rightValid) {
-    Serial.println("Avoid reason: only right side has valid clearance.");
-    return AVOID_TURN_RIGHT;
-  }
-
-  if (!leftValid && !rightValid) {
-    Serial.println("Avoid reason: no valid side clearance, default right.");
-    return AVOID_TURN_RIGHT;
-  }
-
-  if (leftMm > rightMm + AVOID_OPEN_MARGIN_MM) {
-    Serial.println("Avoid reason: left side has more clearance.");
-    return AVOID_TURN_LEFT;
-  }
-
-  if (rightMm > leftMm + AVOID_OPEN_MARGIN_MM) {
-    Serial.println("Avoid reason: right side has more clearance.");
-    return AVOID_TURN_RIGHT;
-  }
-
-  Serial.println("Avoid reason: similar clearance, default right.");
-  return AVOID_TURN_RIGHT;
+  Serial.print("Avoid reason: ");
+  Serial.println(reason);
+  return choice;
 }
 
 void reverseDistanceOpenLoop(float distanceMetres) {

@@ -20,6 +20,34 @@ bool handleEmergencyStopPriority(const char* contextLabel) {
   return true;
 }
 
+static bool handleDiagonalClearancePriority(float targetX, float targetY) {
+  RangeSensorId sensorId;
+  float clearanceMm = 0.0;
+  if (!getDiagonalClearanceWarning(sensorId, clearanceMm)) {
+    return false;
+  }
+
+  stopMotors();
+  updateOdometry();
+
+  Serial.print("PRIORITY 1 DIAGONAL_CLEARANCE warning from ");
+  Serial.print(rangeSensors[sensorId].name);
+  Serial.print(": ");
+  Serial.print(clearanceMm, 1);
+  Serial.println(" mm. Starting clearance escape.");
+
+  char detail[64];
+  snprintf(detail, sizeof(detail), "%s;clearance=%.0f", rangeSensors[sensorId].name, clearanceMm);
+  sendBluetoothEvent("diagonal_clearance_warning", detail);
+  runObstacleAvoidance(targetX, targetY, "diagonal_clearance");
+
+  if (!stoppedSafely) {
+    setRobotState(FOLLOW_PATH);
+  }
+
+  return true;
+}
+
 bool handleStuckPriority() {
   if (inRecovery) {
     return false;
@@ -34,13 +62,13 @@ bool handleStuckPriority() {
   return false;
 }
 
-bool handleObstacleAvoidPriority(float originalPathHeadingDeg) {
+bool handleObstacleAvoidPriority(float targetX, float targetY) {
   if (!isRangeSensorBlocked(RANGE_FRONT)) {
     return false;
   }
 
   Serial.println("PRIORITY 3 OBSTACLE_AVOID active.");
-  runObstacleAvoidance(originalPathHeadingDeg);
+  runObstacleAvoidance(targetX, targetY);
 
   if (!stoppedSafely) {
     setRobotState(FOLLOW_PATH);
@@ -63,9 +91,13 @@ bool handleReturnHomePriority() {
   return true;
 }
 
-bool handleDrivePriorities(float originalPathHeadingDeg) {
+bool handleDrivePriorities(float targetX, float targetY) {
   if (handleEmergencyStopPriority("normal drive")) {
-    handleObstacleAvoidPriority(originalPathHeadingDeg);
+    handleObstacleAvoidPriority(targetX, targetY);
+    return true;
+  }
+
+  if (handleDiagonalClearancePriority(targetX, targetY)) {
     return true;
   }
 

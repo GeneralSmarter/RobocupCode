@@ -44,10 +44,10 @@ VL53L1X leftInnerTOF;
 VL53L0X leftOuterTOF;
 
 RangeSensorState rangeSensors[RANGE_SENSOR_COUNT] = {
-  {"right_outer", -45, 9999, false, false, false, 0, 0, 0},
-  {"right_inner", -20, 9999, false, false, false, 0, 0, 0},
-  {"left_inner", 20, 9999, false, false, false, 0, 0, 0},
-  {"left_outer", 45, 9999, false, false, false, 0, 0, 0},
+  {"right_outer", (int)FAN_SENSOR_GEOMETRY[RANGE_RIGHT_OUTER].angleDeg, 9999, false, false, false, 0, 0, 0},
+  {"right_inner", (int)FAN_SENSOR_GEOMETRY[RANGE_RIGHT_INNER].angleDeg, 9999, false, false, false, 0, 0, 0},
+  {"left_inner", (int)FAN_SENSOR_GEOMETRY[RANGE_LEFT_INNER].angleDeg, 9999, false, false, false, 0, 0, 0},
+  {"left_outer", (int)FAN_SENSOR_GEOMETRY[RANGE_LEFT_OUTER].angleDeg, 9999, false, false, false, 0, 0, 0},
   {"front_virtual", 0, 9999, false, false, false, 0, 0, 0},
   {"right_fan", -30, 9999, false, false, false, 0, 0, 0},
   {"left_fan", 30, 9999, false, false, false, 0, 0, 0}

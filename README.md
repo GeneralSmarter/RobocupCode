@@ -74,6 +74,28 @@ it never drives the motors. `TEST TURN` accepts signed angles from `-360` to
 `TEST ARM` first and finish by stopping the motors and returning to
 `END_MATCH`.
 
+`TEST SIDE` includes each candidate side's `passable` flag and inner/outer
+`sweep_clearance_mm` values. A side is passable only when both fan rays clear
+the robot's measured turn footprint plus the configured safety margin.
+
+Obstacle avoidance logs an `adaptive_bypass_plan` event before moving. Its
+detail records the selected side, footprint-clearance reason, bounded bypass
+distance, minimum turn score, outward travel score, and current waypoint
+heading. Both fan rays must clear the initial turning sweep; the outward ray
+then validates travel into a side gap, because the inner ray may still be
+seeing the obstacle edge. After the bypass it emits `adaptive_rejoin` with its
+target/handoff turn and lets the normal waypoint controller steer directly
+toward the active target instead of driving a fixed rejoin segment.
+
+All four forward-facing fan rays now also form a diagonal footprint guard. A
+ray is a warning when its measured endpoint enters the robot's circular turn
+envelope plus the configured clearance margin. During normal waypoint motion,
+that guard stops the robot and starts a clearance escape; during avoidance
+entry, it performs bounded 50 mm reverse / 10 degree extra-turn steps until
+the fan clearance is restored or recovery takes over. CSV reports this as
+`diagonal_clearance_warning` (and, after an in-avoidance escape succeeds,
+`diagonal_clearance_restored`).
+
 Use the smallest test that exercises the feature being changed:
 
 - command/telemetry changes: `ZERO`, `BUILD`, `STATUS`, `MARK`.
@@ -108,10 +130,10 @@ The V6 high fan is configured right-to-left by XSHUT/header number:
 
 | Index | Name | Angle | Model | XSHUT | Address |
 | --- | --- | ---: | --- | ---: | --- |
-| 0 | `right_outer` | `-45` | VL53L0X | 0 | `0x30` |
+| 0 | `right_outer` | `-60` | VL53L0X | 0 | `0x30` |
 | 1 | `right_inner` | `-20` | VL53L1X | 1 | `0x31` |
 | 2 | `left_inner` | `+20` | VL53L1X | 2 | `0x32` |
-| 3 | `left_outer` | `+45` | VL53L0X | 3 | `0x33` |
+| 3 | `left_outer` | `+60` | VL53L0X | 3 | `0x33` |
 
 Legacy `front`, `left`, and `right` telemetry remains available. `left` and
 `right` are aggregate fan readings using the nearest valid reading on that side,
@@ -123,6 +145,37 @@ normal calibrated window are treated as unsafe aggregate clearance rather than
 clear space. Use `TEST FAN` for the full sector table, and `TEST SIDE <seconds>`
 for a no-motion check of the side choice that avoidance would make from the
 current fan clearances.
+
+### Footprint-aware avoidance geometry
+
+Avoidance geometry is configured once in `Robot.h`, relative to the midpoint
+between the drive wheels: `+X` is forward and `+Y` is left. The same block
+contains the chassis extents and four fan sensor origins/angles, so future
+mechanical changes do not require editing the avoidance algorithm. The current
+turn-footprint margin is `50 mm`; validate it with `TEST SIDE` before changing
+avoidance motion.
+
+### Calibrating fan geometry
+
+Treat each ToF reading as starting at an **effective beam origin**, not at the
+robot centre. The effective origin intentionally includes any small fixed range
+offset inside the sensor, which is exactly what the clearance maths needs.
+
+1. Square the robot to a long flat front wall and record each raw fan range at
+   three known gaps from the robot's front face (for example 300, 500, and
+   700 mm). Use `CSV ON`, `MARK`, and `FAN`; the ±60 degree outer rays need a
+   wall wide enough to intercept them at every gap.
+2. With `D = front_extent + front_face_gap` and readings `r1`, `r2` from two
+   positions, fit the beam angle using
+   `theta = acos((D2 - D1) / (r2 - r1))`. Then average
+   `x = D - r * cos(theta)` over all positions.
+3. Put a flat wall parallel to the relevant robot side. Express its coordinate
+   as `Y` from the wheel-midpoint origin (right is negative, left positive),
+   then fit the sideways origin with `y = Y - r * sin(theta)`.
+
+Enter the resulting effective `x`, `y`, and signed angle in
+`FAN_SENSOR_GEOMETRY` in `Robot.h`; do not change avoidance code for a
+mechanical remount.
 
 ## Default START Route
 

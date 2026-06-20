@@ -160,10 +160,10 @@ extern VL53L0X leftOuterTOF;
 const byte SX1509_ADDRESS = 0x3F;
 
 // High fan XSHUT mapping, physically numbered right-to-left on the robot.
-const byte RIGHT_OUTER_XSHUT = 0;  // -45 deg, VL53L0X
+const byte RIGHT_OUTER_XSHUT = 0;  // -60 deg, VL53L0X
 const byte RIGHT_INNER_XSHUT = 1;  // -20 deg, VL53L1X
 const byte LEFT_INNER_XSHUT  = 2;  // +20 deg, VL53L1X
-const byte LEFT_OUTER_XSHUT  = 3;  // +45 deg, VL53L0X
+const byte LEFT_OUTER_XSHUT  = 3;  // +60 deg, VL53L0X
 
 const uint8_t RIGHT_OUTER_ADDRESS = 0x30;
 const uint8_t RIGHT_INNER_ADDRESS = 0x31;
@@ -190,6 +190,36 @@ enum RangeSensorId {
   RANGE_RIGHT,
   RANGE_LEFT,
   RANGE_SENSOR_COUNT
+};
+
+// Robot-centred geometry in millimetres. The origin is the midpoint between
+// the drive wheels: +X forward, +Y left. Keep future physical measurements in
+// this one block so clearance logic stays relative to the chassis.
+struct RobotFootprintGeometry {
+  float frontExtentMm;
+  float rearExtentMm;
+  float leftExtentMm;
+  float rightExtentMm;
+};
+
+struct FanSensorGeometry {
+  float xMm;
+  float yMm;
+  float angleDeg;
+};
+
+const RobotFootprintGeometry ROBOT_FOOTPRINT_GEOMETRY = {
+  185.0,  // front extent
+  160.0,  // rear extent
+  145.0,  // left extent
+  145.0   // right extent
+};
+
+const FanSensorGeometry FAN_SENSOR_GEOMETRY[4] = {
+  {110.0, -95.0, -60.0},  // right outer
+  {150.0, -40.0, -20.0},  // right inner
+  {150.0,  40.0,  20.0},  // left inner
+  {110.0,  95.0,  60.0}   // left outer
 };
 
 struct RangeSensorState {
@@ -226,18 +256,37 @@ extern unsigned long lastFrontInvalidPrintMs;
 // =====================================================
 // Obstacle avoidance
 // =====================================================
-const int AVOID_OPEN_MARGIN_MM = 80;
+const float AVOID_CLEARANCE_MARGIN_MM = 50.0;
+const float AVOID_SCORE_TIE_MARGIN_MM = 80.0;
 
 const float AVOID_REVERSE_DISTANCE_M = 0.10;
-const float AVOID_BYPASS_DISTANCE_M  = 0.40;
-const float AVOID_REJOIN_DISTANCE_M  = 0.25;
 const float AVOID_TURN_ANGLE_DEG     = 60.0;
+// A clearance check uses each fan ray against the actual circular turn
+// envelope of the chassis. Keep this tied to the normal footprint margin so
+// geometry changes remain relative to the robot, not a particular course.
+const float AVOID_DIAGONAL_WARNING_CLEARANCE_MM = AVOID_CLEARANCE_MARGIN_MM;
+const float AVOID_ESCAPE_REVERSE_STEP_M = 0.05;
+const float AVOID_ESCAPE_TURN_STEP_DEG = 10.0;
+const int AVOID_ESCAPE_MAX_CLEARANCE_ATTEMPTS = 2;
+const float AVOID_MIN_BYPASS_DISTANCE_M = 0.25;
+const float AVOID_MAX_BYPASS_DISTANCE_M = 0.55;
+const float AVOID_TARGET_BYPASS_FRACTION = 0.50;
+const float AVOID_REJOIN_HANDOFF_MAX_ERROR_DEG = 30.0;
 
 const unsigned long AVOID_TIMEOUT_MS = 7000;
 
 enum AvoidTurnChoice {
   AVOID_TURN_LEFT,
-  AVOID_TURN_RIGHT
+  AVOID_TURN_RIGHT,
+  AVOID_TURN_NONE
+};
+
+struct AvoidSideClearance {
+  bool valid;
+  bool passable;
+  float innerSweepClearanceMm;
+  float outerSweepClearanceMm;
+  float scoreMm;
 };
 
 // =====================================================
@@ -269,6 +318,7 @@ const unsigned long DRIVE_STUCK_TIME_MS = 900;
 
 const float WHEEL_MISMATCH_SPEED_MIN = 700.0;
 const float WHEEL_MISMATCH_RATIO = 0.45;
+const float WHEEL_MISMATCH_EXPECTED_RATIO = 0.70;
 const unsigned long WHEEL_MISMATCH_TIME_MS = 900;
 
 const float TURN_STUCK_YAW_MIN_DEG = 3.0;
@@ -386,8 +436,12 @@ void rightISR();
 void goToPoint(float targetX, float targetY);
 void runWaypointAction(const char* action);
 
-void runObstacleAvoidance(float originalPathHeadingDeg);
+void runObstacleAvoidance(float targetX, float targetY,
+                          const char* trigger = "front_blocked");
 AvoidTurnChoice chooseAvoidTurnDirection();
+AvoidTurnChoice evaluateAvoidTurnDirection(AvoidSideClearance &left,
+                                           AvoidSideClearance &right,
+                                           const char* &reason);
 void reverseDistanceOpenLoop(float distanceMetres);
 
 bool isValidWallFollowReading(uint16_t distanceMm);
@@ -399,7 +453,8 @@ void driveDistanceWithHeading(float distanceMetres, float targetHeadingDeg);
 void driveDistanceWithHeadingNoAvoid(float distanceMetres, float targetHeadingDeg);
 
 void runStuckRecovery();
-void updateStuckDriving(float targetSpeed, float leftSpeed, float rightSpeed);
+void updateStuckDriving(float leftTargetSpeed, float rightTargetSpeed,
+                        float leftSpeed, float rightSpeed);
 void resetTurnStuckCheck(float startYaw);
 void updateStuckTurning(float currentYaw);
 void clearStuckFlags();
@@ -427,14 +482,16 @@ void updateFanTOFSensors();
 bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 uint16_t getRangeSensorDistance(RangeSensorId id);
+float getFanSweepClearanceMm(RangeSensorId id);
+bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm);
 bool waitForFrontClear(unsigned long timeoutMs);
 void printFanTelemetry();
 
 bool handleEmergencyStopPriority(const char* contextLabel);
 bool handleStuckPriority();
-bool handleObstacleAvoidPriority(float originalPathHeadingDeg);
+bool handleObstacleAvoidPriority(float targetX, float targetY);
 bool handleReturnHomePriority();
-bool handleDrivePriorities(float originalPathHeadingDeg);
+bool handleDrivePriorities(float targetX, float targetY);
 
 void stopMotors();
 void writeMotorUS(int leftUs, int rightUs);

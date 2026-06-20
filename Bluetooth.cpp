@@ -19,8 +19,8 @@ static unsigned long lastBluetoothTelemetryMs = 0;
 
 const float TEST_DRIVE_MIN_METRES = 0.01;
 const float TEST_DRIVE_MAX_METRES = 1.50;
-const float TEST_GOTO_MIN_COORD_M = -3.00;
-const float TEST_GOTO_MAX_COORD_M = 3.00;
+const float TEST_GOTO_MIN_COORD_M = -10.00;
+const float TEST_GOTO_MAX_COORD_M = 10.00;
 const float TEST_AVOID_MIN_METRES = 0.10;
 const float TEST_AVOID_MAX_METRES = 2.00;
 const float TEST_TURN_MIN_DEG = -360.0;
@@ -417,53 +417,32 @@ void sendBluetoothTelemetry() {
 }
 
 static const char* avoidChoiceName(AvoidTurnChoice choice) {
-  return choice == AVOID_TURN_LEFT ? "left" : "right";
+  if (choice == AVOID_TURN_LEFT) {
+    return "left";
+  }
+  if (choice == AVOID_TURN_RIGHT) {
+    return "right";
+  }
+  return "none";
 }
 
-static AvoidTurnChoice sampleAvoidSideChoice(const char* &reason) {
-  bool leftValid = isRangeSensorValid(RANGE_LEFT);
-  bool rightValid = isRangeSensorValid(RANGE_RIGHT);
-  uint16_t leftMm = getRangeSensorDistance(RANGE_LEFT);
-  uint16_t rightMm = getRangeSensorDistance(RANGE_RIGHT);
-
-  if (leftValid && !rightValid) {
-    reason = "only_left_valid";
-    return AVOID_TURN_LEFT;
-  }
-
-  if (!leftValid && rightValid) {
-    reason = "only_right_valid";
-    return AVOID_TURN_RIGHT;
-  }
-
-  if (!leftValid && !rightValid) {
-    reason = "no_valid_side_default_right";
-    return AVOID_TURN_RIGHT;
-  }
-
-  if (leftMm > rightMm + AVOID_OPEN_MARGIN_MM) {
-    reason = "left_more_clearance";
-    return AVOID_TURN_LEFT;
-  }
-
-  if (rightMm > leftMm + AVOID_OPEN_MARGIN_MM) {
-    reason = "right_more_clearance";
-    return AVOID_TURN_RIGHT;
-  }
-
-  reason = "similar_clearance_default_right";
-  return AVOID_TURN_RIGHT;
+static AvoidTurnChoice sampleAvoidSideChoice(const char* &reason,
+                                             AvoidSideClearance &left,
+                                             AvoidSideClearance &right) {
+  return evaluateAvoidTurnDirection(left, right, reason);
 }
 
 static void printSideDecisionHeader() {
-  Serial2.println("side_decision,sample,ms,choice,reason,front_mm,front_valid,front_blocked,right_mm,right_valid,left_mm,left_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid");
+  Serial2.println("side_decision,sample,ms,choice,reason,front_mm,front_valid,front_blocked,right_mm,right_valid,left_mm,left_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,left_passable,left_inner_sweep_clearance_mm,left_outer_sweep_clearance_mm,left_score_mm,right_passable,right_inner_sweep_clearance_mm,right_outer_sweep_clearance_mm,right_score_mm");
 }
 
 static void printSideDecisionRow(int sampleNumber) {
   updateTOFSensors();
 
   const char* reason = "";
-  AvoidTurnChoice choice = sampleAvoidSideChoice(reason);
+  AvoidSideClearance left;
+  AvoidSideClearance right;
+  AvoidTurnChoice choice = sampleAvoidSideChoice(reason, left, right);
 
   Serial2.print("side_decision,");
   Serial2.print(sampleNumber);
@@ -502,7 +481,23 @@ static void printSideDecisionRow(int sampleNumber) {
   Serial2.print(",");
   Serial2.print(isRangeSensorValid(RANGE_LEFT_INNER) ? 1 : 0);
   Serial2.print(",");
-  Serial2.println(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
+  Serial2.print(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(left.passable ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(left.innerSweepClearanceMm, 1);
+  Serial2.print(",");
+  Serial2.print(left.outerSweepClearanceMm, 1);
+  Serial2.print(",");
+  Serial2.print(left.scoreMm, 1);
+  Serial2.print(",");
+  Serial2.print(right.passable ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(right.innerSweepClearanceMm, 1);
+  Serial2.print(",");
+  Serial2.print(right.outerSweepClearanceMm, 1);
+  Serial2.print(",");
+  Serial2.println(right.scoreMm, 1);
 }
 
 static void printFloatRangeError(const char* commandName, float minValue, float maxValue) {

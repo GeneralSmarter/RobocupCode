@@ -396,6 +396,53 @@ uint16_t getRangeSensorDistance(RangeSensorId id) {
   return rangeSensors[id].distanceMm;
 }
 
+static float getRobotTurnSweepRadiusMm() {
+  const float frontLeft = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm * ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
+                                ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm * ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm);
+  const float frontRight = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm * ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
+                                 ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm);
+  const float rearLeft = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm +
+                               ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm * ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm);
+  const float rearRight = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm +
+                                ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm * ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm);
+  return max(max(frontLeft, frontRight), max(rearLeft, rearRight));
+}
+
+float getFanSweepClearanceMm(RangeSensorId id) {
+  if (!isPhysicalFanSensor(id) || !isRangeSensorValid(id)) {
+    return -1000000.0;
+  }
+
+  const FanSensorGeometry &sensor = FAN_SENSOR_GEOMETRY[(int)id];
+  const float rangeMm = (float)getRangeSensorDistance(id);
+  const float angleRad = sensor.angleDeg * DEG_TO_RAD;
+  const float endpointX = sensor.xMm + rangeMm * cosf(angleRad);
+  const float endpointY = sensor.yMm + rangeMm * sinf(angleRad);
+  return sqrtf(endpointX * endpointX + endpointY * endpointY) -
+         getRobotTurnSweepRadiusMm();
+}
+
+bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
+  sensorId = RANGE_SENSOR_COUNT;
+  clearanceMm = 1000000.0;
+
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
+    RangeSensorId id = (RangeSensorId)i;
+    if (!isRangeSensorValid(id)) {
+      continue;
+    }
+
+    const float clearance = getFanSweepClearanceMm(id);
+    if (clearance < clearanceMm) {
+      clearanceMm = clearance;
+      sensorId = id;
+    }
+  }
+
+  return sensorId != RANGE_SENSOR_COUNT &&
+         clearanceMm < AVOID_DIAGONAL_WARNING_CLEARANCE_MM;
+}
+
 bool waitForFrontClear(unsigned long timeoutMs) {
   unsigned long startMs = millis();
 

@@ -134,7 +134,13 @@ void runStuckRecovery() {
   }
 }
 
-void updateStuckDriving(float targetSpeed, float leftSpeed, float rightSpeed) {
+void updateStuckDriving(float leftTargetSpeed, float rightTargetSpeed,
+                        float leftSpeed, float rightSpeed) {
+  float absLeftTarget = fabs(leftTargetSpeed);
+  float absRightTarget = fabs(rightTargetSpeed);
+  float avgTargetSpeed = (absLeftTarget + absRightTarget) / 2.0;
+  float maxTargetSpeed = max(absLeftTarget, absRightTarget);
+  float minTargetSpeed = min(absLeftTarget, absRightTarget);
   float absLeftSpeed = fabs(leftSpeed);
   float absRightSpeed = fabs(rightSpeed);
   float avgSpeed = (absLeftSpeed + absRightSpeed) / 2.0;
@@ -143,7 +149,7 @@ void updateStuckDriving(float targetSpeed, float leftSpeed, float rightSpeed) {
 
   unsigned long now = millis();
 
-  if (targetSpeed > STUCK_COMMAND_SPEED_MIN && avgSpeed < STUCK_ENCODER_SPEED_MIN) {
+  if (avgTargetSpeed > STUCK_COMMAND_SPEED_MIN && avgSpeed < STUCK_ENCODER_SPEED_MIN) {
     if (driveStuckStartMs == 0) {
       driveStuckStartMs = now;
     }
@@ -157,7 +163,13 @@ void updateStuckDriving(float targetSpeed, float leftSpeed, float rightSpeed) {
     driveStuck = false;
   }
 
-  if (maxWheelSpeed > WHEEL_MISMATCH_SPEED_MIN && minWheelSpeed < maxWheelSpeed * WHEEL_MISMATCH_RATIO) {
+  bool comparableWheelTargets =
+    maxTargetSpeed > WHEEL_MISMATCH_SPEED_MIN &&
+    minTargetSpeed >= maxTargetSpeed * WHEEL_MISMATCH_EXPECTED_RATIO;
+
+  if (comparableWheelTargets &&
+      maxWheelSpeed > WHEEL_MISMATCH_SPEED_MIN &&
+      minWheelSpeed < maxWheelSpeed * WHEEL_MISMATCH_RATIO) {
     if (wheelMismatchStartMs == 0) {
       wheelMismatchStartMs = now;
     }

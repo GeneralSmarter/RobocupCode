@@ -111,7 +111,7 @@ void goToPoint(float targetX, float targetY) {
       return;
     }
 
-    if (handleDrivePriorities(targetHeading)) {
+    if (handleDrivePriorities(targetX, targetY)) {
       if (!robotRunEnabled || currentState == END_MATCH) {
         stopMotors();
         return;
@@ -189,7 +189,9 @@ void goToPoint(float targetX, float targetY) {
       );
       setMotionCommand(forwardTargetSpeed, headingCorrection);
 
-      updateStuckDriving(forwardTargetSpeed, leftSpeed, rightSpeed);
+      updateStuckDriving(forwardTargetSpeed + headingCorrection,
+                          forwardTargetSpeed - headingCorrection,
+                          leftSpeed, rightSpeed);
 
       if (handleStuckPriority()) {
         resetEncodersAndPID();

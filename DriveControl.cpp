@@ -115,12 +115,6 @@ void driveDistanceWithHeadingWallFallback(float distanceMetres, float targetHead
       float leftSpeed = dLeft / dt;
       float rightSpeed = dRight / dt;
 
-      updateStuckDriving(baseTargetSpeed, leftSpeed, rightSpeed);
-
-      if (handleStuckPriority()) {
-        return;
-      }
-
       updateOdometry();
 
       float yaw = readYawDeg();
@@ -135,6 +129,12 @@ void driveDistanceWithHeadingWallFallback(float distanceMetres, float targetHead
 
       leftTargetSpeed  = constrain(leftTargetSpeed, 0.0, 3000.0);
       rightTargetSpeed = constrain(rightTargetSpeed, 0.0, 3000.0);
+
+      updateStuckDriving(leftTargetSpeed, rightTargetSpeed, leftSpeed, rightSpeed);
+
+      if (handleStuckPriority()) {
+        return;
+      }
 
       int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, leftForwardBaseUs);
       int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, rightForwardBaseUs);
@@ -174,6 +174,9 @@ void driveDistanceWithHeading(float distanceMetres, float targetHeadingDeg) {
   resetEncodersAndPID();
 
   long targetTicks = distanceMetres * TICKS_PER_METRE;
+  float targetHeadingRad = targetHeadingDeg * DEG_TO_RAD;
+  float targetX = robotX + distanceMetres * cosf(targetHeadingRad);
+  float targetY = robotY + distanceMetres * sinf(targetHeadingRad);
 
   Serial.println();
   Serial.print("Driving ");
@@ -190,7 +193,7 @@ void driveDistanceWithHeading(float distanceMetres, float targetHeadingDeg) {
 
     updateTOFSensors();
 
-    if (handleDrivePriorities(targetHeadingDeg)) {
+    if (handleDrivePriorities(targetX, targetY)) {
       return;
     }
 
@@ -229,12 +232,6 @@ void driveDistanceWithHeading(float distanceMetres, float targetHeadingDeg) {
       float leftSpeed = dLeft / dt;
       float rightSpeed = dRight / dt;
 
-      updateStuckDriving(baseTargetSpeed, leftSpeed, rightSpeed);
-
-      if (handleStuckPriority()) {
-        return;
-      }
-
       updateOdometry();
 
       float yaw = readYawDeg();
@@ -247,6 +244,12 @@ void driveDistanceWithHeading(float distanceMetres, float targetHeadingDeg) {
 
       leftTargetSpeed  = constrain(leftTargetSpeed, 0.0, 3000.0);
       rightTargetSpeed = constrain(rightTargetSpeed, 0.0, 3000.0);
+
+      updateStuckDriving(leftTargetSpeed, rightTargetSpeed, leftSpeed, rightSpeed);
+
+      if (handleStuckPriority()) {
+        return;
+      }
 
       int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, leftForwardBaseUs);
       int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, rightForwardBaseUs);
@@ -342,12 +345,6 @@ void driveDistanceWithHeadingNoAvoid(float distanceMetres, float targetHeadingDe
       float leftSpeed = dLeft / dt;
       float rightSpeed = dRight / dt;
 
-      updateStuckDriving(baseTargetSpeed, leftSpeed, rightSpeed);
-
-      if (handleStuckPriority()) {
-        return;
-      }
-
       updateOdometry();
 
       float yaw = readYawDeg();
@@ -360,6 +357,12 @@ void driveDistanceWithHeadingNoAvoid(float distanceMetres, float targetHeadingDe
 
       leftTargetSpeed  = constrain(leftTargetSpeed, 0.0, 3000.0);
       rightTargetSpeed = constrain(rightTargetSpeed, 0.0, 3000.0);
+
+      updateStuckDriving(leftTargetSpeed, rightTargetSpeed, leftSpeed, rightSpeed);
+
+      if (handleStuckPriority()) {
+        return;
+      }
 
       int leftCommand = updatePID(leftTargetSpeed, leftSpeed, leftIntegral, lastLeftError, dt, leftForwardBaseUs);
       int rightCommand = updatePID(rightTargetSpeed, rightSpeed, rightIntegral, lastRightError, dt, rightForwardBaseUs);
