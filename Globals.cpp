@@ -14,6 +14,7 @@ long lastOdomRightCount = 0;
 
 int leftForwardBaseUs = LEFT_BASE_US;
 int rightForwardBaseUs = RIGHT_BASE_US;
+int weightScanTurnOffsetUs = DEFAULT_WEIGHT_SCAN_TURN_OFFSET_US;
 
 float robotX = 0.0;
 float robotY = 0.0;
@@ -34,29 +35,69 @@ float lastRightError = 0.0;
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 
 float yawOffset = 0.0;
-float K_heading = DEFAULT_HEADING_GAIN;
 
 SX1509 io;
 
 VL53L0X rightOuterTOF;
-VL53L1X rightInnerTOF;
-VL53L1X leftInnerTOF;
+VL53L0X rightInnerTOF;
+VL53L0X leftInnerTOF;
 VL53L0X leftOuterTOF;
+VL53L1X objectLeftLowTOF;
+VL53L1X objectLeftUpperTOF;
+VL53L1X objectRightLowTOF;
+VL53L1X objectRightUpperTOF;
 
 RangeSensorState rangeSensors[RANGE_SENSOR_COUNT] = {
-  {"right_outer", (int)FAN_SENSOR_GEOMETRY[RANGE_RIGHT_OUTER].angleDeg, 9999, false, false, false, 0, 0, 0},
-  {"right_inner", (int)FAN_SENSOR_GEOMETRY[RANGE_RIGHT_INNER].angleDeg, 9999, false, false, false, 0, 0, 0},
-  {"left_inner", (int)FAN_SENSOR_GEOMETRY[RANGE_LEFT_INNER].angleDeg, 9999, false, false, false, 0, 0, 0},
-  {"left_outer", (int)FAN_SENSOR_GEOMETRY[RANGE_LEFT_OUTER].angleDeg, 9999, false, false, false, 0, 0, 0},
-  {"front_virtual", 0, 9999, false, false, false, 0, 0, 0},
-  {"right_fan", -30, 9999, false, false, false, 0, 0, 0},
-  {"left_fan", 30, 9999, false, false, false, 0, 0, 0}
+  {"right_outer", (int)FAN_SENSOR_GEOMETRY[RANGE_RIGHT_OUTER].angleDeg, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
+  {"right_inner", (int)FAN_SENSOR_GEOMETRY[RANGE_RIGHT_INNER].angleDeg, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
+  {"left_inner", (int)FAN_SENSOR_GEOMETRY[RANGE_LEFT_INNER].angleDeg, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
+  {"left_outer", (int)FAN_SENSOR_GEOMETRY[RANGE_LEFT_OUTER].angleDeg, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
+  {"front_virtual", 0, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
+  {"right_fan", -30, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
+  {"left_fan", 30, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
+  {"fake_rear_tof", (int)FAKE_REAR_TOF_GEOMETRY.angleDeg, RANGE_NO_READING_MM, false, false, false, 0, 0, 0}
+};
+
+const ObjectSensorGeometry OBJECT_SENSOR_GEOMETRY[OBJECT_TOF_COUNT] = {
+  {91.4,  60.6, 55.0, -20.0, 0.0, OBJECT_ROLE_LOW},    // object_left_low, XSHUT7
+  {91.4,  60.6, 120.0, -20.0, 0.0, OBJECT_ROLE_UPPER}, // object_left_upper, XSHUT5
+  {91.4, -60.6, 55.0,  20.0, 0.0, OBJECT_ROLE_LOW},    // object_right_low, XSHUT6
+  {91.4, -60.6, 120.0,  20.0, 0.0, OBJECT_ROLE_UPPER}  // object_right_upper, XSHUT4
+};
+
+ObjectSensorState objectSensors[OBJECT_TOF_COUNT] = {
+  {"object_left_low", OBJECT_ROLE_LOW, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0},
+  {"object_left_upper", OBJECT_ROLE_UPPER, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0},
+  {"object_right_low", OBJECT_ROLE_LOW, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0},
+  {"object_right_upper", OBJECT_ROLE_UPPER, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0}
+};
+
+ObjectCandidateState objectCandidate = {
+  OBJECT_CANDIDATE_DISABLED,
+  "object_tof_disabled",
+  false,
+  0,
+  OBJECT_NO_READING_MM,
+  0,
+  0
+};
+
+ObjectTargetEstimate objectTargetEstimate = {
+  false,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  OBJECT_NO_READING_MM,
+  0,
+  "not_estimated",
+  0
 };
 
 bool frontBlocked = false;
-uint16_t frontDistance = 9999;
-uint16_t leftDistance  = 9999;
-uint16_t rightDistance = 9999;
+uint16_t frontDistance = RANGE_NO_READING_MM;
+uint16_t leftDistance  = RANGE_NO_READING_MM;
+uint16_t rightDistance = RANGE_NO_READING_MM;
 
 bool frontTofValid = false;
 bool leftTofValid = false;
@@ -68,7 +109,6 @@ unsigned long lastRightTofReadMs = 0;
 
 int frontBlockCounter = 0;
 int frontClearCounter = 0;
-unsigned long lastFrontInvalidPrintMs = 0;
 
 bool driveStuck = false;
 bool wheelMismatchStuck = false;
@@ -79,10 +119,8 @@ unsigned long wheelMismatchStartMs = 0;
 unsigned long turnCheckStartMs = 0;
 float turnCheckStartYaw = 0.0;
 
-int stuckRecoveryCount = 0;
-bool stoppedSafely = false;
-bool inRecovery = false;
 bool returnHomeRequested = false;
+bool escapeBacktrackEnabled = true;
 bool robotRunEnabled = false;
 bool bluetoothOutputEnabled = false;
 
@@ -97,6 +135,42 @@ bool endMatchPrinted = false;
 float desiredForwardSpeed = 0.0;
 float desiredTurnSpeed = 0.0;
 
+NavigationGoal navigationGoal = {
+  NAV_GOAL_NONE,
+  NAV_OWNER_ROUTE,
+  false,
+  false,
+  false,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0
+};
+
+PlannerTelemetry plannerTelemetry = {
+  0.0,
+  0.0,
+  0.0,
+  -1.0,
+  0.0,
+  0.0,
+  0,
+  PLANNER_STOP_NONE,
+  "idle",
+  "idle",
+  "",
+  0
+};
+
+bool motorStopRequested = true;
+unsigned long lastSensorUpdateMs = 0;
+unsigned long lastOdometryUpdateMs = 0;
+unsigned long lastPlannerUpdateMs = 0;
+unsigned long lastMotorControlUpdateMs = 0;
+
 int lastLeftMotorUs = STOP_US;
 int lastRightMotorUs = STOP_US;
 
@@ -108,5 +182,3 @@ Waypoint path[] = {
 };
 
 extern const int NUM_POINTS = sizeof(path) / sizeof(path[0]);
-
-unsigned long lastTime = 0;

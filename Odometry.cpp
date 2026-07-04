@@ -16,7 +16,7 @@ void updateOdometry() {
 
   float dCentre = (dLeftMetres + dRightMetres) / 2.0;
 
-  robotTheta = readYawDeg();
+  robotTheta = navigationHeadingDeg();
   float thetaRad = robotTheta * PI / 180.0;
 
   robotX += dCentre * cos(thetaRad);

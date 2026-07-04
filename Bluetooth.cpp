@@ -14,8 +14,20 @@ static bool bluetoothCsvStreamEnabled = false;
 static bool bluetoothTestArmed = false;
 static bool bluetoothManualArmed = false;
 static bool bluetoothManualActive = false;
+static bool bluetoothSideTestActive = false;
+static bool bluetoothTurnPulseTestActive = false;
+static bool turnPulseCoasting = false;
 static unsigned long lastManualDriveCommandMs = 0;
 static unsigned long lastBluetoothTelemetryMs = 0;
+static unsigned long sideTestEndMs = 0;
+static unsigned long sideTestNextSampleMs = 0;
+static int sideTestSampleNumber = 0;
+static unsigned long turnPulseEndMs = 0;
+static unsigned long turnPulseCoastEndMs = 0;
+static unsigned long turnPulseNextSampleMs = 0;
+static unsigned long turnPulseStartMs = 0;
+static float turnPulseStartYawDeg = 0.0;
+static float turnPulseCommandTicksPerSec = 0.0;
 
 const float TEST_DRIVE_MIN_METRES = 0.01;
 const float TEST_DRIVE_MAX_METRES = 1.50;
@@ -25,15 +37,24 @@ const float TEST_AVOID_MIN_METRES = 0.10;
 const float TEST_AVOID_MAX_METRES = 2.00;
 const float TEST_TURN_MIN_DEG = -360.0;
 const float TEST_TURN_MAX_DEG = 360.0;
+const float TEST_TURN_PULSE_MIN_SECONDS = 0.10;
+const float TEST_TURN_PULSE_MAX_SECONDS = 0.80;
+const unsigned long TEST_TURN_PULSE_SAMPLE_INTERVAL_MS = 100;
+const unsigned long TEST_TURN_PULSE_COAST_MS = 1000;
+const unsigned long TEST_TURN_LADDER_PULSE_MS = 250;
+const unsigned long TEST_TURN_LADDER_COAST_MS = 500;
+const int TEST_TURN_LADDER_OFFSETS_US[] = {120, 160, 200, 240, 280, 300};
+const int TEST_TURN_LADDER_STEP_COUNT =
+  sizeof(TEST_TURN_LADDER_OFFSETS_US) / sizeof(TEST_TURN_LADDER_OFFSETS_US[0]);
 const float TEST_SIDE_MIN_SECONDS = 1.0;
 const float TEST_SIDE_MAX_SECONDS = 30.0;
 const unsigned long TEST_SIDE_SAMPLE_INTERVAL_MS = 1000;
 const float SPEED_MIN_TICKS_PER_SEC = 300.0;
 const float SPEED_MAX_TICKS_PER_SEC = 3000.0;
-const float HGAIN_MIN = 0.0;
-const float HGAIN_MAX = 100.0;
 const float FBASE_MIN_US = STOP_US;
 const float FBASE_MAX_US = MAX_US;
+const float SEARCHTURN_MIN_US = WEIGHT_SCAN_TURN_OFFSET_MIN_US;
+const float SEARCHTURN_MAX_US = WEIGHT_SCAN_TURN_OFFSET_MAX_US;
 const float MANUAL_COMMAND_MIN = -100.0;
 const float MANUAL_COMMAND_MAX = 100.0;
 const unsigned long MANUAL_DRIVE_TIMEOUT_MS = 350;
@@ -163,18 +184,25 @@ static void printBluetoothHelp() {
   Serial2.println("  CAL            print calibration summary");
   Serial2.println("  SPEED <ticks>  set temporary base target speed");
   Serial2.println("  SPEED RESET    restore default base target speed");
-  Serial2.println("  HGAIN <gain>   set temporary heading correction gain");
-  Serial2.println("  HGAIN RESET    restore default heading correction gain");
+  Serial2.println("  SEARCHTURN <us>|RESET  set TEST SEARCH scan turn offset");
   Serial2.println("  FBASE <l> <r>  set temporary forward motor base pulses");
   Serial2.println("  FBASE RESET    restore default forward motor base pulses");
+  Serial2.println("  ESCAPE ON/OFF/STATUS  enable or disable front-blocked reverse recovery");
   Serial2.println("  TEST ARM       allow one or more test motion commands");
   Serial2.println("  TEST DISARM    disable test motion commands");
   Serial2.println("  TEST DRIVE <m> drive a fixed distance at current heading");
   Serial2.println("  TEST GOTO <x> <y>  go to one temporary absolute waypoint");
   Serial2.println("  TEST AVOID <m> run one straight-ahead avoidance scenario");
+  Serial2.println("  TEST ESCAPE <m> front-blocked reverse-recovery test");
   Serial2.println("  TEST FAN       print high fan ToF sector readings");
+  Serial2.println("  TEST OBJECT    print object ToF and candidate telemetry");
+  Serial2.println("  TEST HUNT TARGET  print estimated pickup target without moving");
+  Serial2.println("  TEST HUNT      drive to confirmed object target after TEST ARM");
+  Serial2.println("  TEST SEARCH    run waypoint-style weight scan/search after TEST ARM");
   Serial2.println("  TEST SIDE <s>  sample avoidance side choice without moving");
   Serial2.println("  TEST TURN <d>  turn a fixed signed angle in degrees");
+  Serial2.println("  TEST TURNPULSE <signed_s>  full-rate timed turn, then log 1 s coast");
+  Serial2.println("  TEST TURNLADDER LEFT|RIGHT  raw slow-pulse calibration ladder");
   Serial2.println("  MARK <note>    print and log a test note");
   Serial2.println("  MANUAL ARM     allow live DRIVE commands");
   Serial2.println("  MANUAL DISARM  stop and disable live DRIVE commands");
@@ -207,8 +235,6 @@ static int displayWaypointIndex() {
 }
 
 void sendBluetoothStatus() {
-  updateTOFSensors();
-
   long leftCount;
   long rightCount;
   readEncoderCounts(leftCount, rightCount);
@@ -267,12 +293,37 @@ void sendBluetoothStatus() {
   Serial2.print(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
   Serial2.print(" frontVirtualValid=");
   Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
+  Serial2.print(" fakeRear=");
+  Serial2.print(getRangeSensorDistance(RANGE_FAKE_REAR));
+  Serial2.print("/");
+  Serial2.print(isRangeSensorValid(RANGE_FAKE_REAR) ? 1 : 0);
+  Serial2.print("/");
+  Serial2.print(isRangeSensorBlocked(RANGE_FAKE_REAR) ? 1 : 0);
+  Serial2.print(" object=");
+  Serial2.print(objectCandidateKindName(objectCandidate.kind));
+  Serial2.print("/");
+  Serial2.print(objectCandidate.confirmed ? 1 : 0);
+  Serial2.print("/");
+  Serial2.print(objectCandidate.directionHint);
+  Serial2.print("/");
+  Serial2.print(objectCandidate.rangeMm);
+  Serial2.print(" fanAgeMs=");
+  unsigned long statusNow = millis();
+  Serial2.print(statusNow - rangeSensors[RANGE_RIGHT_OUTER].lastReadMs);
+  Serial2.print("/");
+  Serial2.print(statusNow - rangeSensors[RANGE_RIGHT_INNER].lastReadMs);
+  Serial2.print("/");
+  Serial2.print(statusNow - rangeSensors[RANGE_LEFT_INNER].lastReadMs);
+  Serial2.print("/");
+  Serial2.print(statusNow - rangeSensors[RANGE_LEFT_OUTER].lastReadMs);
   Serial2.print(" encL=");
   Serial2.print(leftCount);
   Serial2.print(" encR=");
   Serial2.print(rightCount);
   Serial2.print(" blocked=");
   Serial2.print(frontBlocked ? 1 : 0);
+  Serial2.print(" escape=");
+  Serial2.print(escapeBacktrackEnabled ? 1 : 0);
   Serial2.print(" stuck=");
   Serial2.print((driveStuck || wheelMismatchStuck || turnStuck) ? 1 : 0);
   Serial2.print(" home=");
@@ -287,16 +338,42 @@ void sendBluetoothStatus() {
   Serial2.print(rightForwardBaseUs);
   Serial2.print(" baseSpeed=");
   Serial2.print(baseTargetSpeed, 1);
-  Serial2.print(" hGain=");
-  Serial2.print(K_heading, 1);
+  Serial2.print(" searchTurnUs=");
+  Serial2.print(weightScanTurnOffsetUs);
   Serial2.print(" cmdForward=");
   Serial2.print(desiredForwardSpeed, 1);
   Serial2.print(" cmdTurn=");
-  Serial2.println(desiredTurnSpeed, 1);
+  Serial2.print(desiredTurnSpeed, 1);
+  Serial2.print(" plannerCandidates=");
+  Serial2.print(plannerTelemetry.candidateCount);
+  Serial2.print(" plannerV=");
+  Serial2.print(plannerTelemetry.selectedForwardTicksPerSec, 1);
+  Serial2.print(" plannerW=");
+  Serial2.print(plannerTelemetry.selectedTurnTicksPerSec, 1);
+  Serial2.print(" plannerClearance=");
+  Serial2.print(plannerTelemetry.minimumSweptClearanceMm, 1);
+  Serial2.print(" plannerStop=");
+  Serial2.print(plannerStopReasonName(plannerTelemetry.stopReason));
+  Serial2.print(" plannerReason=");
+  Serial2.print(plannerTelemetry.planReason);
+  Serial2.print(" objectTarget=");
+  Serial2.print(objectTargetEstimate.valid ? 1 : 0);
+  Serial2.print("/");
+  Serial2.print(isObjectTargetFresh() ? 1 : 0);
+  Serial2.print("/");
+  Serial2.print(objectTargetEstimate.worldX, 3);
+  Serial2.print("/");
+  Serial2.print(objectTargetEstimate.worldY, 3);
+  Serial2.print("/");
+  Serial2.print(objectTargetEstimate.robotXmm, 1);
+  Serial2.print("/");
+  Serial2.print(objectTargetEstimate.robotYmm, 1);
+  Serial2.print("/");
+  Serial2.println(objectTargetEstimate.sourceMask);
 }
 
 static void sendBluetoothCsvHeader() {
-  Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,front_virtual_mm,front_virtual_valid,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn");
+  Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,front_virtual_mm,front_virtual_valid,fake_rear_mm,fake_rear_valid,fake_rear_blocked,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn,planner_candidates,planner_v_tps,planner_w_tps,planner_curvature,planner_min_clearance_mm,planner_speed_cap_tps,planner_goal_distance_m,planner_stop,planner_reason,planner_replan,planner_safe_stop,object_candidate,object_confirmed,object_direction,object_range_mm,object0_mm,object1_mm,object2_mm,object3_mm,object0_valid,object1_valid,object2_valid,object3_valid,object0_range_status,object1_range_status,object2_range_status,object3_range_status,object_reason,object_target_valid,object_target_fresh,object_target_world_x_m,object_target_world_y_m,object_target_robot_x_mm,object_target_robot_y_mm,object_target_sources,object_target_reason");
 }
 
 static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName, const char* eventDetail) {
@@ -358,6 +435,21 @@ static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName,
   Serial2.print(",");
   Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
   Serial2.print(",");
+  Serial2.print(getRangeSensorDistance(RANGE_FAKE_REAR));
+  Serial2.print(",");
+  Serial2.print(isRangeSensorValid(RANGE_FAKE_REAR) ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isRangeSensorBlocked(RANGE_FAKE_REAR) ? 1 : 0);
+  Serial2.print(",");
+  unsigned long now = millis();
+  Serial2.print(now - rangeSensors[RANGE_RIGHT_OUTER].lastReadMs);
+  Serial2.print(",");
+  Serial2.print(now - rangeSensors[RANGE_RIGHT_INNER].lastReadMs);
+  Serial2.print(",");
+  Serial2.print(now - rangeSensors[RANGE_LEFT_INNER].lastReadMs);
+  Serial2.print(",");
+  Serial2.print(now - rangeSensors[RANGE_LEFT_OUTER].lastReadMs);
+  Serial2.print(",");
   Serial2.print(leftCount);
   Serial2.print(",");
   Serial2.print(rightCount);
@@ -380,7 +472,67 @@ static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName,
   Serial2.print(",");
   Serial2.print(desiredForwardSpeed, 1);
   Serial2.print(",");
-  Serial2.println(desiredTurnSpeed, 1);
+  Serial2.print(desiredTurnSpeed, 1);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.candidateCount);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.selectedForwardTicksPerSec, 1);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.selectedTurnTicksPerSec, 1);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.selectedCurvature, 3);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.minimumSweptClearanceMm, 1);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.speedCapTicksPerSec, 1);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.localGoalDistanceM, 3);
+  Serial2.print(",");
+  Serial2.print(plannerStopReasonName(plannerTelemetry.stopReason));
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.planReason);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.replanReason);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.safeStopReason);
+  Serial2.print(",");
+  Serial2.print(objectCandidateKindName(objectCandidate.kind));
+  Serial2.print(",");
+  Serial2.print(objectCandidate.confirmed ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(objectCandidate.directionHint);
+  Serial2.print(",");
+  Serial2.print(objectCandidate.rangeMm);
+  for (int i = 0; i < OBJECT_TOF_COUNT; i++) {
+    Serial2.print(",");
+    Serial2.print(objectSensors[i].distanceMm);
+  }
+  for (int i = 0; i < OBJECT_TOF_COUNT; i++) {
+    Serial2.print(",");
+    Serial2.print(objectSensors[i].valid ? 1 : 0);
+  }
+  for (int i = 0; i < OBJECT_TOF_COUNT; i++) {
+    Serial2.print(",");
+    Serial2.print(objectSensors[i].rangeStatus);
+  }
+  Serial2.print(",");
+  Serial2.print(objectCandidate.reason);
+  Serial2.print(",");
+  Serial2.print(objectTargetEstimate.valid ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(isObjectTargetFresh() ? 1 : 0);
+  Serial2.print(",");
+  Serial2.print(objectTargetEstimate.worldX, 3);
+  Serial2.print(",");
+  Serial2.print(objectTargetEstimate.worldY, 3);
+  Serial2.print(",");
+  Serial2.print(objectTargetEstimate.robotXmm, 1);
+  Serial2.print(",");
+  Serial2.print(objectTargetEstimate.robotYmm, 1);
+  Serial2.print(",");
+  Serial2.print(objectTargetEstimate.sourceMask);
+  Serial2.print(",");
+  Serial2.println(objectTargetEstimate.reason);
 }
 
 static void sendBluetoothCsvRow() {
@@ -509,16 +661,6 @@ static void printFloatRangeError(const char* commandName, float minValue, float 
   Serial2.println(maxValue, 2);
 }
 
-static int manualMotorPulseFromPercent(float percent, int forwardUs, int reverseUs) {
-  percent = constrain(percent, MANUAL_COMMAND_MIN, MANUAL_COMMAND_MAX);
-
-  if (percent >= 0.0) {
-    return STOP_US + (int)((forwardUs - STOP_US) * (percent / 100.0));
-  }
-
-  return STOP_US - (int)((STOP_US - reverseUs) * (-percent / 100.0));
-}
-
 static void stopManualDrive() {
   bluetoothManualActive = false;
   setMotionCommand(0.0, 0.0);
@@ -546,14 +688,28 @@ static void runManualDriveCommand(float forwardPercent, float turnPercent) {
     return;
   }
 
-  float leftPercent = constrain(forwardPercent + turnPercent, MANUAL_COMMAND_MIN, MANUAL_COMMAND_MAX);
-  float rightPercent = constrain(forwardPercent - turnPercent, MANUAL_COMMAND_MIN, MANUAL_COMMAND_MAX);
+  if ((turnPercent > 0.0 &&
+       (!isRangeSensorValid(RANGE_LEFT_INNER) || !isRangeSensorValid(RANGE_LEFT_OUTER))) ||
+      (turnPercent < 0.0 &&
+       (!isRangeSensorValid(RANGE_RIGHT_INNER) || !isRangeSensorValid(RANGE_RIGHT_OUTER)))) {
+    stopManualDrive();
+    Serial2.println("MANUAL blocked by invalid turn-side sensing. Motors stopped.");
+    sendBluetoothEvent("manual_drive_blocked", "turn_side_invalid");
+    return;
+  }
 
-  int leftUs = manualMotorPulseFromPercent(leftPercent, leftForwardBaseUs, LEFT_REVERSE_US);
-  int rightUs = manualMotorPulseFromPercent(rightPercent, rightForwardBaseUs, RIGHT_REVERSE_US);
+  if (turnPercent != 0.0 && !isTurnSweepSafe()) {
+    stopManualDrive();
+    Serial2.println("MANUAL blocked by turn-sweep clearance. Motors stopped.");
+    sendBluetoothEvent("manual_drive_blocked", "turn_sweep");
+    return;
+  }
 
-  setMotionCommand(forwardPercent, turnPercent);
-  writeMotorUS(leftUs, rightUs);
+  // Manual drive remains deliberately direct in intent, but it now feeds the
+  // same single motor-output path as autonomous navigation.
+  setMotionCommand(baseTargetSpeed * forwardPercent / 100.0,
+                   baseTargetSpeed * turnPercent / 100.0);
+  motorStopRequested = false;
 
   bluetoothManualActive = forwardPercent != 0.0 || turnPercent != 0.0;
   lastManualDriveCommandMs = millis();
@@ -589,25 +745,9 @@ static void beginBluetoothTestMotion() {
   bluetoothManualArmed = false;
   bluetoothManualActive = false;
   robotRunEnabled = true;
-  stoppedSafely = false;
   endMatchPrinted = false;
   setRobotState(FOLLOW_PATH);
   clearStuckFlags();
-}
-
-static void finishBluetoothTestMotion(bool aborted) {
-  stopMotors();
-  robotRunEnabled = false;
-  stoppedSafely = true;
-  endMatchPrinted = false;
-  setRobotState(END_MATCH);
-  bluetoothAbortMotionRequested = false;
-
-  if (aborted) {
-    Serial2.println("TEST aborted. Motors stopped.");
-  } else {
-    Serial2.println("TEST complete. Motors stopped.");
-  }
 }
 
 static void runBluetoothTestDrive(float distanceMetres) {
@@ -627,7 +767,8 @@ static void runBluetoothTestDrive(float distanceMetres) {
     return;
   }
 
-  float headingDeg = readYawDeg();
+  float headingDeg = navigationHeadingDeg();
+  float headingRad = headingDeg * DEG_TO_RAD;
 
   Serial2.print("OK test drive ");
   Serial2.print(distanceMetres, 3);
@@ -637,10 +778,9 @@ static void runBluetoothTestDrive(float distanceMetres) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_drive_start", "manual");
-  driveDistanceWithHeadingNoAvoid(distanceMetres, headingDeg);
-  bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
-  finishBluetoothTestMotion(aborted);
-  sendBluetoothEvent(aborted ? "test_drive_abort" : "test_drive_end", "manual");
+  startNavigationPoint(robotX + cosf(headingRad) * distanceMetres,
+                       robotY + sinf(headingRad) * distanceMetres,
+                       NAV_OWNER_TEST_DRIVE);
 }
 
 static void runBluetoothTestGoto(float targetX, float targetY) {
@@ -662,10 +802,80 @@ static void runBluetoothTestGoto(float targetX, float targetY) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_goto_start", "manual");
-  goToPoint(targetX, targetY);
-  bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
-  finishBluetoothTestMotion(aborted);
-  sendBluetoothEvent(aborted ? "test_goto_abort" : "test_goto_end", "manual");
+  startNavigationPoint(targetX, targetY, NAV_OWNER_TEST_GOTO);
+}
+
+static void refreshObjectTargetEstimateForCommand() {
+  refreshObjectTargetEstimate();
+}
+
+static void printObjectHuntTarget() {
+  refreshObjectTargetEstimateForCommand();
+
+  Serial2.print("object_hunt_target,valid=");
+  Serial2.print(objectTargetEstimate.valid ? 1 : 0);
+  Serial2.print(",fresh=");
+  Serial2.print(isObjectTargetFresh() ? 1 : 0);
+  Serial2.print(",candidate=");
+  Serial2.print(objectCandidateKindName(objectCandidate.kind));
+  Serial2.print(",confirmed=");
+  Serial2.print(objectCandidate.confirmed ? 1 : 0);
+  Serial2.print(",direction_hint=");
+  Serial2.print(objectCandidate.directionHint);
+  Serial2.print(",range_mm=");
+  Serial2.print(objectTargetEstimate.rangeMm);
+  Serial2.print(",robot_x_mm=");
+  Serial2.print(objectTargetEstimate.robotXmm, 1);
+  Serial2.print(",robot_y_mm=");
+  Serial2.print(objectTargetEstimate.robotYmm, 1);
+  Serial2.print(",world_x_m=");
+  Serial2.print(objectTargetEstimate.worldX, 3);
+  Serial2.print(",world_y_m=");
+  Serial2.print(objectTargetEstimate.worldY, 3);
+  Serial2.print(",sources=");
+  Serial2.print(objectTargetEstimate.sourceMask);
+  Serial2.print(",reason=");
+  Serial2.println(objectTargetEstimate.reason);
+}
+
+static void runBluetoothTestHunt() {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+
+  refreshObjectTargetEstimateForCommand();
+  if (!isObjectTargetFresh()) {
+    Serial2.println("ERROR no fresh confirmed weight target. Use TEST OBJECT or TEST HUNT TARGET first.");
+    return;
+  }
+
+  Serial2.print("OK test hunt target x=");
+  Serial2.print(objectTargetEstimate.worldX, 3);
+  Serial2.print(" y=");
+  Serial2.print(objectTargetEstimate.worldY, 3);
+  Serial2.print(" robot_mm=");
+  Serial2.print(objectTargetEstimate.robotXmm, 1);
+  Serial2.print("/");
+  Serial2.print(objectTargetEstimate.robotYmm, 1);
+  Serial2.print(" sources=");
+  Serial2.print(objectTargetEstimate.sourceMask);
+  Serial2.println(".");
+
+  beginBluetoothTestMotion();
+  sendBluetoothEvent("test_hunt_start", "object_target");
+  startNavigationPoint(objectTargetEstimate.worldX, objectTargetEstimate.worldY,
+                       NAV_OWNER_TEST_HUNT);
+}
+
+static void runBluetoothTestSearch() {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+
+  Serial2.println("OK test search using current pose as search waypoint.");
+  beginBluetoothTestMotion();
+  sendBluetoothEvent("test_search_start", "manual");
+  startWeightSearchTest();
 }
 
 static void runBluetoothTestAvoid(float distanceMetres) {
@@ -678,7 +888,7 @@ static void runBluetoothTestAvoid(float distanceMetres) {
     return;
   }
 
-  float headingDeg = readYawDeg();
+  float headingDeg = navigationHeadingDeg();
   float headingRad = headingDeg * PI / 180.0;
   float targetX = robotX + cos(headingRad) * distanceMetres;
   float targetY = robotY + sin(headingRad) * distanceMetres;
@@ -695,10 +905,37 @@ static void runBluetoothTestAvoid(float distanceMetres) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_avoid_start", "manual");
-  goToPoint(targetX, targetY);
-  bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
-  finishBluetoothTestMotion(aborted);
-  sendBluetoothEvent(aborted ? "test_avoid_abort" : "test_avoid_end", "manual");
+  startNavigationPoint(targetX, targetY, NAV_OWNER_TEST_AVOID);
+}
+
+static void runBluetoothTestEscape(float distanceMetres) {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+
+  if (distanceMetres < TEST_AVOID_MIN_METRES || distanceMetres > TEST_AVOID_MAX_METRES) {
+    printFloatRangeError("TEST ESCAPE", TEST_AVOID_MIN_METRES, TEST_AVOID_MAX_METRES);
+    return;
+  }
+
+  float headingDeg = navigationHeadingDeg();
+  float headingRad = headingDeg * PI / 180.0;
+  float targetX = robotX + cos(headingRad) * distanceMetres;
+  float targetY = robotY + sin(headingRad) * distanceMetres;
+
+  Serial2.print("OK test escape scan ");
+  Serial2.print(distanceMetres, 3);
+  Serial2.print(" m toward x=");
+  Serial2.print(targetX, 3);
+  Serial2.print(" y=");
+  Serial2.print(targetY, 3);
+  Serial2.print(" heading=");
+  Serial2.print(headingDeg, 2);
+  Serial2.println(" deg. Front block still stops forward motion; reverse recovery may keep retrying.");
+
+  beginBluetoothTestMotion();
+  sendBluetoothEvent("test_escape_start", "manual");
+  startNavigationPoint(targetX, targetY, NAV_OWNER_TEST_ESCAPE);
 }
 
 static void runBluetoothTestSide(float durationSeconds) {
@@ -712,35 +949,37 @@ static void runBluetoothTestSide(float durationSeconds) {
   bluetoothManualActive = false;
   bluetoothAbortMotionRequested = false;
 
-  unsigned long durationMs = (unsigned long)(durationSeconds * 1000.0);
   unsigned long startMs = millis();
-  unsigned long nextSampleMs = startMs;
-  int sampleNumber = 0;
+  sideTestEndMs = startMs + (unsigned long)(durationSeconds * 1000.0);
+  sideTestNextSampleMs = startMs;
+  sideTestSampleNumber = 0;
+  bluetoothSideTestActive = true;
 
   Serial2.print("OK side decision sampler for ");
   Serial2.print(durationSeconds, 1);
   Serial2.println(" s. Move the obstacle around the fan; motors stay stopped.");
   printSideDecisionHeader();
 
-  while (millis() - startMs <= durationMs) {
-    if (handleBluetoothCommands()) {
-      stopMotors();
-      Serial2.println("TEST SIDE aborted.");
-      return;
-    }
+}
 
-    unsigned long now = millis();
-    if (now >= nextSampleMs) {
-      printSideDecisionRow(sampleNumber);
-      sampleNumber++;
-      nextSampleMs = now + TEST_SIDE_SAMPLE_INTERVAL_MS;
-    }
-
-    delay(20);
+static void updateBluetoothTestSide() {
+  if (!bluetoothSideTestActive) {
+    return;
   }
 
-  stopMotors();
-  Serial2.println("TEST SIDE complete.");
+  unsigned long now = millis();
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+
+  if (now >= sideTestNextSampleMs) {
+    printSideDecisionRow(sideTestSampleNumber++);
+    sideTestNextSampleMs = now + TEST_SIDE_SAMPLE_INTERVAL_MS;
+  }
+
+  if (now >= sideTestEndMs) {
+    bluetoothSideTestActive = false;
+    Serial2.println("TEST SIDE complete.");
+  }
 }
 
 static void runBluetoothTestTurn(float angleDeg) {
@@ -764,10 +1003,213 @@ static void runBluetoothTestTurn(float angleDeg) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_turn_start", "manual");
-  turnAngle(angleDeg);
-  bool aborted = bluetoothAbortMotionRequested || currentState == END_MATCH;
-  finishBluetoothTestMotion(aborted);
-  sendBluetoothEvent(aborted ? "test_turn_abort" : "test_turn_end", "manual");
+  startNavigationTurn(angleDeg, NAV_OWNER_TEST_TURN);
+}
+
+static void printTurnPulseSample(const char* phase) {
+  Serial2.print("turn_pulse,");
+  Serial2.print(phase);
+  Serial2.print(",elapsed_ms,");
+  Serial2.print(millis() - turnPulseStartMs);
+  Serial2.print(",yaw_deg,");
+  Serial2.print(wrapAngle(readYawDeg() - turnPulseStartYawDeg), 2);
+  Serial2.print(",command_tps,");
+  Serial2.println(turnPulseCoasting ? 0.0 : turnPulseCommandTicksPerSec, 1);
+}
+
+static void finishBluetoothTurnPulseTest() {
+  float finalYawDeg = wrapAngle(readYawDeg() - turnPulseStartYawDeg);
+  bluetoothTurnPulseTestActive = false;
+  turnPulseCoasting = false;
+  bluetoothManualActive = false;
+  robotRunEnabled = false;
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  setRobotState(END_MATCH);
+  Serial2.print("TURNPULSE complete: final_yaw_deg=");
+  Serial2.println(finalYawDeg, 2);
+  sendBluetoothEvent("test_turnpulse_end", "coast_logged");
+}
+
+static void runBluetoothTestTurnPulse(float signedSeconds) {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+
+  float durationSeconds = fabs(signedSeconds);
+  if (durationSeconds < TEST_TURN_PULSE_MIN_SECONDS ||
+      durationSeconds > TEST_TURN_PULSE_MAX_SECONDS) {
+    printFloatRangeError("TEST TURNPULSE magnitude", TEST_TURN_PULSE_MIN_SECONDS,
+                         TEST_TURN_PULSE_MAX_SECONDS);
+    return;
+  }
+
+  float direction = signedSeconds >= 0.0 ? 1.0 : -1.0;
+  turnPulseCommandTicksPerSec = direction * PLANNER_TURN_TARGET_SPEED;
+  updateTOFSensors();
+  if (!isTurnDirectionObservable(turnPulseCommandTicksPerSec) || !isTurnSweepSafe()) {
+    Serial2.println("ERROR TEST TURNPULSE refused by turn sensing or sweep clearance.");
+    return;
+  }
+
+  if (isNavigationGoalActive()) {
+    cancelNavigationGoal(PLANNER_STOP_ABORTED, "turnpulse_started");
+  }
+  bluetoothAbortMotionRequested = false;
+  bluetoothManualArmed = false;
+  bluetoothManualActive = true;
+  robotRunEnabled = false;
+  clearStuckFlags();
+  turnPulseStartYawDeg = readYawDeg();
+  unsigned long now = millis();
+  turnPulseStartMs = now;
+  turnPulseEndMs = now + (unsigned long)(durationSeconds * 1000.0);
+  turnPulseCoastEndMs = turnPulseEndMs + TEST_TURN_PULSE_COAST_MS;
+  turnPulseNextSampleMs = now;
+  turnPulseCoasting = false;
+  bluetoothTurnPulseTestActive = true;
+  motorStopRequested = false;
+  setMotionCommand(0.0, turnPulseCommandTicksPerSec);
+
+  Serial2.print("OK turn pulse ");
+  Serial2.print(signedSeconds, 2);
+  Serial2.println(" s at full calibrated turn rate; logging 1 s coast.");
+  sendBluetoothEvent("test_turnpulse_start", "calibration");
+}
+
+static void runBluetoothTestTurnLadder(const char* directionText) {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+
+  bool rightTurn = false;
+  if (commandEquals(directionText, "RIGHT")) {
+    rightTurn = true;
+  } else if (commandEquals(directionText, "LEFT")) {
+    rightTurn = false;
+  } else {
+    Serial2.println("ERROR usage: TEST TURNLADDER LEFT|RIGHT");
+    return;
+  }
+
+  float safetyTurn = rightTurn ? PLANNER_TURN_SLOW_TARGET_SPEED
+                               : -PLANNER_TURN_SLOW_TARGET_SPEED;
+  updateTOFSensors();
+  if (!isTurnDirectionObservable(safetyTurn) || !isTurnSweepSafe()) {
+    Serial2.println("ERROR TEST TURNLADDER refused by turn sensing or sweep clearance.");
+    return;
+  }
+
+  if (isNavigationGoalActive()) {
+    cancelNavigationGoal(PLANNER_STOP_ABORTED, "turnladder_started");
+  }
+  cancelWeightSearch("turnladder_started");
+  bluetoothManualArmed = false;
+  bluetoothManualActive = false;
+  bluetoothTurnPulseTestActive = false;
+  robotRunEnabled = false;
+  clearStuckFlags();
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  writeMotorUS(STOP_US, STOP_US);
+  delay(250);
+
+  Serial2.print("turn_ladder_start,direction=");
+  Serial2.print(rightTurn ? "RIGHT" : "LEFT");
+  Serial2.print(",pulse_ms=");
+  Serial2.print(TEST_TURN_LADDER_PULSE_MS);
+  Serial2.print(",coast_ms=");
+  Serial2.println(TEST_TURN_LADDER_COAST_MS);
+  sendBluetoothEvent("test_turnladder_start", rightTurn ? "right" : "left");
+
+  for (int i = 0; i < TEST_TURN_LADDER_STEP_COUNT; i++) {
+    int offset = TEST_TURN_LADDER_OFFSETS_US[i];
+    int leftUs = rightTurn ? STOP_US + offset : STOP_US - offset;
+    int rightUs = rightTurn ? STOP_US - offset : STOP_US + offset;
+
+    updateTOFSensors();
+    if (!isTurnDirectionObservable(safetyTurn) || !isTurnSweepSafe()) {
+      writeMotorUS(STOP_US, STOP_US);
+      motorStopRequested = true;
+      setMotionCommand(0.0, 0.0);
+      Serial2.println("turn_ladder_abort,reason=safety_recheck_failed");
+      sendBluetoothEvent("test_turnladder_abort", "safety_recheck_failed");
+      return;
+    }
+
+    float startYaw = readYawDeg();
+    motorStopRequested = false;
+    setMotionCommand(0.0, 0.0);
+    writeMotorUS(leftUs, rightUs);
+    delay(TEST_TURN_LADDER_PULSE_MS);
+    float driveYaw = readYawDeg();
+    writeMotorUS(STOP_US, STOP_US);
+    motorStopRequested = true;
+    setMotionCommand(0.0, 0.0);
+    delay(TEST_TURN_LADDER_COAST_MS);
+    float finalYaw = readYawDeg();
+
+    Serial2.print("turn_ladder,step=");
+    Serial2.print(i + 1);
+    Serial2.print(",direction=");
+    Serial2.print(rightTurn ? "RIGHT" : "LEFT");
+    Serial2.print(",offset_us=");
+    Serial2.print(offset);
+    Serial2.print(",left_us=");
+    Serial2.print(leftUs);
+    Serial2.print(",right_us=");
+    Serial2.print(rightUs);
+    Serial2.print(",drive_delta_deg=");
+    Serial2.print(wrapAngle(driveYaw - startYaw), 2);
+    Serial2.print(",final_delta_deg=");
+    Serial2.print(wrapAngle(finalYaw - startYaw), 2);
+    Serial2.print(",coast_delta_deg=");
+    Serial2.println(wrapAngle(finalYaw - driveYaw), 2);
+  }
+
+  writeMotorUS(STOP_US, STOP_US);
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  robotRunEnabled = false;
+  setRobotState(END_MATCH);
+  Serial2.println("TURNLADDER complete. Motors stopped.");
+  sendBluetoothEvent("test_turnladder_end", rightTurn ? "right" : "left");
+}
+
+static void updateBluetoothTurnPulseTest() {
+  if (!bluetoothTurnPulseTestActive) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (!turnPulseCoasting) {
+    updateTOFSensors();
+    if (!isTurnDirectionObservable(turnPulseCommandTicksPerSec) || !isTurnSweepSafe()) {
+      Serial2.println("TURNPULSE aborted by turn sensing or sweep clearance.");
+      finishBluetoothTurnPulseTest();
+      return;
+    }
+    motorStopRequested = false;
+    setMotionCommand(0.0, turnPulseCommandTicksPerSec);
+    bluetoothManualActive = true;
+    lastManualDriveCommandMs = now;
+    if (now >= turnPulseEndMs) {
+      turnPulseCoasting = true;
+      bluetoothManualActive = false;
+      motorStopRequested = true;
+      setMotionCommand(0.0, 0.0);
+      Serial2.println("TURNPULSE drive phase complete; logging coast.");
+    }
+  }
+
+  if (now >= turnPulseNextSampleMs) {
+    printTurnPulseSample(turnPulseCoasting ? "coast" : "drive");
+    turnPulseNextSampleMs = now + TEST_TURN_PULSE_SAMPLE_INTERVAL_MS;
+  }
+
+  if (turnPulseCoasting && now >= turnPulseCoastEndMs) {
+    finishBluetoothTurnPulseTest();
+  }
 }
 
 static void printBluetoothBuild() {
@@ -808,18 +1250,17 @@ static void setBluetoothBaseSpeed(float speedTicksPerSecond) {
   sendBluetoothEvent("speed_set", "manual");
 }
 
-static void setBluetoothHeadingGain(float headingGain) {
-  if (headingGain < HGAIN_MIN || headingGain > HGAIN_MAX) {
-    printFloatRangeError("HGAIN", HGAIN_MIN, HGAIN_MAX);
+static void setBluetoothSearchTurnOffset(float offsetUs) {
+  if (offsetUs < SEARCHTURN_MIN_US || offsetUs > SEARCHTURN_MAX_US) {
+    printFloatRangeError("SEARCHTURN", SEARCHTURN_MIN_US, SEARCHTURN_MAX_US);
     return;
   }
 
-  K_heading = headingGain;
-
-  Serial2.print("OK heading gain set to ");
-  Serial2.print(K_heading, 1);
-  Serial2.println(".");
-  sendBluetoothEvent("hgain_set", "manual");
+  weightScanTurnOffsetUs = (int)(offsetUs + 0.5f);
+  Serial2.print("OK search turn offset set to ");
+  Serial2.print(weightScanTurnOffsetUs);
+  Serial2.println(" us.");
+  sendBluetoothEvent("searchturn_set", "manual");
 }
 
 static void setBluetoothForwardBase(float leftBaseUs, float rightBaseUs) {
@@ -849,8 +1290,8 @@ static void zeroRobotPoseFromBluetooth() {
   robotTheta = 0.0;
 
   resetEncodersAndPID();
+  clearLocalMap();
   currentWaypointIndex = 0;
-  stuckRecoveryCount = 0;
   returnHomeRequested = false;
   clearStuckFlags();
   robotRunEnabled = false;
@@ -858,27 +1299,20 @@ static void zeroRobotPoseFromBluetooth() {
   bluetoothManualArmed = false;
   bluetoothManualActive = false;
   bluetoothAbortMotionRequested = true;
-  stoppedSafely = true;
   endMatchPrinted = false;
   setRobotState(END_MATCH);
-  Serial2.println("OK stopped and zeroed yaw, pose, encoders, and PID state.");
+  Serial2.println("OK stopped and zeroed yaw, pose, encoder references, map, and PID state.");
 }
 
-static void handleBluetoothCommandLine(char* command) {
-  trimCommand(command);
-
-  if (command[0] == '\0') {
-    return;
-  }
-
+static bool handleCoreBluetoothCommand(const char* command) {
   if (commandEquals(command, "HELP") || commandEquals(command, "H")) {
     printBluetoothHelp();
-    return;
+    return true;
   }
 
   if (commandEquals(command, "BUILD")) {
     printBluetoothBuild();
-    return;
+    return true;
   }
 
   if (commandEquals(command, "START")) {
@@ -887,9 +1321,9 @@ static void handleBluetoothCommandLine(char* command) {
     bluetoothManualArmed = false;
     bluetoothManualActive = false;
     bluetoothAbortMotionRequested = false;
-    stoppedSafely = false;
     endMatchPrinted = false;
     returnHomeRequested = false;
+    clearNavigationGoalResult();
 
     if (currentState == END_MATCH) {
       currentState = INIT;
@@ -897,25 +1331,69 @@ static void handleBluetoothCommandLine(char* command) {
     }
 
     Serial2.println("OK start requested.");
-    return;
+    return true;
   }
 
   if (commandEquals(command, "STATUS") || commandEquals(command, "P")) {
     sendBluetoothStatus();
-    return;
+    return true;
   }
 
+  if (commandEquals(command, "CAL") || commandEquals(command, "CALIBRATION")) {
+    printCalibrationSummary();
+    return true;
+  }
+
+  if (commandEquals(command, "HOME")) {
+    bluetoothTestArmed = false;
+    bluetoothManualArmed = false;
+    bluetoothManualActive = false;
+    bluetoothTurnPulseTestActive = false;
+    if (isNavigationGoalActive()) {
+      cancelNavigationGoal(PLANNER_STOP_ABORTED, "home_requested");
+      clearNavigationGoalResult();
+    }
+    returnHomeRequested = true;
+    Serial2.println("OK return home requested.");
+    return true;
+  }
+
+  if (commandEquals(command, "ZERO")) {
+    zeroRobotPoseFromBluetooth();
+    return true;
+  }
+
+  if (commandEquals(command, "STOP") || commandEquals(command, "S")) {
+    robotRunEnabled = false;
+    bluetoothTestArmed = false;
+    bluetoothManualArmed = false;
+    bluetoothManualActive = false;
+    bluetoothSideTestActive = false;
+    bluetoothTurnPulseTestActive = false;
+    bluetoothAbortMotionRequested = true;
+    endMatchPrinted = false;
+    cancelNavigationGoal(PLANNER_STOP_ABORTED, "stop_command");
+    stopMotors();
+    setRobotState(END_MATCH);
+    Serial2.println("OK stopped motors and set END_MATCH.");
+    return true;
+  }
+
+  return false;
+}
+
+static bool handleStreamAndLogBluetoothCommand(const char* command) {
   if (commandEquals(command, "STREAM ON")) {
     bluetoothStreamEnabled = true;
     lastBluetoothTelemetryMs = 0;
     Serial2.println("OK stream on.");
-    return;
+    return true;
   }
 
   if (commandEquals(command, "STREAM OFF")) {
     bluetoothStreamEnabled = false;
     Serial2.println("OK stream off.");
-    return;
+    return true;
   }
 
   if (commandEquals(command, "CSV ON")) {
@@ -923,48 +1401,40 @@ static void handleBluetoothCommandLine(char* command) {
     lastBluetoothTelemetryMs = 0;
     Serial2.println("OK csv on.");
     sendBluetoothCsvHeader();
-    return;
+    return true;
   }
 
   if (commandEquals(command, "CSV OFF")) {
     bluetoothCsvStreamEnabled = false;
     Serial2.println("OK csv off.");
-    return;
+    return true;
   }
 
-  if (commandEquals(command, "CAL") || commandEquals(command, "CALIBRATION")) {
-    printCalibrationSummary();
-    return;
+  if (commandHasPrefix(command, "MARK")) {
+    markBluetoothLog(commandArgument(command, "MARK"));
+    return true;
   }
 
+  return false;
+}
+
+static bool handleTuningBluetoothCommand(const char* command) {
   if (commandEquals(command, "SPEED RESET")) {
     baseTargetSpeed = DEFAULT_BASE_TARGET_SPEED;
     Serial2.print("OK base target speed reset to ");
     Serial2.print(baseTargetSpeed, 1);
     Serial2.println(" ticks/s.");
     sendBluetoothEvent("speed_reset", "manual");
-    return;
+    return true;
   }
 
-  if (commandEquals(command, "HGAIN RESET")) {
-    K_heading = DEFAULT_HEADING_GAIN;
-    Serial2.print("OK heading gain reset to ");
-    Serial2.print(K_heading, 1);
-    Serial2.println(".");
-    sendBluetoothEvent("hgain_reset", "manual");
-    return;
-  }
-
-  if (commandHasPrefix(command, "HGAIN")) {
-    float requestedHeadingGain = 0.0;
-
-    if (!parseFloatArgument(commandArgument(command, "HGAIN"), requestedHeadingGain)) {
-      Serial2.println("ERROR usage: HGAIN <gain> or HGAIN RESET");
-      return;
-    }
-
-    setBluetoothHeadingGain(requestedHeadingGain);
-    return;
+  if (commandEquals(command, "SEARCHTURN RESET")) {
+    weightScanTurnOffsetUs = DEFAULT_WEIGHT_SCAN_TURN_OFFSET_US;
+    Serial2.print("OK search turn offset reset to ");
+    Serial2.print(weightScanTurnOffsetUs);
+    Serial2.println(" us.");
+    sendBluetoothEvent("searchturn_reset", "manual");
+    return true;
   }
 
   if (commandEquals(command, "FBASE RESET")) {
@@ -976,7 +1446,17 @@ static void handleBluetoothCommandLine(char* command) {
     Serial2.print(rightForwardBaseUs);
     Serial2.println(" us.");
     sendBluetoothEvent("fbase_reset", "manual");
-    return;
+    return true;
+  }
+
+  if (commandHasPrefix(command, "SEARCHTURN")) {
+    float offsetUs = 0.0;
+    if (!parseFloatArgument(commandArgument(command, "SEARCHTURN"), offsetUs)) {
+      Serial2.println("ERROR usage: SEARCHTURN <offset_us> or SEARCHTURN RESET");
+      return true;
+    }
+    setBluetoothSearchTurnOffset(offsetUs);
+    return true;
   }
 
   if (commandHasPrefix(command, "FBASE")) {
@@ -985,11 +1465,11 @@ static void handleBluetoothCommandLine(char* command) {
 
     if (!parseTwoFloatArguments(commandArgument(command, "FBASE"), requestedLeftBase, requestedRightBase)) {
       Serial2.println("ERROR usage: FBASE <left_us> <right_us> or FBASE RESET");
-      return;
+      return true;
     }
 
     setBluetoothForwardBase(requestedLeftBase, requestedRightBase);
-    return;
+    return true;
   }
 
   if (commandHasPrefix(command, "SPEED")) {
@@ -997,13 +1477,42 @@ static void handleBluetoothCommandLine(char* command) {
 
     if (!parseFloatArgument(commandArgument(command, "SPEED"), requestedSpeed)) {
       Serial2.println("ERROR usage: SPEED <ticks/s> or SPEED RESET");
-      return;
+      return true;
     }
 
     setBluetoothBaseSpeed(requestedSpeed);
-    return;
+    return true;
   }
 
+  if (commandEquals(command, "ESCAPE ON")) {
+    escapeBacktrackEnabled = true;
+    Serial2.println("OK front-blocked reverse recovery enabled.");
+    sendBluetoothEvent("escape_set", "on");
+    return true;
+  }
+
+  if (commandEquals(command, "ESCAPE OFF")) {
+    escapeBacktrackEnabled = false;
+    Serial2.println("OK front-blocked reverse recovery disabled. Front block will safe-stop only.");
+    sendBluetoothEvent("escape_set", "off");
+    return true;
+  }
+
+  if (commandEquals(command, "ESCAPE STATUS")) {
+    Serial2.print("ESCAPE ");
+    Serial2.println(escapeBacktrackEnabled ? "ON" : "OFF");
+    return true;
+  }
+
+  if (commandHasPrefix(command, "ESCAPE")) {
+    Serial2.println("ERROR usage: ESCAPE ON, ESCAPE OFF, or ESCAPE STATUS");
+    return true;
+  }
+
+  return false;
+}
+
+static bool handleTestArmBluetoothCommand(const char* command) {
   if (commandEquals(command, "TEST ARM")) {
     bluetoothTestArmed = true;
     bluetoothManualArmed = false;
@@ -1011,19 +1520,45 @@ static void handleBluetoothCommandLine(char* command) {
     robotRunEnabled = false;
     bluetoothAbortMotionRequested = false;
     stopMotors();
-    Serial2.println("OK test motion armed. TEST DRIVE, TEST TURN, TEST GOTO, and TEST AVOID can move the robot.");
+    Serial2.println("OK test motion armed. TEST DRIVE, TEST TURN, TEST GOTO, TEST AVOID, TEST ESCAPE, TEST SEARCH, and TEST HUNT can move the robot.");
     sendBluetoothEvent("test_arm", "manual");
-    return;
+    return true;
   }
 
   if (commandEquals(command, "TEST DISARM")) {
     bluetoothTestArmed = false;
+    bluetoothSideTestActive = false;
+    bluetoothTurnPulseTestActive = false;
+    // Disarming must end an already-running TEST GOTO/DRIVE/AVOID/TURN goal,
+    // not merely reject the next command. Otherwise updateRobotController()
+    // can re-publish an old navigation command after this one-cycle stop.
+    bool activeTestNavigationGoal = isNavigationGoalActive() &&
+      (navigationGoal.owner == NAV_OWNER_TEST_DRIVE ||
+       navigationGoal.owner == NAV_OWNER_TEST_GOTO ||
+       navigationGoal.owner == NAV_OWNER_TEST_AVOID ||
+       navigationGoal.owner == NAV_OWNER_TEST_ESCAPE ||
+       navigationGoal.owner == NAV_OWNER_TEST_TURN ||
+       navigationGoal.owner == NAV_OWNER_TEST_HUNT ||
+       navigationGoal.owner == NAV_OWNER_WEIGHT_SCAN ||
+       navigationGoal.owner == NAV_OWNER_OBJECT_HUNT);
+    if (activeTestNavigationGoal) {
+      cancelNavigationGoal(PLANNER_STOP_ABORTED, "test_disarmed");
+    }
+    if (isWeightSearchActive()) {
+      cancelWeightSearch("test_disarmed");
+    }
+    robotRunEnabled = false;
     stopMotors();
+    setRobotState(END_MATCH);
     Serial2.println("OK test motion disarmed.");
     sendBluetoothEvent("test_disarm", "manual");
-    return;
+    return true;
   }
 
+  return false;
+}
+
+static bool handleManualBluetoothCommand(const char* command) {
   if (commandEquals(command, "MANUAL ARM")) {
     bluetoothManualArmed = true;
     bluetoothManualActive = false;
@@ -1033,7 +1568,7 @@ static void handleBluetoothCommandLine(char* command) {
     stopMotors();
     Serial2.println("OK manual drive armed. Use DRIVE <forward> <turn>.");
     sendBluetoothEvent("manual_arm", "manual");
-    return;
+    return true;
   }
 
   if (commandEquals(command, "MANUAL DISARM")) {
@@ -1041,7 +1576,7 @@ static void handleBluetoothCommandLine(char* command) {
     stopManualDrive();
     Serial2.println("OK manual drive disarmed.");
     sendBluetoothEvent("manual_disarm", "manual");
-    return;
+    return true;
   }
 
   if (commandHasPrefix(command, "DRIVE")) {
@@ -1050,23 +1585,27 @@ static void handleBluetoothCommandLine(char* command) {
 
     if (!parseTwoFloatArguments(commandArgument(command, "DRIVE"), forwardPercent, turnPercent)) {
       Serial2.println("ERROR usage: DRIVE <forward -100..100> <turn -100..100>");
-      return;
+      return true;
     }
 
     runManualDriveCommand(forwardPercent, turnPercent);
-    return;
+    return true;
   }
 
+  return false;
+}
+
+static bool handleTestMotionBluetoothCommand(const char* command) {
   if (commandHasPrefix(command, "TEST DRIVE")) {
     float distanceMetres = 0.0;
 
     if (!parseFloatArgument(commandArgument(command, "TEST DRIVE"), distanceMetres)) {
       Serial2.println("ERROR usage: TEST DRIVE <metres>");
-      return;
+      return true;
     }
 
     runBluetoothTestDrive(distanceMetres);
-    return;
+    return true;
   }
 
   if (commandHasPrefix(command, "TEST GOTO")) {
@@ -1075,11 +1614,11 @@ static void handleBluetoothCommandLine(char* command) {
 
     if (!parseTwoFloatArguments(commandArgument(command, "TEST GOTO"), targetX, targetY)) {
       Serial2.println("ERROR usage: TEST GOTO <x_m> <y_m>");
-      return;
+      return true;
     }
 
     runBluetoothTestGoto(targetX, targetY);
-    return;
+    return true;
   }
 
   if (commandHasPrefix(command, "TEST AVOID")) {
@@ -1087,11 +1626,23 @@ static void handleBluetoothCommandLine(char* command) {
 
     if (!parseFloatArgument(commandArgument(command, "TEST AVOID"), distanceMetres)) {
       Serial2.println("ERROR usage: TEST AVOID <metres>");
-      return;
+      return true;
     }
 
     runBluetoothTestAvoid(distanceMetres);
-    return;
+    return true;
+  }
+
+  if (commandHasPrefix(command, "TEST ESCAPE")) {
+    float distanceMetres = 0.0;
+
+    if (!parseFloatArgument(commandArgument(command, "TEST ESCAPE"), distanceMetres)) {
+      Serial2.println("ERROR usage: TEST ESCAPE <metres>");
+      return true;
+    }
+
+    runBluetoothTestEscape(distanceMetres);
+    return true;
   }
 
   if (commandHasPrefix(command, "TEST SIDE")) {
@@ -1099,16 +1650,63 @@ static void handleBluetoothCommandLine(char* command) {
 
     if (!parseFloatArgument(commandArgument(command, "TEST SIDE"), durationSeconds)) {
       Serial2.println("ERROR usage: TEST SIDE <seconds>");
-      return;
+      return true;
     }
 
     runBluetoothTestSide(durationSeconds);
-    return;
+    return true;
   }
 
   if (commandEquals(command, "TEST FAN") || commandEquals(command, "FAN")) {
     printFanTelemetry();
-    return;
+    return true;
+  }
+
+  if (commandEquals(command, "TEST OBJECT") || commandEquals(command, "OBJECT")) {
+    printObjectTelemetry();
+    return true;
+  }
+
+  if (commandEquals(command, "TEST HUNT TARGET")) {
+    printObjectHuntTarget();
+    return true;
+  }
+
+  if (commandEquals(command, "TEST HUNT")) {
+    runBluetoothTestHunt();
+    return true;
+  }
+
+  if (commandHasPrefix(command, "TEST HUNT")) {
+    Serial2.println("ERROR usage: TEST HUNT or TEST HUNT TARGET");
+    return true;
+  }
+
+  if (commandEquals(command, "TEST SEARCH")) {
+    runBluetoothTestSearch();
+    return true;
+  }
+
+  if (commandHasPrefix(command, "TEST SEARCH")) {
+    Serial2.println("ERROR usage: TEST SEARCH");
+    return true;
+  }
+
+  if (commandHasPrefix(command, "TEST TURNPULSE")) {
+    float signedSeconds = 0.0;
+
+    if (!parseFloatArgument(commandArgument(command, "TEST TURNPULSE"), signedSeconds)) {
+      Serial2.println("ERROR usage: TEST TURNPULSE <signed_seconds>");
+      return true;
+    }
+
+    runBluetoothTestTurnPulse(signedSeconds);
+    return true;
+  }
+
+  if (commandHasPrefix(command, "TEST TURNLADDER")) {
+    runBluetoothTestTurnLadder(commandArgument(command, "TEST TURNLADDER"));
+    return true;
   }
 
   if (commandHasPrefix(command, "TEST TURN")) {
@@ -1116,43 +1714,29 @@ static void handleBluetoothCommandLine(char* command) {
 
     if (!parseFloatArgument(commandArgument(command, "TEST TURN"), angleDeg)) {
       Serial2.println("ERROR usage: TEST TURN <degrees>");
-      return;
+      return true;
     }
 
     runBluetoothTestTurn(angleDeg);
+    return true;
+  }
+
+  return false;
+}
+
+static void handleBluetoothCommandLine(char* command) {
+  trimCommand(command);
+
+  if (command[0] == '\0') {
     return;
   }
 
-  if (commandHasPrefix(command, "MARK")) {
-    markBluetoothLog(commandArgument(command, "MARK"));
-    return;
-  }
-
-  if (commandEquals(command, "HOME")) {
-    bluetoothTestArmed = false;
-    bluetoothManualArmed = false;
-    bluetoothManualActive = false;
-    returnHomeRequested = true;
-    Serial2.println("OK return home requested.");
-    return;
-  }
-
-  if (commandEquals(command, "ZERO")) {
-    zeroRobotPoseFromBluetooth();
-    return;
-  }
-
-  if (commandEquals(command, "STOP") || commandEquals(command, "S")) {
-    robotRunEnabled = false;
-    bluetoothTestArmed = false;
-    bluetoothManualArmed = false;
-    bluetoothManualActive = false;
-    bluetoothAbortMotionRequested = true;
-    stoppedSafely = true;
-    endMatchPrinted = false;
-    stopMotors();
-    setRobotState(END_MATCH);
-    Serial2.println("OK stopped motors and set END_MATCH.");
+  if (handleCoreBluetoothCommand(command) ||
+      handleStreamAndLogBluetoothCommand(command) ||
+      handleTuningBluetoothCommand(command) ||
+      handleTestArmBluetoothCommand(command) ||
+      handleManualBluetoothCommand(command) ||
+      handleTestMotionBluetoothCommand(command)) {
     return;
   }
 
@@ -1181,6 +1765,7 @@ bool handleBluetoothCommands() {
     }
   }
 
-  sendBluetoothTelemetry();
+  updateBluetoothTestSide();
+  updateBluetoothTurnPulseTest();
   return bluetoothAbortMotionRequested;
 }

@@ -3,10 +3,14 @@
 // =====================================================
 // TOF sensors
 // =====================================================
-const uint16_t TOF_NO_READING_MM = 9999;
+const uint16_t TOF_NO_READING_MM = RANGE_NO_READING_MM;
 const uint16_t L0X_VALID_MAX_MM = 8191;
+static uint16_t pendingCloseDistanceMm[RANGE_SENSOR_COUNT] = {0};
+static uint8_t pendingCloseReadCount[RANGE_SENSOR_COUNT] = {0};
+static bool tofCloseReadingRevalidating = false;
 
 static void updateFrontBlockState();
+static void updateFakeRearTofSensor();
 
 static bool isPhysicalFanSensor(RangeSensorId id) {
   return id == RANGE_RIGHT_OUTER ||
@@ -16,11 +20,7 @@ static bool isPhysicalFanSensor(RangeSensorId id) {
 }
 
 static const char* fanModelName(RangeSensorId id) {
-  if (id == RANGE_RIGHT_OUTER || id == RANGE_LEFT_OUTER) {
-    return "VL53L0X";
-  }
-
-  return "VL53L1X";
+  return "VL53L0X";
 }
 
 static byte fanXshutPin(RangeSensorId id) {
@@ -34,7 +34,7 @@ static byte fanXshutPin(RangeSensorId id) {
     case RANGE_LEFT_OUTER:
       return LEFT_OUTER_XSHUT;
     default:
-      return 255;
+      return INVALID_XSHUT_PIN;
   }
 }
 
@@ -53,12 +53,13 @@ static uint8_t fanI2cAddress(RangeSensorId id) {
   }
 }
 
-static bool isValidL1XDistance(uint16_t distanceMm) {
-  return distanceMm >= FRONT_VALID_MIN_MM && distanceMm <= FRONT_VALID_MAX_MM;
-}
-
 static bool isValidL0XDistance(uint16_t distanceMm) {
   return distanceMm >= FRONT_VALID_MIN_MM && distanceMm <= L0X_VALID_MAX_MM;
+}
+
+static bool isValidFakeRearTofDistance(uint16_t distanceMm) {
+  return distanceMm >= FAKE_REAR_TOF_VALID_MIN_MM &&
+         distanceMm <= FAKE_REAR_TOF_VALID_MAX_MM;
 }
 
 static unsigned long maxReadTime(unsigned long a, unsigned long b) {
@@ -70,13 +71,16 @@ static bool isUsableAggregateReading(const RangeSensorState &sensor) {
     return true;
   }
 
-  // VL53L1X can report very small values when an object is pressed close to
-  // the beam. Treat that as unsafe clearance even though it is below the
-  // normal calibrated distance window.
+  // A ToF can report very small values when an object is pressed close to the
+  // beam. Treat that as unsafe clearance even though it is below the normal
+  // calibrated distance window.
   return sensor.distanceMm > 0 && sensor.distanceMm < FRONT_STOP_DISTANCE_MM;
 }
 
 static void combineFanAggregateSensor(RangeSensorId aggregateId, RangeSensorId innerId, RangeSensorId outerId) {
+  // Legacy front/left/right telemetry is derived from the physical fan. The
+  // planner itself uses the individual rays, but this aggregate preserves a
+  // simple nearest-obstacle view for front-stop and operator telemetry.
   RangeSensorState &aggregate = rangeSensors[aggregateId];
   RangeSensorState &inner = rangeSensors[innerId];
   RangeSensorState &outer = rangeSensors[outerId];
@@ -128,6 +132,33 @@ static void syncLegacyTofGlobals() {
 
 static void setRangeSensorReading(RangeSensorId id, uint16_t distanceMm, bool valid) {
   RangeSensorState &sensor = rangeSensors[id];
+
+  // A fan beam cannot physically move hundreds of millimetres closer in one
+  // 20 ms sample while the robot is moving at its permitted speed.  Hold a
+  // sudden close return until a second, similar reading confirms it.  Motion
+  // is stopped during that one-sample recheck, so this removes I2C/ToF
+  // outliers without treating them as free space.
+  // Only a very large inward jump is delayed. A gradual approach to a real
+  // wall remains responsive; the filter is aimed at isolated impossible drops.
+  if (valid && sensor.valid &&
+      distanceMm + TOF_SUDDEN_CLOSE_DROP_MM < sensor.distanceMm) {
+    uint8_t index = (uint8_t)id;
+    uint16_t pending = pendingCloseDistanceMm[index];
+    if (pendingCloseReadCount[index] == 0 ||
+        abs((int)distanceMm - (int)pending) > TOF_CLOSE_CONFIRM_TOLERANCE_MM) {
+      pendingCloseDistanceMm[index] = distanceMm;
+      pendingCloseReadCount[index] = 1;
+    } else {
+      pendingCloseReadCount[index]++;
+    }
+
+    if (pendingCloseReadCount[index] < TOF_CLOSE_CONFIRM_READS) {
+      tofCloseReadingRevalidating = true;
+      return;
+    }
+  }
+
+  pendingCloseReadCount[(uint8_t)id] = 0;
   sensor.distanceMm = distanceMm;
   sensor.valid = valid;
   sensor.stale = false;
@@ -143,6 +174,7 @@ static void setRangeSensorReading(RangeSensorId id, uint16_t distanceMm, bool va
 
 static void markRangeSensorTimeout(RangeSensorId id) {
   RangeSensorState &sensor = rangeSensors[id];
+  pendingCloseReadCount[(uint8_t)id] = 0;
   sensor.distanceMm = TOF_NO_READING_MM;
   sensor.valid = false;
   sensor.stale = false;
@@ -214,37 +246,6 @@ static void connectL0XFanSensor(VL53L0X &sensor, RangeSensorId id) {
   }
 }
 
-static void connectL1XFanSensor(VL53L1X &sensor, RangeSensorId id) {
-  while (true) {
-    Serial.print("Starting ");
-    Serial.print(rangeSensors[id].name);
-    Serial.println(" VL53L1X...");
-
-    io.digitalWrite(fanXshutPin(id), HIGH);
-    delay(100);
-
-    sensor.setTimeout(100);
-
-    if (sensor.init()) {
-      sensor.setAddress(fanI2cAddress(id));
-      sensor.setDistanceMode(VL53L1X::Long);
-      sensor.setMeasurementTimingBudget(50000);
-      sensor.startContinuous(50);
-      setRangeSensorReading(id, TOF_NO_READING_MM, false);
-
-      Serial.print(rangeSensors[id].name);
-      Serial.print(" VL53L1X connected at 0x");
-      Serial.println(fanI2cAddress(id), HEX);
-      break;
-    }
-
-    Serial.print(rangeSensors[id].name);
-    Serial.println(" VL53L1X not detected. Retrying...");
-    io.digitalWrite(fanXshutPin(id), LOW);
-    delay(1000);
-  }
-}
-
 void connectTOFSensors() {
   while (true) {
     Serial.println("Connecting to SX1509...");
@@ -269,6 +270,7 @@ void connectTOFSensors() {
     io.pinMode(fanXshutPins[i], OUTPUT);
     io.digitalWrite(fanXshutPins[i], LOW);
   }
+  prepareObjectTOFPinsForStartup();
 
   delay(100);
 
@@ -276,6 +278,8 @@ void connectTOFSensors() {
   connectRightInnerTOF();
   connectLeftInnerTOF();
   connectLeftOuterTOF();
+  connectObjectTOFSensors();
+  updateFakeRearTofSensor();
 }
 
 void connectRightOuterTOF() {
@@ -283,11 +287,11 @@ void connectRightOuterTOF() {
 }
 
 void connectRightInnerTOF() {
-  connectL1XFanSensor(rightInnerTOF, RANGE_RIGHT_INNER);
+  connectL0XFanSensor(rightInnerTOF, RANGE_RIGHT_INNER);
 }
 
 void connectLeftInnerTOF() {
-  connectL1XFanSensor(leftInnerTOF, RANGE_LEFT_INNER);
+  connectL0XFanSensor(leftInnerTOF, RANGE_LEFT_INNER);
 }
 
 void connectLeftOuterTOF() {
@@ -295,6 +299,8 @@ void connectLeftOuterTOF() {
 }
 
 static void updateFrontBlockState() {
+  // The virtual front is the nearer inner +/-20 degree ray. It has its own
+  // debounce so a genuine front obstacle is not lost between local-map updates.
   if (!rangeSensors[RANGE_FRONT].valid) {
     frontBlockCounter = 0;
     frontClearCounter = 0;
@@ -340,31 +346,28 @@ static void updateFrontBlockState() {
   }
 }
 
-static void updateL1XFanSensor(RangeSensorId id, VL53L1X &sensor, void (*reconnectSensor)()) {
-  uint16_t rawDistance = sensor.read();
-
-  if (sensor.timeoutOccurred()) {
-    stopMotors();
-    markRangeSensorTimeout(id);
-    Serial.print(rangeSensors[id].name);
-    Serial.println(" TOF timeout. Reconnecting...");
-    reconnectSensor();
-    return;
+static void updateFakeRearTofSensor() {
+  setRangeSensorReading(RANGE_FAKE_REAR,
+                        FAKE_REAR_TOF_DISTANCE_MM,
+                        isValidFakeRearTofDistance(FAKE_REAR_TOF_DISTANCE_MM));
+  RangeSensorState &sensor = rangeSensors[RANGE_FAKE_REAR];
+  sensor.blocked = sensor.valid &&
+                   sensor.distanceMm < FAKE_REAR_TOF_STOP_DISTANCE_MM;
+  if (sensor.valid && sensor.distanceMm > FAKE_REAR_TOF_CLEAR_DISTANCE_MM) {
+    sensor.blocked = false;
   }
-
-  bool validReading = isValidL1XDistance(rawDistance);
-  setRangeSensorReading(id, rawDistance, validReading);
+  sensor.stale = false;
+  syncLegacyTofGlobals();
 }
 
-static void updateL0XFanSensor(RangeSensorId id, VL53L0X &sensor, void (*reconnectSensor)()) {
+static void updateL0XFanSensor(RangeSensorId id, VL53L0X &sensor) {
   uint16_t rawDistance = sensor.readRangeContinuousMillimeters();
 
   if (sensor.timeoutOccurred()) {
     stopMotors();
     markRangeSensorTimeout(id);
     Serial.print(rangeSensors[id].name);
-    Serial.println(" TOF timeout. Reconnecting...");
-    reconnectSensor();
+    Serial.println(" TOF timeout. Channel marked degraded; motion policy will not assume clearance.");
     return;
   }
 
@@ -373,14 +376,17 @@ static void updateL0XFanSensor(RangeSensorId id, VL53L0X &sensor, void (*reconne
 
 void updateTOFSensors() {
   updateFanTOFSensors();
+  updateObjectTOFSensors();
   updateTofStaleFlags();
 }
 
 void updateFanTOFSensors() {
-  updateL0XFanSensor(RANGE_RIGHT_OUTER, rightOuterTOF, connectRightOuterTOF);
-  updateL1XFanSensor(RANGE_RIGHT_INNER, rightInnerTOF, connectRightInnerTOF);
-  updateL1XFanSensor(RANGE_LEFT_INNER, leftInnerTOF, connectLeftInnerTOF);
-  updateL0XFanSensor(RANGE_LEFT_OUTER, leftOuterTOF, connectLeftOuterTOF);
+  tofCloseReadingRevalidating = false;
+  updateL0XFanSensor(RANGE_RIGHT_OUTER, rightOuterTOF);
+  updateL0XFanSensor(RANGE_RIGHT_INNER, rightInnerTOF);
+  updateL0XFanSensor(RANGE_LEFT_INNER, leftInnerTOF);
+  updateL0XFanSensor(RANGE_LEFT_OUTER, leftOuterTOF);
+  updateFakeRearTofSensor();
   updateFrontBlockState();
 }
 
@@ -390,6 +396,10 @@ bool isRangeSensorValid(RangeSensorId id) {
 
 bool isRangeSensorBlocked(RangeSensorId id) {
   return rangeSensors[id].blocked;
+}
+
+bool isTofCloseReadingRevalidating() {
+  return tofCloseReadingRevalidating;
 }
 
 uint16_t getRangeSensorDistance(RangeSensorId id) {
@@ -409,6 +419,8 @@ static float getRobotTurnSweepRadiusMm() {
 }
 
 float getFanSweepClearanceMm(RangeSensorId id) {
+  // This measures clearance to the largest chassis corner during an in-place
+  // pivot. It is intentionally more conservative than straight body clearance.
   if (!isPhysicalFanSensor(id) || !isRangeSensorValid(id)) {
     return -1000000.0;
   }
@@ -422,6 +434,42 @@ float getFanSweepClearanceMm(RangeSensorId id) {
          getRobotTurnSweepRadiusMm();
 }
 
+static float getFanFootprintClearanceMm(RangeSensorId id) {
+  // For immediate straight-driving protection, measure distance from the ToF
+  // endpoint to the current rectangular body, not to the turn circle. This is
+  // why a narrow straight corridor can remain legal while a pivot inside it is
+  // still rejected by getFanSweepClearanceMm().
+  if (!isPhysicalFanSensor(id) || !isRangeSensorValid(id)) {
+    return -1000000.0;
+  }
+
+  const FanSensorGeometry &sensor = FAN_SENSOR_GEOMETRY[(int)id];
+  const float angleRad = sensor.angleDeg * DEG_TO_RAD;
+  const float rangeMm = (float)getRangeSensorDistance(id);
+  const float pointX = sensor.xMm + rangeMm * cosf(angleRad);
+  const float pointY = sensor.yMm + rangeMm * sinf(angleRad);
+  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm;
+  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm;
+  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm;
+  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm;
+
+  float outsideX = 0.0;
+  if (pointX > front) {
+    outsideX = pointX - front;
+  } else if (pointX < -rear) {
+    outsideX = -rear - pointX;
+  }
+
+  float outsideY = 0.0;
+  if (pointY > left) {
+    outsideY = pointY - left;
+  } else if (pointY < -right) {
+    outsideY = -right - pointY;
+  }
+
+  return sqrtf(outsideX * outsideX + outsideY * outsideY);
+}
+
 bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
   sensorId = RANGE_SENSOR_COUNT;
   clearanceMm = 1000000.0;
@@ -429,10 +477,21 @@ bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
   for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
     RangeSensorId id = (RangeSensorId)i;
     if (!isRangeSensorValid(id)) {
+      // A very small nonzero ToF return is outside the normal calibrated
+      // window but is evidence of immediate contact, never clear space.
+      if (getRangeSensorDistance(id) > 0 &&
+          getRangeSensorDistance(id) < FRONT_STOP_DISTANCE_MM) {
+        sensorId = id;
+        clearanceMm = -1000000.0;
+        return true;
+      }
       continue;
     }
 
-    const float clearance = getFanSweepClearanceMm(id);
+    // Point-goal safety protects the chassis as it is now. Turn clearance is
+    // evaluated separately by isTurnSweepSafe(); using the turn envelope here
+    // would falsely reject a straight, pre-aligned 400 mm corridor.
+    const float clearance = getFanFootprintClearanceMm(id);
     if (clearance < clearanceMm) {
       clearanceMm = clearance;
       sensorId = id;
@@ -440,29 +499,7 @@ bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
   }
 
   return sensorId != RANGE_SENSOR_COUNT &&
-         clearanceMm < AVOID_DIAGONAL_WARNING_CLEARANCE_MM;
-}
-
-bool waitForFrontClear(unsigned long timeoutMs) {
-  unsigned long startMs = millis();
-
-  while (millis() - startMs <= timeoutMs) {
-    if (handleBluetoothCommands()) {
-      stopMotors();
-      return false;
-    }
-
-    updateTOFSensors();
-
-    if (!isRangeSensorBlocked(RANGE_FRONT)) {
-      return true;
-    }
-
-    delay(50);
-  }
-
-  updateTOFSensors();
-  return !isRangeSensorBlocked(RANGE_FRONT);
+         clearanceMm < PLANNER_TOTAL_HARD_CLEARANCE_M * 1000.0f;
 }
 
 void printFanTelemetry() {
@@ -510,5 +547,11 @@ void printFanTelemetry() {
   Serial2.print(",left_mm=");
   Serial2.print(getRangeSensorDistance(RANGE_LEFT));
   Serial2.print(",left_valid=");
-  Serial2.println(isRangeSensorValid(RANGE_LEFT) ? 1 : 0);
+  Serial2.print(isRangeSensorValid(RANGE_LEFT) ? 1 : 0);
+  Serial2.print(",fake_rear_mm=");
+  Serial2.print(getRangeSensorDistance(RANGE_FAKE_REAR));
+  Serial2.print(",fake_rear_valid=");
+  Serial2.print(isRangeSensorValid(RANGE_FAKE_REAR) ? 1 : 0);
+  Serial2.print(",fake_rear_blocked=");
+  Serial2.println(isRangeSensorBlocked(RANGE_FAKE_REAR) ? 1 : 0);
 }

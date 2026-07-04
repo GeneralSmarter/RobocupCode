@@ -1,9 +1,8 @@
 // =====================================================
 // ROBOCUP ROBOT CODE
 // =====================================================
-// Behavior preserved from MatrixToPathV3 Step 23.
-// This sketch is split into focused modules so sensor, motion,
-// navigation, and state-machine work can evolve independently.
+// V7 local-planner firmware. This sketch only performs setup and schedules
+// the module-owned control loop.
 // =====================================================
 
 #include "Robot.h"
@@ -41,9 +40,10 @@ void setup() {
   robotX = 0.0;
   robotY = 0.0;
   robotTheta = 0.0;
+  initializeNavigationController();
 
   Serial.println();
-  Serial.println("Step 23 modular priority-order navigation ready.");
+  Serial.println("V7 local-planner navigation ready.");
   printCalibrationSummary();
   printPose();
   printWaitingForStart();
@@ -58,18 +58,12 @@ void loop() {
   handleBluetoothCommands();
   updateManualDriveTimeout();
 
-  if (isManualDriveActive()) {
-    delay(20);
-    return;
+  if (robotRunEnabled && !isManualDriveActive()) {
+    runStateMachine();
+  } else if (!isManualDriveActive()) {
+    motorStopRequested = true;
+    setMotionCommand(0.0, 0.0);
   }
 
-  if (!robotRunEnabled) {
-    updateTOFSensors();
-    stopMotors();
-    delay(50);
-    return;
-  }
-
-  runStateMachine();
-  handleBluetoothCommands();
+  updateRobotController();
 }

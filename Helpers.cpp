@@ -9,17 +9,26 @@ float wrapAngle(float angle) {
   return angle;
 }
 
+float navigationHeadingDeg() {
+  // The BNO055 mounting reports a physical right turn as positive yaw. The
+  // robot/map convention is +Y left with counter-clockwise-positive heading,
+  // so navigation geometry must use the inverse of that feedback convention.
+  return -readYawDeg();
+}
+
 void resetEncodersAndPID() {
-  noInterrupts();
-  leftRawCount = 0;
-  rightRawCount = 0;
-  interrupts();
+  // Encoder totals are intentionally never reset during navigation.  Local
+  // planning, odometry, and recovery all need one continuous motion history.
+  // A caller that wants a fresh control segment receives new snapshots instead.
+  long leftCount;
+  long rightCount;
+  readEncoderCounts(leftCount, rightCount);
 
-  lastLeftCount = 0;
-  lastRightCount = 0;
+  lastLeftCount = leftCount;
+  lastRightCount = rightCount;
 
-  lastOdomLeftCount = 0;
-  lastOdomRightCount = 0;
+  lastOdomLeftCount = leftCount;
+  lastOdomRightCount = rightCount;
 
   leftIntegral = 0.0;
   rightIntegral = 0.0;
@@ -76,6 +85,8 @@ void printCalibrationSummary() {
   Serial.println(RIGHT_ENCODER_SIGN);
   Serial.print("Ticks per metre: ");
   Serial.println(TICKS_PER_METRE, 2);
+  Serial.print("Planner effective track width m (provisional until arc-calibrated): ");
+  Serial.println(EFFECTIVE_TRACK_WIDTH_M, 3);
   Serial.print("Base target speed ticks/s: ");
   Serial.println(baseTargetSpeed, 1);
   Serial.print("Wheel PID Kp/Ki/Kd: ");
@@ -84,8 +95,6 @@ void printCalibrationSummary() {
   Serial.print(Ki, 4);
   Serial.print("/");
   Serial.println(Kd, 4);
-  Serial.print("Heading gain: ");
-  Serial.println(K_heading, 3);
   Serial.print("Waypoint tolerance m: ");
   Serial.println(WAYPOINT_TOLERANCE_M, 3);
   Serial.print("Front ToF stop/clear mm: ");
@@ -99,15 +108,15 @@ void printCalibrationSummary() {
   Serial.print("ToF stale timeout ms: ");
   Serial.println(TOF_STALE_TIMEOUT_MS);
   Serial.println("High ToF fan right-to-left:");
-  Serial.println("  0 right_outer -45 deg VL53L0X XSHUT0 addr 0x30");
-  Serial.println("  1 right_inner -20 deg VL53L1X XSHUT1 addr 0x31");
-  Serial.println("  2 left_inner  +20 deg VL53L1X XSHUT2 addr 0x32");
-  Serial.println("  3 left_outer  +45 deg VL53L0X XSHUT3 addr 0x33");
+  Serial.println("  0 right_outer -60 deg VL53L0X XSHUT0 addr 0x30");
+  Serial.println("  1 right_inner -20 deg VL53L0X XSHUT1 addr 0x31");
+  Serial.println("  2 left_inner  +20 deg VL53L0X XSHUT2 addr 0x32");
+  Serial.println("  3 left_outer  +60 deg VL53L0X XSHUT3 addr 0x33");
   Serial.println("  front safety is virtual: nearest valid +/-20 deg inner beam");
-  Serial.print("Wall follow enabled: ");
-  Serial.println(ENABLE_SIDE_WALL_FOLLOW_FALLBACK ? "yes" : "no");
-  Serial.print("Wall follow target mm: ");
-  Serial.println(WALL_FOLLOW_TARGET_MM);
+  Serial.println("  outer fan beams are clearance sensors, not side-wall followers");
+  Serial.print("Object VL53L1X subsystem enabled: ");
+  Serial.println(OBJECT_TOF_ENABLED ? "yes" : "no");
+  Serial.println("  planned object ToFs: left/right LOW+UPPER on XSHUT4-7, addr 0x34-0x37");
   Serial.println("Use Bluetooth command CSV ON for once-per-second machine-readable telemetry.");
 }
 
