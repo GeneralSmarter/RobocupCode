@@ -23,7 +23,9 @@ track-width calibration gate.
 ## Files
 
 - `RobotCode.ino` - Arduino setup/loop only.
-- `Robot.h` - shared configuration, globals, enums, structs, and prototypes.
+- `Robot.h` - shared hardware/runtime globals and function prototypes.
+- `RobotTypes.h` - shared enums and structs.
+- `RobotConfig.h` - calibration values, pins, geometry, timing, and planner constants.
 - `Globals.cpp` - hardware objects, runtime state, and waypoint list.
 - `Encoders.cpp` - encoder interrupt handlers.
 - `StateMachine.cpp` - high-level robot states.
@@ -39,6 +41,29 @@ track-width calibration gate.
 - `Helpers.cpp` - angle wrapping, cumulative encoder control snapshots, count
   reads, and pose print.
 - `Bluetooth.cpp` - CH9143 Bluetooth serial command and telemetry link on `Serial2`.
+
+## Control Flow
+
+The active V7 firmware has one scheduled control path:
+
+```text
+RobotCode.ino loop()
+  -> handleBluetoothCommands()
+  -> runStateMachine()
+  -> updateRobotController()
+       -> updateTOFSensors()
+       -> updateObjectTOFSensors()
+       -> updateLocalMapFromSensors()
+       -> updateOdometry()
+       -> updateNavigationController()
+       -> updateMotorController()
+```
+
+Keep `MotorControl.cpp` as the only periodic motor-output owner. New behaviours
+should request motion through navigation goals or `setMotionCommand()`, not by
+writing motor pulses from another module. `Bluetooth.cpp` still contains both
+command handling and telemetry formatting so command names, CSV fields, and
+test workflows stay in one visible interface file during hardware validation.
 
 ## Bluetooth CH9143 Link
 
