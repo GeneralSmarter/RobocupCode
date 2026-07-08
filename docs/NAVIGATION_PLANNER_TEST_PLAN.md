@@ -231,8 +231,66 @@ the log emits `reverse_recovery_start,no_forward_path`, then
 `reverse_recovery_step,arc_selected` as reverse arcs are selected. The planner
 tries normal forward planning first on every planner tick. When forward arcs
 become valid again, it emits `reverse_recovery_end,forward_path_found` and
-continues toward the point goal. It should not abort merely because one reverse
-step failed to produce a forward option.
+continues toward the point goal. If the inner/outer fan rays still show close
+side evidence at reverse exit, it first emits `post_reverse_escape_start` and
+drives a temporary side-clearance goal. It should not abort merely because one
+reverse step failed to produce a forward option. Current source requires a
+strong side tie (`0.10 m`) or recent escape-side memory before choosing a new
+side, holds the post-reverse escape for at least `900 ms`, and bypasses generic
+point alignment while a side escape is available.
+
+### Stage 1c: offset wall/gap side-escape rejoin
+
+Use the classic wall/gap setup, but deliberately offset the robot so that after
+it begins the avoid run one outer fan ToF still sees the wall. The purpose is
+to catch both old failure modes: reversing or shuffling back into the same
+wall-offset pocket, and "passing" in serial while physically scraping or
+requiring repeated retries.
+
+```text
+ZERO
+CSV ON
+MARK arn8
+TEST ARM
+TEST AVOID 1.00
+STATUS
+CSV OFF
+```
+
+Pass criteria: the robot clears the wall without contact or scraping, does not
+repeat the same wall-pocket entry, and ends at the real waypoint tolerance with
+`waypoint_reached`. A broad detour-plane finish far from the waypoint is not an
+accepted pass. The preferred event chain is `SIDE_ESCAPE -> ROUTE_REJOIN ->
+FINAL_POINT_APPROACH -> waypoint_reached`; reverse recovery may still occur if
+there is genuinely no forward arc, but it is not required for a pass.
+
+Known evidence from the 2026-07-06/07 rework is summarized in
+`NAVIGATION_REWORK_SESSION_SUMMARY_20260706.md`; the diagnosis trail is in
+`OBSTACLE_REWORK_RECOMMENDATION.md`. The old `rvs1`/`rvs2` reverse-survey
+branch is historical only: `rvs2` reached `waypoint_reached` in serial, but
+physical observation showed multiple retries and scraping, so it was not
+accepted. `arn4b` also is not accepted because its broad detour finish ended
+around `x=0.948 y=0.463`, too far from the real waypoint.
+
+Accepted evidence: `arn7` on 2026-07-06 passed `TEST AVOID 1.00` with
+terminal `test_avoid_end,waypoint_reached`, no reverse recovery, and final pose
+about `x=1.028 y=0.049 theta=-80.50`. `arn7d2` passed `TEST AVOID 2.00` with
+terminal `test_avoid_end,waypoint_reached`, no reverse recovery, and final pose
+about `x=1.977 y=0.053 theta=-28.94`.
+
+Current watch item: post-clear motion may feel slower than necessary because
+`PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS` is applied while
+`sideEscapeRejoinActive(...)` is true. If tuning this, run:
+
+```text
+MARK arn8
+TEST AVOID 1.00
+MARK arn8d2
+TEST AVOID 2.00
+```
+
+after narrowing the speed cap condition. Keep marks short; one long mark was
+observed to stall command parsing before the test started.
 
 ### Current escape evidence
 

@@ -1,7 +1,7 @@
 # Current State And Next Steps
 
-Status: end-of-day handoff after object detection, `TEST HUNT`, `TEST SEARCH`,
-route-search V1, and search-turn tuning.
+Status: current handoff after object detection/search work plus the 2026-07-06/07
+offset wall/gap navigation rework.
 
 This file records what the robot can do now, what is still only scaffold, and
 the next smallest useful steps. It should be read alongside
@@ -25,12 +25,13 @@ the next smallest useful steps. It should be read alongside
 - Object VL53L1X sensors are perception/candidate sensors only; they do not
   override high-fan safety.
 
-End-of-day robot state, 2026-07-04:
+Latest robot state, 2026-07-06/07:
 
 - Firmware compiled and uploaded successfully with Arduino CLI.
 - Last reported build label: `V7-local-planner`.
-- Last reported state: `END_MATCH`, `testArmed=0`, `motorL=1500`,
-  `motorR=1500`.
+- Latest accepted offset wall/gap navigation evidence is `arn7`/`arn7d2`, not
+  `rvs2`. `arn7d2` ended in `waypoint_reached` with no reverse recovery and
+  approximate pose `x=1.977 y=0.053 theta=-28.94`.
 - Last reported search scan setting: `searchTurnUs=280`.
 - Normal global slow pivot pulses are back at `1800/1200 us`.
 - Weight-search scan/confirm turns use their own runtime offset via
@@ -39,14 +40,43 @@ End-of-day robot state, 2026-07-04:
 
 ## 2. Current Navigation State
 
-Navigation is considered good enough to support object work. Do not redesign
-navigation unless object integration exposes a direct problem.
+Navigation is considered good enough to support object work, with the
+2026-07-06/07 bounded side-escape rework as the current baseline. Do not
+redesign navigation unless object integration or physical regression testing
+exposes a direct problem.
 
 Accepted navigation behaviour:
 
 - Four high fan VL53L0X sensors are active and valid in open space.
 - V7 local planner can drive point goals.
 - Fake-rear-ToF reverse recovery is available and tested.
+- Reverse recovery now exits through `post_reverse_escape` when a close
+  inner/outer side fan ray remains after forward space returns.
+- The reverse-survey branch (`rvs1`/`rvs2`) is historical only. `rvs2` reached
+  `waypoint_reached` in serial logs, but physical observation showed multiple
+  retries and scraping, so it is not accepted as the current baseline.
+- The accepted offset wall/gap model is:
+  `SIDE_ESCAPE -> ROUTE_REJOIN -> FINAL_POINT_APPROACH -> waypoint_reached`.
+  Obstacle avoidance should be a temporary overlay that clears the obstacle and
+  then returns control to the actual waypoint, not a sticky replacement route.
+- Current source uses proactive side-escape memory, urgent escape-turn
+  commitment, committed side-sign steering, longer post-reverse latching,
+  corridor-squeeze suppression during active side escape, bounded route
+  rejoin, restored finish/overshoot/missed guards, scoped point-alignment
+  bypass, and a temporary side-escape rejoin speed cap.
+- Accepted evidence after the rework:
+  - `arn7`: `TEST AVOID 1.00` passed with `waypoint_reached`, no reverse
+    recovery, final pose about `x=1.028 y=0.049 theta=-80.50`.
+  - `arn7d2`: `TEST AVOID 2.00` passed with `waypoint_reached`, no reverse
+    recovery, final pose about `x=1.977 y=0.053 theta=-28.94`.
+- Do not reintroduce broad detour-plane completion. The `arn4b`
+  route-line-detour finish ended around `x=0.948 y=0.463`, too far from the
+  real waypoint.
+- Current watch item: the post-clear movement may be slower than necessary
+  because `PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS` is applied while
+  `sideEscapeRejoinActive(...)` is true. If it feels slow in physical testing,
+  remove that condition from the cap and run the `arn8`/`arn8d2` checks from
+  `NAVIGATION_REWORK_SESSION_SUMMARY_20260706.md`.
 - 400 mm competition gap has one accepted physical pass.
 - `TEST HUNT` can use the same point-goal planner path as `TEST GOTO`.
 - `TEST DISARM` cancels test-owned goals and leaves motors neutral.
@@ -103,6 +133,9 @@ Current constants:
 
 ```cpp
 OBJECT_TOF_ENABLED = true
+OBJECT_TOF_ROI_WIDTH = 16
+OBJECT_TOF_ROI_HEIGHT = 4
+OBJECT_TOF_ROI_CENTER_SPAD = 199
 OBJECT_TOF_VALID_MIN_MM = 40
 OBJECT_TOF_VALID_MAX_MM = 4000
 OBJECT_CANDIDATE_MIN_MM = 60
@@ -112,6 +145,18 @@ OBJECT_UPPER_STRONG_SIGNAL_MCPS = 4.0
 OBJECT_CANDIDATE_CONFIRM_READS = 3
 OBJECT_TARGET_STALE_TIMEOUT_MS = 1000
 ```
+
+Object ToF FOV notes:
+
+- The object sensors currently use a centered `16 x 4` ROI: full horizontal
+  width and minimum vertical height.
+- For the mounted VL53L1X boards, `width` is left-right across the readable
+  sensor label and `height` is up-down. The centered `16 x 4` ROI is intended
+  to reduce floor/chassis/vertical clutter while keeping left-right object
+  coverage.
+- If the ROI centre is shifted later with `setROICenter()`, remember the
+  VL53L1X lens inverts the image; centered sizing does not need that mental
+  inversion.
 
 Current search/hunt constants:
 

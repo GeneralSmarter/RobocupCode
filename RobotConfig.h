@@ -94,11 +94,14 @@ const uint8_t OBJECT_RIGHT_LOW_ADDRESS   = 0x36;
 const uint8_t OBJECT_RIGHT_UPPER_ADDRESS = 0x37;
 const uint32_t OBJECT_TOF_TIMING_BUDGET_US = 50000;
 const unsigned long OBJECT_TOF_SAMPLE_PERIOD_MS = 60;
+const uint8_t OBJECT_TOF_ROI_WIDTH = 16;
+const uint8_t OBJECT_TOF_ROI_HEIGHT = 10;
+const uint8_t OBJECT_TOF_ROI_CENTER_SPAD = 199;
 const int OBJECT_TOF_VALID_MIN_MM = 40;
-const int OBJECT_TOF_VALID_MAX_MM = 4000;
+const int OBJECT_TOF_VALID_MAX_MM = 2000;
 const unsigned long OBJECT_TOF_STALE_TIMEOUT_MS = 750;
 const uint16_t OBJECT_CANDIDATE_MIN_MM = 60;
-const uint16_t OBJECT_CANDIDATE_MAX_MM = 1500;
+const uint16_t OBJECT_CANDIDATE_MAX_MM = 800;
 const uint16_t OBJECT_UPPER_CLEAR_DELTA_MM = 80;
 const float OBJECT_UPPER_STRONG_SIGNAL_MCPS = 4.0;
 const uint8_t OBJECT_CANDIDATE_CONFIRM_READS = 3;
@@ -270,6 +273,12 @@ const float PLANNER_SENSING_LATENCY_S = 0.12;
 const float PLANNER_ESCAPE_SPEED_LIMIT_START_M = 0.48;
 const float PLANNER_ESCAPE_SPEED_LIMIT_FULL_M = 0.28;
 const float PLANNER_ESCAPE_MIN_SPEED_TPS = PLANNER_MIN_DRIVABLE_SPEED_TPS;
+// Once a side-escape is urgent, do not let generic point-progress scoring
+// choose straight or opposite-side arcs that keep walking the chassis into the
+// wall pocket. If no committed same-side arc is safe, stop and let reverse
+// recovery create a new observation pose before the front sensor is buried.
+const float PLANNER_ESCAPE_FORCE_TURN_URGENCY = 0.60;
+const float PLANNER_ESCAPE_FORCE_TURN_MIN_RATIO = 0.15;
 const float PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS = 0.0;
 const float PLANNER_TURN_TARGET_SPEED = 1050.0;
 // This marker selects the original, physically calibrated slow-turn pulse
@@ -326,6 +335,14 @@ const float PLANNER_HUNT_PICKUP_MAX_SPEED_TPS = 2850.0;
 // chasing the clamped lookahead point indefinitely. Beyond this window, abort
 // the point goal as missed so the robot cannot run away from a passed target.
 const float PLANNER_LINE_FOLLOW_MISSED_STOP_OVERSHOOT_M = 0.45;
+// After a side-escape detour, rejoin the original waypoint slowly instead of
+// treating a broad target-plane crossing as success. The waypoint itself still
+// owns completion; this cap just prevents the post-clear high-speed S-turn loop.
+const float PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS = 1700.0;
+// Side-escape route rejoin is a temporary handoff, not a new mission. Once the
+// robot is this close to the target plane, return to ordinary point approach so
+// the planner cannot keep extending the detour forward past the waypoint.
+const float PLANNER_SIDE_ESCAPE_FINAL_APPROACH_M = 0.30;
 // Point goals are forward-arc goals. If a new point lies behind the chassis,
 // rotate in place first until the target is inside the arc planner's useful
 // forward field. This prevents TEST GOTO 0 0 from driving farther away after a
@@ -345,6 +362,24 @@ const float PLANNER_REVERSE_RECOVERY_MIN_SPEED_SCALE = 0.75;
 const float PLANNER_REVERSE_RECOVERY_MAX_TURN_RATIO = 0.60;
 const int PLANNER_REVERSE_RECOVERY_CURVATURE_SAMPLES = 9;
 const float PLANNER_REVERSE_RECOVERY_REAR_BUFFER_M = 0.06;
+const float PLANNER_REVERSE_SURVEY_MIN_REVERSE_M = 0.16;
+const float PLANNER_REVERSE_SURVEY_RETRY_REVERSE_M = 0.10;
+const float PLANNER_REVERSE_SURVEY_MAX_REVERSE_M = 0.48;
+const float PLANNER_REVERSE_SURVEY_FRONT_CLEAR_M = 0.34;
+const float PLANNER_REVERSE_SURVEY_SIDE_CLEAR_M = 0.28;
+const unsigned long PLANNER_REVERSE_SURVEY_SETTLE_MS = 220;
+const float PLANNER_POST_REVERSE_ESCAPE_EXTRA_LATERAL_M = 0.08;
+const float PLANNER_SIDE_ESCAPE_TIE_M = 0.10;
+const unsigned long PLANNER_SIDE_ESCAPE_MEMORY_MS = 2500;
+const float PLANNER_SIDE_ESCAPE_ADAPT_STEP_M = 0.08;
+const float PLANNER_SIDE_ESCAPE_ADAPT_MAX_EXTRA_M = 0.24;
+const unsigned long PLANNER_SIDE_ESCAPE_ADAPT_MEMORY_MS = 5000;
+const unsigned long PLANNER_SIDE_ESCAPE_ADAPT_BUMP_COOLDOWN_MS = 300;
+// Keep the post-reverse lane long enough to actually pass the obstacle edge.
+// A 900 ms latch could look clean for a moment, then hand control back to the
+// waypoint and turn the robot straight back toward the wall.
+const unsigned long PLANNER_POST_REVERSE_ESCAPE_MIN_MS = 1800;
+const unsigned long PLANNER_POST_REVERSE_ESCAPE_TIMEOUT_MS = 5000;
 const uint16_t TOF_SUDDEN_CLOSE_DROP_MM = 400;
 const uint16_t TOF_CLOSE_CONFIRM_TOLERANCE_MM = 200;
 const uint8_t TOF_CLOSE_CONFIRM_READS = 2;

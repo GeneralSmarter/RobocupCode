@@ -51,16 +51,55 @@ static float reverseRecoveryStartX = 0.0;
 static float reverseRecoveryStartY = 0.0;
 static unsigned long reverseRecoveryStartedMs = 0;
 static unsigned long reverseRecoveryStepCount = 0;
+static bool reverseSurveySettling = false;
+static unsigned long reverseSurveySettleStartedMs = 0;
+static bool reverseSurveyReadyReported = false;
+static bool reverseSurveyReadyToTryForward = false;
+static bool reverseSurveyForcedByMaxRetreat = false;
+static float reverseSurveyRequiredRetreatM = PLANNER_REVERSE_SURVEY_MIN_REVERSE_M;
 static unsigned long noSafeTrajectorySinceMs = 0;
 static bool candidateRejectsReported = false;
 static bool reverseRecoveryRejectsReported = false;
 static bool clearanceEscapeLocalGoalActive = false;
+static bool clearanceEscapeRouteDetourActive = false;
+static bool postReverseEscapeActive = false;
+static float postReverseEscapeSideSign = 0.0f;
+static unsigned long postReverseEscapeStartedMs = 0;
+static float lastClearanceEscapeSideSign = 0.0f;
+static unsigned long lastClearanceEscapeMs = 0;
+static float sideEscapeAdaptiveExtraM = 0.0f;
+static float sideEscapeAdaptiveSideSign = 0.0f;
+static uint8_t sideEscapeAdaptiveFailureCount = 0;
+static unsigned long sideEscapeAdaptiveLastBumpMs = 0;
 static float lastFootprintRejectWorldX = 0.0f;
 static float lastFootprintRejectWorldY = 0.0f;
 static int lastFootprintRejectCellX = -1;
 static int lastFootprintRejectCellY = -1;
 static float lastCorridorRejectLeftM = -1.0f;
 static float lastCorridorRejectRightM = -1.0f;
+
+struct SideEscapeEvidence {
+  bool sensorsValid;
+  bool closeSideEvidence;
+  bool sidePreferenceValid;
+  float rightM;
+  float leftM;
+  float restrictedM;
+  float triggerM;
+  float sideSign;
+};
+
+static void resetPostReverseEscapeState();
+static void resetClearanceEscapeMemory();
+static void resetReverseSurveyState();
+static bool readSideEscapeEvidence(SideEscapeEvidence &evidence);
+static void bumpSideEscapeAdaptiveExtra(float sideSign, const char* reason);
+
+enum ReverseSurveyDecision {
+  REVERSE_SURVEY_REVERSE,
+  REVERSE_SURVEY_HOLD,
+  REVERSE_SURVEY_FORWARD
+};
 
 enum CandidateRejectReason {
   CANDIDATE_REJECT_NONE,
@@ -572,6 +611,9 @@ static void finishNavigationGoal(bool success, PlannerStopReason reason, const c
   reverseRecoveryActive = false;
   noSafeTrajectorySinceMs = 0;
   reverseRecoveryRejectsReported = false;
+  resetReverseSurveyState();
+  resetPostReverseEscapeState();
+  resetClearanceEscapeMemory();
   navigationGoal.active = false;
   navigationGoal.completed = success;
   navigationGoal.failed = !success;
@@ -629,6 +671,9 @@ void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owne
   noSafeTrajectorySinceMs = 0;
   candidateRejectsReported = false;
   reverseRecoveryRejectsReported = false;
+  resetReverseSurveyState();
+  resetPostReverseEscapeState();
+  resetClearanceEscapeMemory();
   plannerTelemetry.replanReason = "goal_started";
   plannerTelemetry.safeStopReason = "";
   resetTurnStuckCheck(navigationHeadingDeg());
@@ -666,6 +711,9 @@ void startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner) {
   reverseRecoveryActive = false;
   noSafeTrajectorySinceMs = 0;
   reverseRecoveryRejectsReported = false;
+  resetReverseSurveyState();
+  resetPostReverseEscapeState();
+  resetClearanceEscapeMemory();
   motorStopRequested = false;
   plannerTelemetry.replanReason = "turn_started";
   plannerTelemetry.safeStopReason = "";
@@ -747,15 +795,33 @@ static float observedForwardDistanceForCandidate(float turnTicks) {
 }
 
 static float clearanceEscapeUrgency() {
-  if (!clearanceEscapeLocalGoalActive || !isRangeSensorValid(RANGE_FRONT)) {
+  if (!clearanceEscapeLocalGoalActive) {
     return 0.0f;
   }
 
-  float frontM = getRangeSensorDistance(RANGE_FRONT) / 1000.0f;
-  float spanM = max(0.001f, PLANNER_ESCAPE_SPEED_LIMIT_START_M -
-                              PLANNER_ESCAPE_SPEED_LIMIT_FULL_M);
-  return constrain((PLANNER_ESCAPE_SPEED_LIMIT_START_M - frontM) / spanM,
-                   0.0f, 1.0f);
+  float urgency = 0.0f;
+  if (isRangeSensorValid(RANGE_FRONT)) {
+    float frontM = getRangeSensorDistance(RANGE_FRONT) / 1000.0f;
+    float spanM = max(0.001f, PLANNER_ESCAPE_SPEED_LIMIT_START_M -
+                                PLANNER_ESCAPE_SPEED_LIMIT_FULL_M);
+    urgency = max(urgency,
+                  constrain((PLANNER_ESCAPE_SPEED_LIMIT_START_M - frontM) / spanM,
+                            0.0f, 1.0f));
+  }
+
+  SideEscapeEvidence evidence;
+  if (readSideEscapeEvidence(evidence) && evidence.closeSideEvidence) {
+    float sideSpanM = max(0.001f, evidence.triggerM - PLANNER_PREFERRED_CLEARANCE_M);
+    urgency = max(urgency,
+                  constrain((evidence.triggerM - evidence.restrictedM) / sideSpanM,
+                            0.0f, 1.0f));
+  }
+
+  if (postReverseEscapeActive) {
+    urgency = max(urgency, 0.85f);
+  }
+
+  return urgency;
 }
 
 static float applyClearanceEscapeSpeedCap(float speedCap) {
@@ -1011,6 +1077,13 @@ static float routeLineLateralErrorM(float worldX, float worldY,
               (worldY - navigationGoal.startY) * routeUx);
 }
 
+static float routeLineSignedLateralErrorM(float worldX, float worldY,
+                                          float routeUx, float routeUy) {
+  // Positive is left of the nominal start->target route frame.
+  return -(worldX - navigationGoal.startX) * routeUy +
+         (worldY - navigationGoal.startY) * routeUx;
+}
+
 static bool routeLineTrackingEligible(float &routeLengthM, float &routeUx,
                                       float &routeUy, float &routeHeadingRad) {
   if (!routeLineFrame(routeLengthM, routeUx, routeUy, routeHeadingRad)) {
@@ -1053,6 +1126,23 @@ static bool routeLineClearlyMissed(float routeLengthM, float routeUx, float rout
          lateralErrorM <= PLANNER_LINE_FOLLOW_LATERAL_TOLERANCE_M;
 }
 
+static bool sideEscapeRejoinActive(float routeLengthM, float routeUx, float routeUy) {
+  if (!clearanceEscapeRouteDetourActive || routeLengthM <= 0.0f) {
+    return false;
+  }
+
+  float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
+  return alongM < routeLengthM - PLANNER_SIDE_ESCAPE_FINAL_APPROACH_M;
+}
+
+static void clearSideEscapeDetourIfActive(const char* reason) {
+  if (!clearanceEscapeRouteDetourActive) {
+    return;
+  }
+  clearanceEscapeRouteDetourActive = false;
+  sendBluetoothEvent("side_escape_final_approach", reason);
+}
+
 static bool huntPickupCarryThroughActive(float routeLengthM, float routeUx,
                                          float routeUy) {
   if (!ownerIsObjectHunt(navigationGoal.owner)) {
@@ -1070,6 +1160,10 @@ static float requestedPointGoalSpeedCap(bool routeLineActive,
                                         float routeLengthM, float routeUx,
                                         float routeUy) {
   float requestedCap = baseTargetSpeed;
+  if (clearanceEscapeLocalGoalActive || postReverseEscapeActive ||
+      sideEscapeRejoinActive(routeLengthM, routeUx, routeUy)) {
+    requestedCap = min(requestedCap, PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS);
+  }
   if (routeLineActive && huntPickupCarryThroughActive(routeLengthM, routeUx, routeUy)) {
     requestedCap = min(PLANNER_HUNT_PICKUP_MAX_SPEED_TPS,
                        baseTargetSpeed + PLANNER_HUNT_PICKUP_BOOST_TPS);
@@ -1262,6 +1356,7 @@ static bool selectTrajectory(float goalX, float goalY) {
   int rejectedForwardObservation = 0;
   int rejectedFootprint = 0;
   int rejectedCorridor = 0;
+  int rejectedEscapeCommit = 0;
   lastFootprintRejectWorldX = 0.0f;
   lastFootprintRejectWorldY = 0.0f;
   lastFootprintRejectCellX = -1;
@@ -1271,12 +1366,24 @@ static bool selectTrajectory(float goalX, float goalY) {
   float escapeUrgency = clearanceEscapeUrgency();
   float desiredEscapeTurnSign = 0.0f;
   if (clearanceEscapeLocalGoalActive) {
-    float headingRad = navigationHeadingRad();
-    float goalBodyY = -dx * sinf(headingRad) + dy * cosf(headingRad);
-    if (goalBodyY < -0.02f) {
-      desiredEscapeTurnSign = -1.0f;  // negative turn reduces navigation heading toward robot-right
-    } else if (goalBodyY > 0.02f) {
-      desiredEscapeTurnSign = 1.0f;   // positive turn increases navigation heading toward robot-left
+    // Under side-escape urgency, commit to the selected open side. Do not infer
+    // turn direction from the route-frame local-goal bearing: once the chassis
+    // is already angled toward the bypass lane, that point can appear on the
+    // opposite side of the robot and make the planner steer back into the wall
+    // pocket. Positive turn is robot-left in this frame, matching sideSign.
+    float committedSideSign = postReverseEscapeActive
+      ? postReverseEscapeSideSign
+      : lastClearanceEscapeSideSign;
+    if (committedSideSign != 0.0f) {
+      desiredEscapeTurnSign = committedSideSign;
+    } else {
+      float headingRad = navigationHeadingRad();
+      float goalBodyY = -dx * sinf(headingRad) + dy * cosf(headingRad);
+      if (goalBodyY < -0.02f) {
+        desiredEscapeTurnSign = -1.0f;  // negative turn reduces navigation heading toward robot-right
+      } else if (goalBodyY > 0.02f) {
+        desiredEscapeTurnSign = 1.0f;   // positive turn increases navigation heading toward robot-left
+      }
     }
   }
 
@@ -1297,6 +1404,19 @@ static bool selectTrajectory(float goalX, float goalY) {
           finalGoalDistanceM <= PLANNER_NEAR_GOAL_STRAIGHTEN_DISTANCE_M &&
           fabs(turn / max(1.0f, forward)) > PLANNER_LINE_FOLLOW_NEAR_GOAL_MAX_TURN_RATIO) {
         continue;
+      }
+
+      if (clearanceEscapeLocalGoalActive &&
+          escapeUrgency >= PLANNER_ESCAPE_FORCE_TURN_URGENCY &&
+          desiredEscapeTurnSign != 0.0f) {
+        float turnRatio = turn / max(1.0f, forward);
+        bool committedToEscapeSide =
+          turnRatio * desiredEscapeTurnSign > 0.0f &&
+          fabs(turnRatio) >= PLANNER_ESCAPE_FORCE_TURN_MIN_RATIO;
+        if (!committedToEscapeSide) {
+          rejectedEscapeCommit++;
+          continue;
+        }
       }
 
       if (forward < PLANNER_MIN_DRIVABLE_SPEED_TPS) {
@@ -1361,6 +1481,7 @@ static bool selectTrajectory(float goalX, float goalY) {
     float leadingEnvelopeM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
                              PLANNER_TOTAL_HARD_CLEARANCE_M;
     bool straightSqueezeAllowed =
+      !clearanceEscapeLocalGoalActive &&
       rejectedFootprint > 0 &&
       rejectedForwardObservation == 0 &&
       rejectedCorridor == 0 &&
@@ -1390,11 +1511,12 @@ static bool selectTrajectory(float goalX, float goalY) {
     }
 
     if (!candidateRejectsReported) {
-      char detail[192];
+      char detail[224];
       snprintf(detail, sizeof(detail),
-               "turn=%d;observed=%d;footprint=%d;corridor=%d;fp=%.3f/%.3f@%d/%d;corr=%.2f/%.2f",
+               "turn=%d;observed=%d;footprint=%d;corridor=%d;escape_commit=%d;urg=%.2f;side=%.0f;fp=%.3f/%.3f@%d/%d;corr=%.2f/%.2f",
                rejectedTurnObservability, rejectedForwardObservation,
-               rejectedFootprint, rejectedCorridor,
+               rejectedFootprint, rejectedCorridor, rejectedEscapeCommit,
+               escapeUrgency, desiredEscapeTurnSign,
                lastFootprintRejectWorldX, lastFootprintRejectWorldY,
                lastFootprintRejectCellX, lastFootprintRejectCellY,
                lastCorridorRejectLeftM, lastCorridorRejectRightM);
@@ -1442,13 +1564,32 @@ static bool canStartReverseRecovery() {
          isRangeSensorValid(RANGE_FAKE_REAR);
 }
 
+static void resetReverseSurveyState() {
+  reverseSurveySettling = false;
+  reverseSurveySettleStartedMs = 0;
+  reverseSurveyReadyReported = false;
+  reverseSurveyReadyToTryForward = false;
+  reverseSurveyForcedByMaxRetreat = false;
+  reverseSurveyRequiredRetreatM = PLANNER_REVERSE_SURVEY_MIN_REVERSE_M;
+}
+
 static void startReverseRecovery() {
+  float adaptiveSideSign = postReverseEscapeActive
+    ? postReverseEscapeSideSign
+    : lastClearanceEscapeSideSign;
+  if (adaptiveSideSign != 0.0f &&
+      millis() - lastClearanceEscapeMs <=
+        PLANNER_SIDE_ESCAPE_ADAPT_MEMORY_MS) {
+    bumpSideEscapeAdaptiveExtra(adaptiveSideSign, "reentered_recovery");
+  }
+
   reverseRecoveryActive = true;
   reverseRecoveryStartX = robotX;
   reverseRecoveryStartY = robotY;
   reverseRecoveryStartedMs = millis();
   reverseRecoveryStepCount = 0;
   reverseRecoveryRejectsReported = false;
+  resetReverseSurveyState();
   noSafeTrajectorySinceMs = 0;
   resetEncodersAndPID();
   plannerTelemetry.planReason = "reverse_recovery_start";
@@ -1463,7 +1604,311 @@ static void endReverseRecovery(const char* detail) {
   }
   reverseRecoveryActive = false;
   reverseRecoveryRejectsReported = false;
+  resetReverseSurveyState();
   sendBluetoothEvent("reverse_recovery_end", detail);
+}
+
+static float sideEscapeTriggerM() {
+  return WAYPOINT_LOOKAHEAD_M +
+         ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+         PLANNER_PREFERRED_CLEARANCE_M;
+}
+
+static const char* sideEscapeName(float sideSign) {
+  if (sideSign < 0.0f) {
+    return "right";
+  }
+  if (sideSign > 0.0f) {
+    return "left";
+  }
+  return "unknown";
+}
+
+static void resetPostReverseEscapeState() {
+  postReverseEscapeActive = false;
+  postReverseEscapeSideSign = 0.0f;
+  postReverseEscapeStartedMs = 0;
+}
+
+static void resetSideEscapeAdaptation() {
+  sideEscapeAdaptiveExtraM = 0.0f;
+  sideEscapeAdaptiveSideSign = 0.0f;
+  sideEscapeAdaptiveFailureCount = 0;
+  sideEscapeAdaptiveLastBumpMs = 0;
+}
+
+static void resetClearanceEscapeMemory() {
+  lastClearanceEscapeSideSign = 0.0f;
+  lastClearanceEscapeMs = 0;
+  clearanceEscapeRouteDetourActive = false;
+  resetSideEscapeAdaptation();
+}
+
+static bool readSideEscapeEvidence(SideEscapeEvidence &evidence) {
+  evidence.sensorsValid =
+    isRangeSensorValid(RANGE_RIGHT_INNER) &&
+    isRangeSensorValid(RANGE_LEFT_INNER) &&
+    isRangeSensorValid(RANGE_RIGHT_OUTER) &&
+    isRangeSensorValid(RANGE_LEFT_OUTER);
+  evidence.rightM = -1.0f;
+  evidence.leftM = -1.0f;
+  evidence.restrictedM = -1.0f;
+  evidence.triggerM = sideEscapeTriggerM();
+  evidence.closeSideEvidence = false;
+  evidence.sidePreferenceValid = false;
+  evidence.sideSign = 0.0f;
+
+  if (!evidence.sensorsValid) {
+    return false;
+  }
+
+  float rightInnerM = getRangeSensorDistance(RANGE_RIGHT_INNER) / 1000.0f;
+  float leftInnerM = getRangeSensorDistance(RANGE_LEFT_INNER) / 1000.0f;
+  float rightOuterM = getRangeSensorDistance(RANGE_RIGHT_OUTER) / 1000.0f;
+  float leftOuterM = getRangeSensorDistance(RANGE_LEFT_OUTER) / 1000.0f;
+  evidence.rightM = min(rightInnerM, rightOuterM);
+  evidence.leftM = min(leftInnerM, leftOuterM);
+  evidence.restrictedM = min(evidence.rightM, evidence.leftM);
+  evidence.closeSideEvidence = evidence.restrictedM < evidence.triggerM;
+  evidence.sidePreferenceValid =
+    fabs(evidence.rightM - evidence.leftM) >= PLANNER_SIDE_ESCAPE_TIE_M;
+  evidence.sideSign = evidence.rightM > evidence.leftM ? -1.0f : 1.0f;
+  return true;
+}
+
+static bool chooseSideEscapeSign(const SideEscapeEvidence &evidence,
+                                 bool allowRecentMemory,
+                                 float &sideSign) {
+  sideSign = 0.0f;
+  if (!evidence.closeSideEvidence) {
+    return false;
+  }
+
+  if (evidence.sidePreferenceValid) {
+    sideSign = evidence.sideSign;
+    return true;
+  }
+
+  if (allowRecentMemory &&
+      lastClearanceEscapeSideSign != 0.0f &&
+      millis() - lastClearanceEscapeMs <= PLANNER_SIDE_ESCAPE_MEMORY_MS) {
+    sideSign = lastClearanceEscapeSideSign;
+    return true;
+  }
+
+  return false;
+}
+
+static void rememberClearanceEscapeSide(float sideSign) {
+  if (sideSign == 0.0f) {
+    return;
+  }
+
+  if (sideEscapeAdaptiveSideSign != 0.0f &&
+      sideSign * sideEscapeAdaptiveSideSign < 0.0f) {
+    resetSideEscapeAdaptation();
+  }
+  lastClearanceEscapeSideSign = sideSign;
+  lastClearanceEscapeMs = millis();
+  clearanceEscapeRouteDetourActive = true;
+}
+
+static float sideEscapeAdaptiveExtraFor(float sideSign) {
+  if (sideSign == 0.0f ||
+      sideEscapeAdaptiveSideSign == 0.0f ||
+      sideSign * sideEscapeAdaptiveSideSign <= 0.0f ||
+      sideEscapeAdaptiveExtraM <= 0.0f) {
+    return 0.0f;
+  }
+
+  if (millis() - sideEscapeAdaptiveLastBumpMs >
+      PLANNER_SIDE_ESCAPE_ADAPT_MEMORY_MS) {
+    resetSideEscapeAdaptation();
+    return 0.0f;
+  }
+
+  return sideEscapeAdaptiveExtraM;
+}
+
+static void bumpSideEscapeAdaptiveExtra(float sideSign, const char* reason) {
+  if (sideSign == 0.0f) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (sideEscapeAdaptiveSideSign != 0.0f &&
+      sideSign * sideEscapeAdaptiveSideSign > 0.0f &&
+      now - sideEscapeAdaptiveLastBumpMs <
+        PLANNER_SIDE_ESCAPE_ADAPT_BUMP_COOLDOWN_MS) {
+    return;
+  }
+
+  if (sideEscapeAdaptiveSideSign == 0.0f ||
+      sideSign * sideEscapeAdaptiveSideSign < 0.0f) {
+    sideEscapeAdaptiveExtraM = 0.0f;
+    sideEscapeAdaptiveFailureCount = 0;
+  }
+
+  sideEscapeAdaptiveSideSign = sideSign;
+  sideEscapeAdaptiveExtraM =
+    min(PLANNER_SIDE_ESCAPE_ADAPT_MAX_EXTRA_M,
+        sideEscapeAdaptiveExtraM + PLANNER_SIDE_ESCAPE_ADAPT_STEP_M);
+  if (sideEscapeAdaptiveFailureCount < 255) {
+    sideEscapeAdaptiveFailureCount++;
+  }
+  sideEscapeAdaptiveLastBumpMs = now;
+  rememberClearanceEscapeSide(sideSign);
+
+  char detail[96];
+  snprintf(detail, sizeof(detail), "reason=%s;side=%s;extra=%.2f;failures=%u",
+           reason, sideEscapeName(sideSign), sideEscapeAdaptiveExtraM,
+           (unsigned int)sideEscapeAdaptiveFailureCount);
+  sendBluetoothEvent("side_escape_widen", detail);
+}
+
+static void sendPostReverseEscapeEvent(const char* eventName,
+                                       const char* reason,
+                                       float sideSign,
+                                       const SideEscapeEvidence &evidence) {
+  char detail[120];
+  snprintf(detail, sizeof(detail), "%s;side=%s;right=%.2f;left=%.2f;extra=%.2f",
+           reason, sideEscapeName(sideSign), evidence.rightM, evidence.leftM,
+           sideEscapeAdaptiveExtraFor(sideSign));
+  sendBluetoothEvent(eventName, detail);
+}
+
+static float reverseRecoveryRetreatDistanceM() {
+  return sqrtf((robotX - reverseRecoveryStartX) *
+               (robotX - reverseRecoveryStartX) +
+               (robotY - reverseRecoveryStartY) *
+               (robotY - reverseRecoveryStartY));
+}
+
+static float reverseSurveyFrontDistanceM() {
+  if (!isRangeSensorValid(RANGE_FRONT)) {
+    return -1.0f;
+  }
+  return getRangeSensorDistance(RANGE_FRONT) / 1000.0f;
+}
+
+static void sendReverseSurveyEvent(const char* eventName,
+                                   const char* reason,
+                                   float retreatM,
+                                   float frontM,
+                                   bool forced,
+                                   const SideEscapeEvidence &evidence) {
+  char detail[144];
+  snprintf(detail, sizeof(detail),
+           "reason=%s;retreat=%.2f;required=%.2f;front=%.2f;side=%.2f;right=%.2f;left=%.2f;forced=%d",
+           reason,
+           retreatM,
+           reverseSurveyRequiredRetreatM,
+           frontM,
+           evidence.restrictedM,
+           evidence.rightM,
+           evidence.leftM,
+           forced ? 1 : 0);
+  sendBluetoothEvent(eventName, detail);
+}
+
+static bool reverseSurveyObservationReady(SideEscapeEvidence &evidence,
+                                          float &retreatM,
+                                          float &frontM,
+                                          bool &forced) {
+  retreatM = reverseRecoveryRetreatDistanceM();
+  frontM = reverseSurveyFrontDistanceM();
+  forced = retreatM >= PLANNER_REVERSE_SURVEY_MAX_REVERSE_M;
+  bool frontReady = frontM >= PLANNER_REVERSE_SURVEY_FRONT_CLEAR_M;
+  bool sideReady = readSideEscapeEvidence(evidence) &&
+                   evidence.restrictedM >= PLANNER_REVERSE_SURVEY_SIDE_CLEAR_M;
+  bool retreatReady = retreatM >= reverseSurveyRequiredRetreatM;
+  return forced || (retreatReady && frontReady && sideReady);
+}
+
+static void holdReverseSurvey(const char* planReason,
+                              const char* replanReason) {
+  plannerTelemetry.selectedForwardTicksPerSec = 0.0;
+  plannerTelemetry.selectedTurnTicksPerSec = 0.0;
+  plannerTelemetry.selectedCurvature = 0.0;
+  plannerTelemetry.minimumSweptClearanceMm = minimumFanSweepClearanceMm();
+  plannerTelemetry.speedCapTicksPerSec = 0.0;
+  plannerTelemetry.candidateCount = 0;
+  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
+  plannerTelemetry.planReason = planReason;
+  plannerTelemetry.replanReason = replanReason;
+  plannerTelemetry.safeStopReason = "";
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+}
+
+static ReverseSurveyDecision updateReverseSurveyDecision() {
+  reverseSurveyReadyToTryForward = false;
+  reverseSurveyForcedByMaxRetreat = false;
+
+  SideEscapeEvidence evidence = {};
+  float retreatM = 0.0f;
+  float frontM = -1.0f;
+  bool forced = false;
+  if (!reverseSurveyObservationReady(evidence, retreatM, frontM, forced)) {
+    reverseSurveySettling = false;
+    reverseSurveyReadyReported = false;
+    return REVERSE_SURVEY_REVERSE;
+  }
+
+  unsigned long now = millis();
+  if (!reverseSurveySettling) {
+    reverseSurveySettling = true;
+    reverseSurveySettleStartedMs = now;
+    reverseSurveyReadyReported = false;
+    reverseSurveyForcedByMaxRetreat = forced;
+    sendReverseSurveyEvent("reverse_survey_settle",
+                           forced ? "max_retreat" : "observation_pose",
+                           retreatM,
+                           frontM,
+                           forced,
+                           evidence);
+    holdReverseSurvey("reverse_survey_settle",
+                      "waiting_for_fresh_side_fan");
+    return REVERSE_SURVEY_HOLD;
+  }
+
+  if (now - reverseSurveySettleStartedMs < PLANNER_REVERSE_SURVEY_SETTLE_MS) {
+    reverseSurveyForcedByMaxRetreat = forced;
+    holdReverseSurvey("reverse_survey_settle",
+                      "waiting_for_fresh_side_fan");
+    return REVERSE_SURVEY_HOLD;
+  }
+
+  reverseSurveyReadyToTryForward = true;
+  reverseSurveyForcedByMaxRetreat = forced;
+  if (!reverseSurveyReadyReported) {
+    sendReverseSurveyEvent("reverse_survey_ready",
+                           forced ? "max_retreat" : "fresh_observation",
+                           retreatM,
+                           frontM,
+                           forced,
+                           evidence);
+    reverseSurveyReadyReported = true;
+  }
+  return REVERSE_SURVEY_FORWARD;
+}
+
+static void requestReverseSurveyRetry(const char* reason) {
+  float retreatM = reverseRecoveryRetreatDistanceM();
+  reverseSurveyRequiredRetreatM =
+    min(PLANNER_REVERSE_SURVEY_MAX_REVERSE_M,
+        max(reverseSurveyRequiredRetreatM,
+            retreatM + PLANNER_REVERSE_SURVEY_RETRY_REVERSE_M));
+  reverseSurveySettling = false;
+  reverseSurveySettleStartedMs = 0;
+  reverseSurveyReadyReported = false;
+  reverseSurveyReadyToTryForward = false;
+  reverseSurveyForcedByMaxRetreat = false;
+
+  char detail[96];
+  snprintf(detail, sizeof(detail), "reason=%s;retreat=%.2f;required=%.2f",
+           reason, retreatM, reverseSurveyRequiredRetreatM);
+  sendBluetoothEvent("reverse_survey_retry", detail);
 }
 
 static float calculateReverseRecoverySpeedCapTicksPerSec() {
@@ -1571,9 +2016,12 @@ static float reverseRecoveryScore(float reverseTicks, float turnTicks,
                                           max(1.0f, baseTargetSpeed));
   float routeScore = 1.0f - min(1.0f, finalRouteLateralErrorM /
                                       PLANNER_LINE_FOLLOW_LATERAL_TOLERANCE_M);
+  float reverseProgressWeight = reverseSurveyReadyToTryForward ? 0.5f : 0.15f;
+  float reverseCurvaturePenalty = reverseSurveyReadyToTryForward ? 0.9f : 2.0f;
   return 1.6f * headingScore + 1.4f * clearanceScore +
          0.8f * smoothnessScore + 0.8f * routeScore +
-         0.5f * progressScore - 0.9f * curvature;
+         reverseProgressWeight * progressScore -
+         reverseCurvaturePenalty * curvature;
 }
 
 static bool selectReverseRecoveryTrajectory(float goalX, float goalY) {
@@ -1676,55 +2124,167 @@ static bool selectReverseRecoveryTrajectory(float goalX, float goalY) {
   return true;
 }
 
-static bool buildClearanceEscapeLocalGoal(float &localGoalX, float &localGoalY) {
-  // A single nearby inner ray and an open opposite inner ray describe an
-  // observable side exit. Give the arc sampler that exit as its temporary
-  // local goal instead of continuing to score only progress along the blocked
-  // global target line. The normal footprint/map checks still decide whether
-  // any candidate is safe.
-  if (!isRangeSensorValid(RANGE_RIGHT_INNER) ||
-      !isRangeSensorValid(RANGE_LEFT_INNER)) {
-    return false;
-  }
-
-  float rightInnerM = getRangeSensorDistance(RANGE_RIGHT_INNER) / 1000.0f;
-  float leftInnerM = getRangeSensorDistance(RANGE_LEFT_INNER) / 1000.0f;
-  float restrictedM = min(rightInnerM, leftInnerM);
-  float escapeTriggerM = WAYPOINT_LOOKAHEAD_M +
-    ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
-    PLANNER_PREFERRED_CLEARANCE_M;
-  if (restrictedM >= escapeTriggerM || fabs(rightInnerM - leftInnerM) < LOCAL_MAP_CELL_M) {
-    return false;
-  }
-
-  if (!isRangeSensorValid(RANGE_RIGHT_OUTER) ||
-      !isRangeSensorValid(RANGE_LEFT_OUTER)) {
-    return false;
-  }
-
-  float rightOuterM = getRangeSensorDistance(RANGE_RIGHT_OUTER) / 1000.0f;
-  float leftOuterM = getRangeSensorDistance(RANGE_LEFT_OUTER) / 1000.0f;
-  float rightSideM = min(rightInnerM, rightOuterM);
-  float leftSideM = min(leftInnerM, leftOuterM);
-  if (fabs(rightSideM - leftSideM) < LOCAL_MAP_CELL_M) {
-    return false;
-  }
-
+static void buildSideEscapeLocalGoal(float sideSign,
+                                     float extraLateralM,
+                                     float &localGoalX,
+                                     float &localGoalY) {
   // Robot +Y is left. An open right side must therefore create a negative-Y
-  // local target (and vice versa). Use both inner and outer rays so a close
-  // outer wall cannot be hidden by an open inner return.
-  float sideSign = rightSideM > leftSideM ? -1.0f : 1.0f;
+  // local target (and vice versa). On routed point goals, express that offset
+  // in the original route frame so the escape remains a forward bypass instead
+  // of rotating with the chassis and walking sideways away from the waypoint.
   float lateralOffsetM = (sideSign > 0.0f
     ? ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm
     : ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
-    PLANNER_PREFERRED_CLEARANCE_M;
+    PLANNER_PREFERRED_CLEARANCE_M + extraLateralM +
+    sideEscapeAdaptiveExtraFor(sideSign);
+
+  float routeLengthM = 0.0f;
+  float routeUx = 1.0f;
+  float routeUy = 0.0f;
+  float routeHeadingRad = 0.0f;
+  if (routeLineFrame(routeLengthM, routeUx, routeUy, routeHeadingRad)) {
+    float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
+    float lookaheadAlongM = constrain(alongM + WAYPOINT_LOOKAHEAD_M,
+                                      0.0f, routeLengthM);
+    float currentLateralM =
+      routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy);
+    float targetLateralM = sideSign * lateralOffsetM;
+    if (sideSign > 0.0f && currentLateralM > targetLateralM) {
+      targetLateralM = max(0.0f, targetLateralM);
+    } else if (sideSign < 0.0f && currentLateralM < targetLateralM) {
+      targetLateralM = min(0.0f, targetLateralM);
+    }
+    localGoalX = navigationGoal.startX + routeUx * lookaheadAlongM -
+                 routeUy * targetLateralM;
+    localGoalY = navigationGoal.startY + routeUy * lookaheadAlongM +
+                 routeUx * targetLateralM;
+    return;
+  }
+
   float headingRad = navigationHeadingRad();
   localGoalX = robotX + WAYPOINT_LOOKAHEAD_M * cosf(headingRad) -
                sideSign * lateralOffsetM * sinf(headingRad);
   localGoalY = robotY + WAYPOINT_LOOKAHEAD_M * sinf(headingRad) +
                sideSign * lateralOffsetM * cosf(headingRad);
+}
+
+static bool buildClearanceEscapeLocalGoal(float &localGoalX, float &localGoalY) {
+  // Nearby side evidence on either the inner or outer rays can describe an
+  // observable side exit. Give the arc sampler that exit as its temporary
+  // local goal instead of scoring only progress along the blocked route line.
+  SideEscapeEvidence evidence;
+  if (!readSideEscapeEvidence(evidence)) {
+    return false;
+  }
+
+  float sideSign = 0.0f;
+  if (!chooseSideEscapeSign(evidence, true, sideSign)) {
+    return false;
+  }
+
+  rememberClearanceEscapeSide(sideSign);
+  buildSideEscapeLocalGoal(sideSign, 0.0f, localGoalX, localGoalY);
   plannerTelemetry.replanReason = "clearance_escape_waypoint";
   return true;
+}
+
+static bool sideEscapeShouldBypassPointAlignment() {
+  if (postReverseEscapeActive) {
+    return true;
+  }
+
+  if (lastClearanceEscapeSideSign != 0.0f &&
+      millis() - lastClearanceEscapeMs <= PLANNER_SIDE_ESCAPE_MEMORY_MS) {
+    return true;
+  }
+
+  SideEscapeEvidence evidence;
+  if (!readSideEscapeEvidence(evidence)) {
+    return false;
+  }
+
+  float sideSign = 0.0f;
+  return chooseSideEscapeSign(evidence, true, sideSign);
+}
+
+static bool buildPostReverseEscapeLocalGoal(float &localGoalX,
+                                            float &localGoalY,
+                                            bool allowPendingStart,
+                                            bool &pendingStart,
+                                            float &pendingSideSign,
+                                            SideEscapeEvidence &pendingEvidence) {
+  pendingStart = false;
+  SideEscapeEvidence evidence;
+  if (!readSideEscapeEvidence(evidence)) {
+    if (postReverseEscapeActive) {
+      sendPostReverseEscapeEvent("post_reverse_escape_unavailable",
+                                 "side_sensor_invalid",
+                                 postReverseEscapeSideSign,
+                                 evidence);
+    }
+    resetPostReverseEscapeState();
+    return false;
+  }
+
+  unsigned long now = millis();
+  if (!evidence.closeSideEvidence &&
+      (!postReverseEscapeActive ||
+       now - postReverseEscapeStartedMs >= PLANNER_POST_REVERSE_ESCAPE_MIN_MS)) {
+    if (postReverseEscapeActive) {
+      sendPostReverseEscapeEvent("post_reverse_escape_end",
+                                 "side_clear",
+                                 postReverseEscapeSideSign,
+                                 evidence);
+    }
+    resetPostReverseEscapeState();
+    return false;
+  }
+
+  if (postReverseEscapeActive &&
+      now - postReverseEscapeStartedMs > PLANNER_POST_REVERSE_ESCAPE_TIMEOUT_MS) {
+    bumpSideEscapeAdaptiveExtra(postReverseEscapeSideSign, "post_timeout");
+    sendPostReverseEscapeEvent("post_reverse_escape_unavailable",
+                               "timeout",
+                               postReverseEscapeSideSign,
+                               evidence);
+    resetPostReverseEscapeState();
+    return false;
+  }
+
+  float sideSign = postReverseEscapeActive ? postReverseEscapeSideSign : 0.0f;
+  if (!postReverseEscapeActive &&
+      !chooseSideEscapeSign(evidence, true, sideSign)) {
+    return false;
+  }
+
+  if (!postReverseEscapeActive) {
+    if (!allowPendingStart) {
+      return false;
+    }
+    pendingStart = true;
+    pendingSideSign = sideSign;
+    pendingEvidence = evidence;
+  }
+
+  buildSideEscapeLocalGoal(sideSign,
+                           PLANNER_POST_REVERSE_ESCAPE_EXTRA_LATERAL_M,
+                           localGoalX,
+                           localGoalY);
+  rememberClearanceEscapeSide(sideSign);
+  plannerTelemetry.replanReason = "post_reverse_escape_waypoint";
+  return true;
+}
+
+static void startPostReverseEscape(float sideSign,
+                                   const SideEscapeEvidence &evidence) {
+  postReverseEscapeActive = true;
+  postReverseEscapeSideSign = sideSign;
+  postReverseEscapeStartedMs = millis();
+  rememberClearanceEscapeSide(sideSign);
+  sendPostReverseEscapeEvent("post_reverse_escape_start",
+                             "forward_path_found",
+                             sideSign,
+                             evidence);
 }
 
 static void updatePointGoal() {
@@ -1749,6 +2309,8 @@ static void updatePointGoal() {
     routeFrameValid &&
     fabs(wrapAngle(routeHeadingRad * RAD_TO_DEG - navigationHeadingDeg())) <=
       PLANNER_LINE_FOLLOW_ENABLE_HEADING_DEG;
+  bool detourRejoinActive =
+    routeFrameValid && sideEscapeRejoinActive(routeLengthM, routeUx, routeUy);
 
   // Object pickup is complete by position, not by final heading. Once the
   // robot has driven through the hunt pickup zone, stop before the generic
@@ -1762,7 +2324,10 @@ static void updatePointGoal() {
     routeLineEligible && huntPickupCarryThroughActive(routeLengthM, routeUx, routeUy);
   float targetHeadingDeg = atan2f(dy, dx) * RAD_TO_DEG;
   float targetHeadingErrorDeg = wrapAngle(targetHeadingDeg - navigationHeadingDeg());
+  bool sideEscapeBypassAlignment =
+    detourRejoinActive && sideEscapeShouldBypassPointAlignment();
   if (!reverseRecoveryActive &&
+      !sideEscapeBypassAlignment &&
       !huntCarryThroughActive &&
       fabs(targetHeadingErrorDeg) > PLANNER_POINT_ALIGN_START_DEG) {
     commandPointAlignmentTurn(targetHeadingErrorDeg);
@@ -1779,7 +2344,10 @@ static void updatePointGoal() {
   // ordinary physical sideways error into a controlled line-follow problem.
   float localGoalX = 0.0f;
   float localGoalY = 0.0f;
-  if (routeLineEligible) {
+  if (routeLineEligible || detourRejoinActive) {
+    // After a side-escape, rejoin the original route only while still before
+    // the final approach window. Past that boundary, hand back to normal point
+    // approach/alignment so the robot cannot extend the detour indefinitely.
     buildRouteLineLocalGoal(routeLengthM, routeUx, routeUy, localGoalX, localGoalY);
   } else {
     float lookaheadM = min(distanceM, WAYPOINT_LOOKAHEAD_M);
@@ -1788,6 +2356,34 @@ static void updatePointGoal() {
   }
 
   clearanceEscapeLocalGoalActive = buildClearanceEscapeLocalGoal(localGoalX, localGoalY);
+  float reverseRecoveryGoalX = localGoalX;
+  float reverseRecoveryGoalY = localGoalY;
+  bool pendingPostReverseEscapeStart = false;
+  float pendingPostReverseEscapeSideSign = 0.0f;
+  SideEscapeEvidence pendingPostReverseEscapeEvidence = {};
+  if (postReverseEscapeActive) {
+    clearanceEscapeLocalGoalActive =
+      buildPostReverseEscapeLocalGoal(localGoalX,
+                                      localGoalY,
+                                      false,
+                                      pendingPostReverseEscapeStart,
+                                      pendingPostReverseEscapeSideSign,
+                                      pendingPostReverseEscapeEvidence) ||
+      clearanceEscapeLocalGoalActive;
+  } else if (reverseRecoveryActive &&
+             buildPostReverseEscapeLocalGoal(localGoalX,
+                                             localGoalY,
+                                             true,
+                                             pendingPostReverseEscapeStart,
+                                             pendingPostReverseEscapeSideSign,
+                                             pendingPostReverseEscapeEvidence)) {
+    clearanceEscapeLocalGoalActive = true;
+  }
+
+  if (clearanceEscapeRouteDetourActive && !detourRejoinActive &&
+      !clearanceEscapeLocalGoalActive && !postReverseEscapeActive) {
+    clearSideEscapeDetourIfActive("final_approach_window");
+  }
 
   // For mostly-forward point goals, the useful physical task is crossing the
   // target plane while staying close to the requested route. A strict 60 mm
@@ -1815,9 +2411,30 @@ static void updatePointGoal() {
     return;
   }
 
+  if (reverseRecoveryActive) {
+    ReverseSurveyDecision surveyDecision = updateReverseSurveyDecision();
+    if (surveyDecision == REVERSE_SURVEY_HOLD) {
+      return;
+    }
+    if (surveyDecision == REVERSE_SURVEY_REVERSE) {
+      if (!selectReverseRecoveryTrajectory(reverseRecoveryGoalX, reverseRecoveryGoalY)) {
+        motorStopRequested = true;
+        setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
+        reportPlannerStopIfChanged();
+      }
+      return;
+    }
+  }
+
   if (selectTrajectory(localGoalX, localGoalY)) {
     if (reverseRecoveryActive) {
-      endReverseRecovery("forward_path_found");
+      if (pendingPostReverseEscapeStart) {
+        startPostReverseEscape(pendingPostReverseEscapeSideSign,
+                               pendingPostReverseEscapeEvidence);
+        endReverseRecovery("forward_path_found_post_escape");
+      } else {
+        endReverseRecovery("forward_path_found");
+      }
     }
     // Any safe forward arc breaks the no-path streak. The recovery condition
     // is therefore genuinely "no forward path exists", not merely "an
@@ -1827,7 +2444,18 @@ static void updatePointGoal() {
   }
 
   if (reverseRecoveryActive) {
-    if (!selectReverseRecoveryTrajectory(localGoalX, localGoalY)) {
+    if (reverseSurveyReadyToTryForward) {
+      if (reverseSurveyForcedByMaxRetreat &&
+          reverseRecoveryRetreatDistanceM() >=
+            PLANNER_REVERSE_SURVEY_MAX_REVERSE_M - 0.01f) {
+        finishNavigationGoal(false,
+                             PLANNER_STOP_NO_SAFE_TRAJECTORY,
+                             "reverse_survey_no_escape");
+        return;
+      }
+      requestReverseSurveyRetry("forward_arc_rejected");
+    }
+    if (!selectReverseRecoveryTrajectory(reverseRecoveryGoalX, reverseRecoveryGoalY)) {
       motorStopRequested = true;
       setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
       reportPlannerStopIfChanged();
@@ -1999,6 +2627,9 @@ void initializeNavigationController() {
   // moves with the robot rather than being re-created every route waypoint.
   clearLocalMap();
   resetEncodersAndPID();
+  resetReverseSurveyState();
+  resetPostReverseEscapeState();
+  resetClearanceEscapeMemory();
   plannerTelemetry.planReason = "initialised";
 }
 
@@ -2030,12 +2661,13 @@ void updateRobotController() {
     // cancel the trusted rear-arc command that is moving the chassis out.
     if (!immediateSafetyStop && navigationGoal.active && !reverseRecoveryActive &&
         isRangeSensorBlocked(RANGE_FRONT)) {
-      // Remember the side that looked tighter. If that same turn direction is
-      // sampled later, candidateScore penalises it to prevent repeated retries
-      // into the obstruction.
+      // Remember the turn direction that would steer into the tighter side.
+      // Positive turn is robot-left in the navigation frame; negative is
+      // robot-right. Penalising that sign prevents repeated retries into the
+      // same side obstruction.
       recentBlockedTurnDirection =
         getRangeSensorDistance(RANGE_RIGHT_INNER) <= getRangeSensorDistance(RANGE_LEFT_INNER)
-          ? 1 : -1;
+          ? -1 : 1;
       recentBlockedTurnMs = now;
       immediateSafetyStop = true;
       motorStopRequested = true;
@@ -2064,7 +2696,7 @@ void updateRobotController() {
       // clearance rather than turn radius, so it can stop an imminent clip
       // without wrongly forbidding a pre-aligned narrow straight passage.
       recentBlockedTurnDirection =
-        FAN_SENSOR_GEOMETRY[(int)diagonalSensor].angleDeg < 0.0 ? 1 : -1;
+        FAN_SENSOR_GEOMETRY[(int)diagonalSensor].angleDeg < 0.0 ? -1 : 1;
       recentBlockedTurnMs = now;
       immediateSafetyStop = true;
       motorStopRequested = true;

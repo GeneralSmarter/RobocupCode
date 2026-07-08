@@ -58,6 +58,7 @@ const float SEARCHTURN_MAX_US = WEIGHT_SCAN_TURN_OFFSET_MAX_US;
 const float MANUAL_COMMAND_MIN = -100.0;
 const float MANUAL_COMMAND_MAX = 100.0;
 const unsigned long MANUAL_DRIVE_TIMEOUT_MS = 350;
+const unsigned long BLUETOOTH_TELEMETRY_INTERVAL_MS = 100;
 
 static bool commandEquals(const char* command, const char* expected) {
   while (*command != '\0' && *expected != '\0') {
@@ -177,9 +178,9 @@ static void printBluetoothHelp() {
   Serial2.println("  BUILD          print firmware build label");
   Serial2.println("  START          start robot navigation");
   Serial2.println("  STATUS or P    print robot status");
-  Serial2.println("  STREAM ON      send status once per second");
+  Serial2.println("  STREAM ON      send status as fast as the telemetry loop allows");
   Serial2.println("  STREAM OFF     stop periodic status");
-  Serial2.println("  CSV ON         send CSV telemetry once per second");
+  Serial2.println("  CSV ON         send CSV telemetry as fast as the telemetry loop allows");
   Serial2.println("  CSV OFF        stop CSV telemetry");
   Serial2.println("  CAL            print calibration summary");
   Serial2.println("  SPEED <ticks>  set temporary base target speed");
@@ -553,7 +554,7 @@ void sendBluetoothTelemetry() {
   }
 
   unsigned long now = millis();
-  if (now - lastBluetoothTelemetryMs < 1000) {
+  if (now - lastBluetoothTelemetryMs < BLUETOOTH_TELEMETRY_INTERVAL_MS) {
     return;
   }
 

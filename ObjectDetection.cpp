@@ -372,6 +372,8 @@ static void connectObjectSensor(ObjectTofId id) {
 
   sensor->setAddress(objectI2cAddress(id));
   sensor->setDistanceMode(VL53L1X::Short);
+  sensor->setROISize(OBJECT_TOF_ROI_WIDTH, OBJECT_TOF_ROI_HEIGHT);
+  sensor->setROICenter(OBJECT_TOF_ROI_CENTER_SPAD);
   sensor->setMeasurementTimingBudget(OBJECT_TOF_TIMING_BUDGET_US);
   sensor->startContinuous(OBJECT_TOF_SAMPLE_PERIOD_MS);
 

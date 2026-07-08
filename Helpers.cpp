@@ -117,7 +117,7 @@ void printCalibrationSummary() {
   Serial.print("Object VL53L1X subsystem enabled: ");
   Serial.println(OBJECT_TOF_ENABLED ? "yes" : "no");
   Serial.println("  planned object ToFs: left/right LOW+UPPER on XSHUT4-7, addr 0x34-0x37");
-  Serial.println("Use Bluetooth command CSV ON for once-per-second machine-readable telemetry.");
+  Serial.println("Use Bluetooth command CSV ON for maximum-rate machine-readable telemetry.");
 }
 
 void printWaitingForStart() {

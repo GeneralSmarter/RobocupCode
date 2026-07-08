@@ -18,6 +18,7 @@ track-width calibration gate.
 
 - [Current state and next steps](docs/CURRENT_STATE_AND_NEXT_STEPS.md)
 - [Navigation planner test plan](docs/NAVIGATION_PLANNER_TEST_PLAN.md)
+- [Drive gear calibration test plan](docs/DRIVE_GEAR_CALIBRATION_TEST_PLAN.md)
 - [Object detection and hunting plan](docs/OBJECT_DETECTION_HUNTING_PLAN.md)
 
 ## Files
@@ -173,9 +174,18 @@ rejects sustained steering once it has observed both nearby boundaries.
 If forward planning remains impossible for 250 ms, V7 enters reverse recovery.
 For this testing build, `RANGE_FAKE_REAR` is a trusted rear ToF reading fixed
 at 4000 mm clear. The planner samples reverse arcs, commands the best one, and
-tries the normal forward planner first again on every planner tick. It leaves
-recovery as soon as a valid forward arc is available. Stuck-wheel detection
-still aborts to protect the drivetrain.
+tries the normal forward planner first again on every planner tick. If a valid
+forward arc appears while either side still has close inner/outer fan evidence,
+the planner enters a short `post_reverse_escape` side-clearance goal before
+resuming the original waypoint. The escape side now requires a stronger side
+tie or recent side-escape memory, holds briefly before release, and bypasses
+generic point alignment so the robot does not immediately steer back into the
+same offset wall pocket. For point routes, the side-escape target is expressed
+in the original start-to-target route frame, not the current chassis frame, so
+the bypass remains a bounded lane along the waypoint direction. If the same
+lane falls back into recovery, it widens in 80 mm steps up to 240 mm of extra
+offset and emits `side_escape_widen`. Stuck-wheel detection still aborts to
+protect the drivetrain.
 
 Use the smallest test that exercises the feature being changed:
 

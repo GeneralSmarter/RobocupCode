@@ -166,6 +166,11 @@ Initial local-planner target integration:
 - Candidate range gate was widened during testing. Current code treats object
   readings as valid from `40-4000 mm`, while confirmed hunt candidates must be
   in the `60-1500 mm` range.
+- Object VL53L1X sensors currently use a centered `16 x 4` ROI: full
+  horizontal width and minimum vertical height. On the mounted boards, ROI
+  width is left-right across the readable sensor label and ROI height is
+  up-down. This reduces floor/chassis/vertical clutter while keeping
+  left-right object coverage.
 - Upper height veto now requires a valid upper range plus at least `4.0 MCPS`
   return signal. Weak upper edge returns are treated as clear so they do not
   turn a good low-weight signature into `tall_obstacle`.
