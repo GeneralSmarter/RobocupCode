@@ -13,7 +13,7 @@ float navigationHeadingDeg() {
   // The BNO055 mounting reports a physical right turn as positive yaw. The
   // robot/map convention is +Y left with counter-clockwise-positive heading,
   // so navigation geometry must use the inverse of that feedback convention.
-  return -readYawDeg();
+  return wrapAngle(navigationYawFromImuClockwise(readImuClockwiseYawDeg()));
 }
 
 void resetEncodersAndPID() {
@@ -87,6 +87,7 @@ void printCalibrationSummary() {
   Serial.println(TICKS_PER_METRE, 2);
   Serial.print("Planner effective track width m (provisional until arc-calibrated): ");
   Serial.println(EFFECTIVE_TRACK_WIDTH_M, 3);
+  Serial.println("Turn convention: +yaw/+turn is CCW/left; omega=(right-left)/track");
   Serial.print("Base target speed ticks/s: ");
   Serial.println(baseTargetSpeed, 1);
   Serial.print("Wheel PID Kp/Ki/Kd: ");

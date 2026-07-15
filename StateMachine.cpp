@@ -1,4 +1,4 @@
-#include "Robot.h"
+﻿#include "Robot.h"
 
 // =====================================================
 // Mission state machine
@@ -7,6 +7,7 @@
 // the incremental navigation controller and observes their results.
 
 static unsigned long waypointActionUntilMs = 0;
+static bool endMatchSafetyTransitionActive = false;
 
 enum WeightSearchPhase {
   WEIGHT_SEARCH_IDLE,
@@ -113,7 +114,8 @@ static void failWeightSearch(const char* detail) {
 }
 
 static bool searchTargetVisible() {
-  refreshObjectTargetEstimate();
+  // Consume the timestamped snapshot maintained by updateRobotController().
+  // A route-interrupt check must never pause active motion to force new reads.
   return objectCandidate.kind == OBJECT_CANDIDATE_WEIGHT_SIZED &&
          objectCandidate.confirmed &&
          isObjectTargetFresh();
@@ -660,7 +662,31 @@ void runEndMatchState() {
   }
 }
 
+static void enforceEndMatchMotionSafety() {
+  if (endMatchSafetyTransitionActive) {
+    stopMotors();
+    return;
+  }
+
+  endMatchSafetyTransitionActive = true;
+  // Revoke first so cleanup cannot allow an old goal to republish a command.
+  revokeMotionAuthority();
+  disarmBluetoothMotionModes();
+  if (isNavigationGoalActive()) {
+    cancelNavigationGoal(PLANNER_STOP_ABORTED, "end_match");
+  }
+  if (isWeightSearchActive()) {
+    cancelWeightSearch("end_match");
+  }
+  robotRunEnabled = false;
+  stopMotors();
+  endMatchSafetyTransitionActive = false;
+}
+
 void setRobotState(RobotState newState) {
+  if (newState == END_MATCH) {
+    enforceEndMatchMotionSafety();
+  }
   if (currentState != newState) {
     previousState = currentState;
     Serial.print("STATE: ");
@@ -687,6 +713,11 @@ const char* robotStateName(RobotState state) {
 }
 
 void setMotionCommand(float forwardSpeed, float turnSpeed) {
+  if (fabs(forwardSpeed) < 1.0f && fabs(turnSpeed) < 1.0f) {
+    stopMotors();
+    return;
+  }
   desiredForwardSpeed = forwardSpeed;
   desiredTurnSpeed = turnSpeed;
+  motionCommandAuthority = MOTION_AUTHORITY_NONE;
 }

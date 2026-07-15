@@ -1,12 +1,20 @@
-# Current State And Next Steps
+﻿# Current State And Next Steps
 
-Status: current handoff after object detection/search work plus the 2026-07-06/07
-offset wall/gap navigation rework.
+Status: current handoff after object detection/search work, the 2026-07-06/07
+offset wall/gap navigation rework, and the 2026-07 full codebase audit.
 
 This file records what the robot can do now, what is still only scaffold, and
-the next smallest useful steps. It should be read alongside
-`OBJECT_DETECTION_HUNTING_PLAN.md`, `../README.md`, `../../HANDOFF.md`, and
-`../../NAVIGATION_DESIGN.md`.
+the next smallest useful steps. Read it alongside `ROBOT_CODEBASE_AUDIT.md`,
+`../README.md`, `../../HANDOFF.md`, and `../../NAVIGATION_DESIGN.md`.
+
+P0 disposition: P0-01, P0-02, P0-07, and P0-08 are fixed in software, with
+physical validation still applicable to the motion findings. P0-03 is partly
+fixed and depends on real sensor coverage. P0-04 fake rear is intentionally
+deferred; P0-05 sensor safety proof is open. P0-06 phase 1 is implemented, but
+coherent sensor snapshots and physical watchdog timing remain follow-ups.
+Operator decision, 2026-07-14: obstacle testing may continue with the current
+`RANGE_FAKE_REAR` channel. Treat this as explicit temporary test scaffolding,
+not proof of rear safety or competition readiness.
 
 ## 1. Current Firmware Baseline
 
@@ -14,7 +22,9 @@ the next smallest useful steps. It should be read alongside
 - Board/build target: Teensy 4.0. Current verified upload path is Arduino CLI
   for `teensy:avr:teensy40`.
 - Navigation baseline: accepted V7 local planner.
-- Main control path remains single and non-blocking:
+- Main control path remains single and scheduled. Phase-1 runtime sensor reads
+  are nonblocking, with a motor lease and loop-deadline telemetry; coherent
+  sensor snapshots and physical watchdog timing remain follow-ups:
   - `updateTOFSensors()`
   - `updateLocalMapFromSensors()`
   - odometry update
@@ -25,9 +35,10 @@ the next smallest useful steps. It should be read alongside
 - Object VL53L1X sensors are perception/candidate sensors only; they do not
   override high-fan safety.
 
-Latest robot state, 2026-07-06/07:
+Latest robot/source state, 2026-07-08:
 
-- Firmware compiled and uploaded successfully with Arduino CLI.
+- Firmware compiles successfully with Arduino CLI. Upload and physical
+  validation of the latest obstacle changes are still pending.
 - Last reported build label: `V7-local-planner`.
 - Latest accepted offset wall/gap navigation evidence is `arn7`/`arn7d2`, not
   `rvs2`. `arn7d2` ended in `waypoint_reached` with no reverse recovery and
@@ -37,6 +48,10 @@ Latest robot state, 2026-07-06/07:
 - Weight-search scan/confirm turns use their own runtime offset via
   `SEARCHTURN`; default is `280 us`.
 - The robot was left stopped, disarmed, and motor-neutral.
+- `RobocupSimulator` now has deterministic tests for G0/G5 wall bypass,
+  offset wall/gap reverse survey, front-against-wall escape, and wide-panel
+  bypass speed recovery. Current verification is Teensy compile PASS,
+  simulator 25/25 PASS, Python 76/76 PASS, and `compileall` PASS.
 
 ## 2. Current Navigation State
 
@@ -49,7 +64,9 @@ Accepted navigation behaviour:
 
 - Four high fan VL53L0X sensors are active and valid in open space.
 - V7 local planner can drive point goals.
-- Fake-rear-ToF reverse recovery is available and tested.
+- Fake-rear-ToF reverse recovery is allowed for current obstacle testing by
+  explicit operator decision. It is not proof of rear safety; log the fake-rear
+  assumption and rear clearance on every physical run.
 - Reverse recovery now exits through `post_reverse_escape` when a close
   inner/outer side fan ray remains after forward space returns.
 - The reverse-survey branch (`rvs1`/`rvs2`) is historical only. `rvs2` reached
@@ -75,15 +92,25 @@ Accepted navigation behaviour:
 - Current watch item: the post-clear movement may be slower than necessary
   because `PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS` is applied while
   `sideEscapeRejoinActive(...)` is true. If it feels slow in physical testing,
-  remove that condition from the cap and run the `arn8`/`arn8d2` checks from
-  `NAVIGATION_REWORK_SESSION_SUMMARY_20260706.md`.
+  remove that condition from the cap and rerun the narrow offset wall/gap
+  checks described in the handoff before expanding test coverage. Do not tune
+  this with physical autonomous testing while P0-04/P0-05 remain open.
+- P0-07 remediation removed `corridor_squeeze_straight` and the reverse
+  front-footprint grace. Zero accepted rollouts now mean zero commanded motion.
+- The simulator keeps contact-free traversal checks for `g0_right`, `g5`, and
+  `wide_panel_bypass`; the front-against-wall case now safe-stops when strict
+  footprint collision rejects reverse. `final_blocked_reached` remains a
+  stop-only result inside the existing `160 mm` gate and requires a clear
+  current inflated footprint. Physical upload/validation remains out of scope.
 - 400 mm competition gap has one accepted physical pass.
 - `TEST HUNT` can use the same point-goal planner path as `TEST GOTO`.
 - `TEST DISARM` cancels test-owned goals and leaves motors neutral.
 
 Current limitations:
 
-- No real rear sensor; `RANGE_FAKE_REAR` is test scaffolding.
+- No real rear sensor; `RANGE_FAKE_REAR` is intentionally deferred test
+  scaffolding. Current obstacle testing may use it by explicit operator
+  decision, but it cannot close P0-04/P0-05.
 - Encoder distance scale is probably not final.
 - `TICKS_PER_METRE` is currently `9125.0` in code.
 - Geometry-derived estimate from `H_Motor.pdf` plus the 20T 8M pulley is about
@@ -204,6 +231,14 @@ Known classifier risks:
 
 ## 5. Current Hunt Target Integration
 
+Navigation uses one turn-sign contract throughout current firmware and tools:
+`+X` is robot-forward, `+Y` is robot-left, and positive yaw, heading, chassis
+turn, and planner curvature are CCW/left. Forward-positive wheels use
+`left=forward-turn`, `right=forward+turn`, so positive angular velocity is
+`(right-left)/trackWidth`. The installed BNO raw yaw is CW/right-positive and
+is converted once by `navigationHeadingDeg()`; mapping, odometry, planning,
+stuck checks, and diagnostics use that navigation heading.
+
 Implemented:
 
 - Confirmed `weight_sized` candidates publish `objectTargetEstimate`.
@@ -289,8 +324,7 @@ Turn/search tuning helpers:
 ```text
 SEARCHTURN <120-300>
 SEARCHTURN RESET
-TEST TURNLADDER LEFT
-TEST TURNLADDER RIGHT
+TEST TURNLADDER is disabled; do not use it as a movement command.
 ```
 
 Safety expectations:
@@ -502,17 +536,9 @@ Pass:
 
 Goal: keep the final slow-turn decision visible for future tuning.
 
-Current command:
-
-```text
-TEST TURNLADDER LEFT
-TEST TURNLADDER RIGHT
-```
-
-- Ladder offsets are `120,160,200,240,280,300 us` from neutral.
-- Each rung drives for `250 ms`, then stops/coasts for `500 ms`.
-- 2026-07-04 ladder result showed `+/-200 us` as the first clear symmetric
-  pivot candidate, but global slow turns felt poor in real `TEST TURN`.
+The raw ladder command is disabled because blocking pulses cannot be
+continuously supervised. Historical ladder measurements are retained only as
+calibration notes, not as a runnable current command.
 - Global slow turns were restored to `1800/1200`.
 - Search scan/confirm turns now use the runtime `SEARCHTURN <offset_us>`
   setting, defaulting to `280 us`, so search speed can be tested without

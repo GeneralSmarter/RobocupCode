@@ -1,4 +1,4 @@
-#ifndef ROBOT_CONFIG_H
+﻿#ifndef ROBOT_CONFIG_H
 #define ROBOT_CONFIG_H
 
 #include <Arduino.h>
@@ -10,39 +10,72 @@
 const bool DEBUG_DRIVE = true;
 const bool DEBUG_TURN  = false;
 
-const char ROBOT_BUILD_LABEL[] = "V7-local-planner";
+const char ROBOT_BUILD_LABEL[] = "V7-p0-obstacle-t06e";
 
 // =====================================================
 // Bluetooth serial debug link
 // =====================================================
 const unsigned long BLUETOOTH_BAUD = 115200;
+// Telemetry is staged as a complete row and then copied atomically into this
+// bounded queue.  The transmitter only writes bytes already reported free by
+// HardwareSerial and never exceeds the per-loop budget, so logging cannot
+// hold the control loop behind a full UART buffer.
+const size_t TELEMETRY_QUEUE_CAPACITY_BYTES = 4096;
+const size_t TELEMETRY_STAGE_CAPACITY_BYTES = 1792;
+const size_t TELEMETRY_TX_BUDGET_BYTES_PER_LOOP = 48;
+const size_t TELEMETRY_EVENT_QUEUE_RESERVE_BYTES = 768;
+const unsigned long TELEMETRY_DUPLICATE_EVENT_LIMIT_MS = 250;
+const unsigned long TELEMETRY_MOTION_INTERVAL_MS = 100;
+const unsigned long TELEMETRY_FULL_INTERVAL_MS = 1000;
+
+// 115200 baud with 8N1 framing carries at most 11,520 bytes/s. Keep normal
+// logging below 60% so motion rows, one full snapshot, and event bursts cannot
+// saturate the transport used by the control loop.
+const size_t TELEMETRY_MOTION_ROW_BUDGET_BYTES = 480;
+const size_t TELEMETRY_FULL_ROW_BUDGET_BYTES = 1792;
+const size_t TELEMETRY_EVENT_RESERVE_BYTES_PER_SECOND = 300;
+const size_t TELEMETRY_DESIGNED_BYTES_PER_SECOND =
+  TELEMETRY_MOTION_ROW_BUDGET_BYTES * (1000 / TELEMETRY_MOTION_INTERVAL_MS) +
+  TELEMETRY_FULL_ROW_BUDGET_BYTES * (1000 / TELEMETRY_FULL_INTERVAL_MS) +
+  TELEMETRY_EVENT_RESERVE_BYTES_PER_SECOND;
+static_assert(
+  TELEMETRY_DESIGNED_BYTES_PER_SECOND * 100 <=
+    (BLUETOOTH_BAUD / 10) * 60,
+  "Telemetry design exceeds 60 percent of Bluetooth UART capacity");
 
 // =====================================================
 // Motors
 // =====================================================
-const int LEFT_MOTOR_PIN  = 0;
-const int RIGHT_MOTOR_PIN = 1;
+// Physically re-proven wheels-up on 2026-07-14. Servo output 0 drives the
+// robot-right wheel and output 1 drives the robot-left wheel.
+const int LEFT_MOTOR_PIN  = 1;
+const int RIGHT_MOTOR_PIN = 0;
 
 const int STOP_US = 1500;
 const int MIN_US  = 1000;
 const int MAX_US  = 1993;
 
-const int LEFT_BASE_US  = 1935;
-const int RIGHT_BASE_US = 1870;
+// These calibrations stay with the physical wheel/output they were measured
+// on; they move with the corrected side mapping above.
+const int LEFT_BASE_US  = 1870;
+const int RIGHT_BASE_US = 1935;
 
-const int LEFT_REVERSE_US  = 1130;
-const int RIGHT_REVERSE_US = 1190;
+const int LEFT_REVERSE_US  = 1190;
+const int RIGHT_REVERSE_US = 1130;
 
 // =====================================================
 // Encoders and drivetrain calibration
 // =====================================================
-const int LEFT_ENC_A  = 2;
-const int LEFT_ENC_B  = 3;
-const int RIGHT_ENC_A = 4;
-const int RIGHT_ENC_B = 5;
+// Encoder connector 2/3 follows the physical-right wheel; connector 4/5
+// follows the physical-left wheel. Both were proven forward-positive with
+// isolated wheel commands in the marked Task-01 logs.
+const int LEFT_ENC_A  = 4;
+const int LEFT_ENC_B  = 5;
+const int RIGHT_ENC_A = 2;
+const int RIGHT_ENC_B = 3;
 
-const int LEFT_ENCODER_SIGN  = -1;
-const int RIGHT_ENCODER_SIGN = 1;
+const int LEFT_ENCODER_SIGN  = 1;
+const int RIGHT_ENCODER_SIGN = -1;
 
 const float TICKS_PER_METRE = 9125.0;
 
@@ -218,6 +251,23 @@ const unsigned long SENSOR_UPDATE_INTERVAL_MS = 20;
 const unsigned long ODOMETRY_UPDATE_INTERVAL_MS = 20;
 const unsigned long PLANNER_UPDATE_INTERVAL_MS = 40;
 const unsigned long MOTOR_CONTROL_INTERVAL_MS = 20;
+const unsigned long MAIN_LOOP_DEADLINE_MS = 60;
+const unsigned long MOTOR_COMMAND_LEASE_MS = 150;
+const unsigned long MOTOR_COMMAND_WATCHDOG_TICK_MS = 10;
+// A point-plan epoch is serviced cooperatively. No one slice may consume the
+// whole main-loop deadline, and an old complete command is neutralized before
+// the independent 150 ms motor lease can expire.
+const unsigned long PLANNER_SLICE_BUDGET_US = 10000;
+const uint8_t PLANNER_MAX_CANDIDATES_PER_SLICE = 2;
+const unsigned long PLANNER_COMMAND_MAX_AGE_MS = 120;
+const unsigned long PLANNER_EPOCH_MAX_AGE_MS = 300;
+
+static_assert(MOTOR_COMMAND_LEASE_MS % MOTOR_COMMAND_WATCHDOG_TICK_MS == 0,
+              "Motor command lease must be an integer number of watchdog ticks");
+static_assert(PLANNER_COMMAND_MAX_AGE_MS < MOTOR_COMMAND_LEASE_MS,
+              "Planner command age guard must stop before the motor lease");
+static_assert(PLANNER_SLICE_BUDGET_US < MAIN_LOOP_DEADLINE_MS * 1000UL,
+              "Planner slice budget must remain below the loop deadline");
 
 const int LOCAL_MAP_CELLS = 60;
 const float LOCAL_MAP_CELL_M = 0.05;
@@ -284,9 +334,9 @@ const float PLANNER_TURN_TARGET_SPEED = 1050.0;
 // This marker selects the original, physically calibrated slow-turn pulse
 // pair inside the single motor-output path.
 const float PLANNER_TURN_SLOW_TARGET_SPEED = 800.0;
-// Turn-pulse coast calibration is directional. The positive/right turn
-// counter-pulse is shorter because 40 ms drove its settled heading past the
-// target, while the negative/left turn settles correctly at 40 ms.
+// Turn-pulse coast calibration is physical-direction-specific. After a right
+// turn, a 20 ms left counter-pulse is sufficient; after a left turn, the right
+// counter-pulse needs 40 ms. Command sign is canonical: positive is left/CCW.
 const unsigned long PLANNER_TURN_RIGHT_BRAKE_PULSE_MS = 20;
 const unsigned long PLANNER_TURN_LEFT_BRAKE_PULSE_MS = 40;
 const unsigned long PLANNER_TURN_SENSOR_REVALIDATE_MS = 120;
@@ -343,6 +393,11 @@ const float PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS = 1700.0;
 // robot is this close to the target plane, return to ordinary point approach so
 // the planner cannot keep extending the detour forward past the waypoint.
 const float PLANNER_SIDE_ESCAPE_FINAL_APPROACH_M = 0.30;
+// If final approach is already close to the waypoint but every forward arc is
+// blocked by the obstacle/wall beyond it, accept the safe reachable pose rather
+// than repeatedly reversing into the same pocket. This is deliberately much
+// tighter than the rejected broad detour-plane finish.
+const float PLANNER_FINAL_BLOCKED_ACCEPTANCE_M = 0.16;
 // Point goals are forward-arc goals. If a new point lies behind the chassis,
 // rotate in place first until the target is inside the arc planner's useful
 // forward field. This prevents TEST GOTO 0 0 from driving farther away after a
@@ -350,18 +405,17 @@ const float PLANNER_SIDE_ESCAPE_FINAL_APPROACH_M = 0.30;
 const float PLANNER_POINT_ALIGN_START_DEG = 30.0;
 const float PLANNER_POINT_ALIGN_BEHIND_DEG = 90.0;
 const float PLANNER_POINT_ALIGN_SIDE_TIE_MM = 50.0;
-const float PLANNER_CORRIDOR_SQUEEZE_HEADING_DEG = 25.0;
-const float PLANNER_CORRIDOR_SQUEEZE_SPEED_TPS = 1500.0;
-const float PLANNER_CORRIDOR_SQUEEZE_MIN_OBSERVED_M = 0.20;
 // Reverse recovery is an explicit no-forward-path recovery. For this testing
 // build, RANGE_FAKE_REAR is trusted as a real rear clearance sensor.
 const unsigned long PLANNER_NO_PATH_BACKTRACK_DELAY_MS = 250;
+const uint8_t PLANNER_REVERSE_MIN_GEOMETRIC_NO_PATH_EPOCHS = 2;
 const float PLANNER_REVERSE_RECOVERY_MAX_SPEED_TPS = 1700.0;
 const float PLANNER_REVERSE_RECOVERY_MIN_SPEED_TPS = PLANNER_MIN_DRIVABLE_SPEED_TPS;
 const float PLANNER_REVERSE_RECOVERY_MIN_SPEED_SCALE = 0.75;
 const float PLANNER_REVERSE_RECOVERY_MAX_TURN_RATIO = 0.60;
 const int PLANNER_REVERSE_RECOVERY_CURVATURE_SAMPLES = 9;
 const float PLANNER_REVERSE_RECOVERY_REAR_BUFFER_M = 0.06;
+const float PLANNER_FRONT_WALL_BYPASS_OUTWARD_M = 0.50;
 const float PLANNER_REVERSE_SURVEY_MIN_REVERSE_M = 0.16;
 const float PLANNER_REVERSE_SURVEY_RETRY_REVERSE_M = 0.10;
 const float PLANNER_REVERSE_SURVEY_MAX_REVERSE_M = 0.48;
@@ -370,6 +424,7 @@ const float PLANNER_REVERSE_SURVEY_SIDE_CLEAR_M = 0.28;
 const unsigned long PLANNER_REVERSE_SURVEY_SETTLE_MS = 220;
 const float PLANNER_POST_REVERSE_ESCAPE_EXTRA_LATERAL_M = 0.08;
 const float PLANNER_SIDE_ESCAPE_TIE_M = 0.10;
+const float PLANNER_SIDE_ESCAPE_MIN_OUTWARD_M = 0.12;
 const unsigned long PLANNER_SIDE_ESCAPE_MEMORY_MS = 2500;
 const float PLANNER_SIDE_ESCAPE_ADAPT_STEP_M = 0.08;
 const float PLANNER_SIDE_ESCAPE_ADAPT_MAX_EXTRA_M = 0.24;
@@ -380,6 +435,23 @@ const unsigned long PLANNER_SIDE_ESCAPE_ADAPT_BUMP_COOLDOWN_MS = 300;
 // waypoint and turn the robot straight back toward the wall.
 const unsigned long PLANNER_POST_REVERSE_ESCAPE_MIN_MS = 1800;
 const unsigned long PLANNER_POST_REVERSE_ESCAPE_TIMEOUT_MS = 5000;
+
+// Task-03 fail-closed envelope for the small (about 1.2 m) obstacle tests.
+// These bounds supervise the original mission goal even when a temporary
+// clearance/post-reverse goal is active.  0.45 m goal growth matches the
+// existing missed-route overshoot window; 0.75 m lateral displacement allows
+// the 0.50 m front-wall bypass plus one chassis width/clearance margin.
+const float PLANNER_RECOVERY_MAX_GOAL_DIVERGENCE_M = 0.45;
+const float PLANNER_RECOVERY_MAX_LATERAL_DISPLACEMENT_M = 0.75;
+// A single phase must settle/reverse/rejoin within 12 s.  At the capped
+// recovery speed, 2.4 m is already twice the nominal test route length.
+const unsigned long PLANNER_RECOVERY_MAX_PHASE_TIME_MS = 12000;
+const float PLANNER_RECOVERY_MAX_CUMULATIVE_DISTANCE_M = 2.40;
+const uint8_t PLANNER_RECOVERY_MAX_COUNT = 2;
+// Require at least 50 mm improvement in either global distance or route
+// along-progress during each rolling 6 s window.
+const unsigned long PLANNER_RECOVERY_NO_PROGRESS_TIMEOUT_MS = 6000;
+const float PLANNER_RECOVERY_PROGRESS_EPSILON_M = 0.05;
 const uint16_t TOF_SUDDEN_CLOSE_DROP_MM = 400;
 const uint16_t TOF_CLOSE_CONFIRM_TOLERANCE_MM = 200;
 const uint8_t TOF_CLOSE_CONFIRM_READS = 2;

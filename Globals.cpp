@@ -134,10 +134,18 @@ bool endMatchPrinted = false;
 
 float desiredForwardSpeed = 0.0;
 float desiredTurnSpeed = 0.0;
+float lastRequestedLeftWheelSpeed = 0.0;
+float lastRequestedRightWheelSpeed = 0.0;
+float lastMeasuredLeftWheelSpeed = 0.0;
+float lastMeasuredRightWheelSpeed = 0.0;
+float lastImuClockwiseYawDeg = 0.0;
+float lastNavigationHeadingDeg = 0.0;
+const char* lastMotorOutputMode = "neutral";
 
 NavigationGoal navigationGoal = {
   NAV_GOAL_NONE,
   NAV_OWNER_ROUTE,
+  MOTION_AUTHORITY_NONE,
   false,
   false,
   false,
@@ -157,15 +165,33 @@ PlannerTelemetry plannerTelemetry = {
   -1.0,
   0.0,
   0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0,
   0,
   PLANNER_STOP_NONE,
   "idle",
   "idle",
   "",
-  0
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  false
 };
 
 bool motorStopRequested = true;
+MotionAuthority motionAuthority = MOTION_AUTHORITY_NONE;
+MotionAuthority motionCommandAuthority = MOTION_AUTHORITY_NONE;
 unsigned long lastSensorUpdateMs = 0;
 unsigned long lastOdometryUpdateMs = 0;
 unsigned long lastPlannerUpdateMs = 0;

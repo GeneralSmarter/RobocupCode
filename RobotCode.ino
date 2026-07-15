@@ -1,4 +1,4 @@
-// =====================================================
+﻿// =====================================================
 // ROBOCUP ROBOT CODE
 // =====================================================
 // V7 local-planner firmware. This sketch only performs setup and schedules
@@ -29,6 +29,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(RIGHT_ENC_A), rightISR, CHANGE);
 
   stopMotors();
+  initializeMotorSafetyWatchdog();
 
   connectIMU();
   connectTOFSensors();
@@ -55,15 +56,30 @@ void setup() {
 // Main loop
 // =====================================================
 void loop() {
+  noteMainLoopHeartbeat();
+  unsigned long phaseStartedUs = micros();
+  serviceMotorSafetyWatchdog();
+  recordMainLoopPhaseDuration("watchdog", phaseStartedUs);
+
+  phaseStartedUs = micros();
   handleBluetoothCommands();
   updateManualDriveTimeout();
+  recordMainLoopPhaseDuration("bluetooth_rx", phaseStartedUs);
 
+  phaseStartedUs = micros();
   if (robotRunEnabled && !isManualDriveActive()) {
     runStateMachine();
   } else if (!isManualDriveActive()) {
     motorStopRequested = true;
     setMotionCommand(0.0, 0.0);
   }
+  recordMainLoopPhaseDuration("state_machine", phaseStartedUs);
 
+  phaseStartedUs = micros();
   updateRobotController();
+  recordMainLoopPhaseDuration("robot_controller", phaseStartedUs);
+
+  phaseStartedUs = micros();
+  serviceBluetoothTelemetryTx();
+  recordMainLoopPhaseDuration("bluetooth_tx", phaseStartedUs);
 }

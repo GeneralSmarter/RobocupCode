@@ -30,7 +30,7 @@ void zeroYaw() {
   Serial.println(yawOffset);
 }
 
-float readYawDeg() {
+float readImuClockwiseYawDeg() {
   sensors_event_t event;
   bno.getEvent(&event);
 

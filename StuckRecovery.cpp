@@ -1,4 +1,4 @@
-#include "Robot.h"
+﻿#include "Robot.h"
 
 // =====================================================
 // Progress monitoring
@@ -73,5 +73,5 @@ void clearStuckFlags() {
   driveStuckStartMs = 0;
   wheelMismatchStartMs = 0;
   turnCheckStartMs = millis();
-  turnCheckStartYaw = readYawDeg();
+  turnCheckStartYaw = navigationHeadingDeg();
 }

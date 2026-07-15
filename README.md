@@ -1,25 +1,42 @@
-# RobotCode
+﻿# RobotCode
 
 Current RoboCup robot firmware for Teensy 4.0.
 
-V7 uses a non-blocking, safety-supervised local planner.  The four forward
-navigation ToFs are VL53L0X sensors and build a short-lived local confidence
-map; a footprint-aware receding-horizon controller selects a safe
+V7 uses a scheduled, safety-supervised local planner. Runtime sensor polling is
+phase-1 nonblocking, with a motor command lease and loop-deadline telemetry;
+coherent sensor snapshots and physical watchdog timing remain follow-ups. The
+four forward navigation ToFs are VL53L0X sensors and build a short-lived local
+confidence map; a footprint-aware receding-horizon controller selects a safe
 differential-drive arc toward the active waypoint.  There is no fixed
 reverse/turn/bypass/rejoin script and no
 outer-fan wall-follow fallback.  The present fan has no rear or true side
 coverage, so invalid or blind space is never treated as clear.
 
-See [NAVIGATION_PLANNER_TEST_PLAN.md](docs/NAVIGATION_PLANNER_TEST_PLAN.md) for the
-required hardware-led validation sequence, including the G0-G5 gap ladder and
-track-width calibration gate.
+Read [ROBOT_CODEBASE_AUDIT.md](docs/ROBOT_CODEBASE_AUDIT.md) before planning
+new navigation or mission work. It records the full 2026-07 audit, including
+the stop-ship safety findings that supersede the older navigation test plans.
+
+P0 status: P0-01 turn convention, P0-02 motion authority/disarm, P0-07 hard
+collision override, and P0-08 field-GOTO command suppression are fixed in
+software. P0-03 is partially fixed and still depends on real sensor coverage.
+P0-04 fake rear is intentionally deferred; P0-05 sensor safety proof remains
+open. P0-06 phase 1 is implemented, with coherent snapshots and physical
+watchdog timing still to follow. Operator decision, 2026-07-14: current
+obstacle testing may use `RANGE_FAKE_REAR` as explicit temporary test
+scaffolding. Do not treat those runs as proof of rear safety or competition
+readiness.
+
+Current verification baseline: Teensy compile PASS, simulator 25/25 PASS,
+Python 76/76 PASS, and Python `compileall` PASS.
+
+The field GOTO desktop UI is preview-only. Field clicks do not send `TEST ARM`
+or `TEST GOTO`; the SE(2) transform, status preflight, bounds preview, and
+explicit confirmation flow are not yet implemented.
 
 ## Read First
 
 - [Current state and next steps](docs/CURRENT_STATE_AND_NEXT_STEPS.md)
-- [Navigation planner test plan](docs/NAVIGATION_PLANNER_TEST_PLAN.md)
-- [Drive gear calibration test plan](docs/DRIVE_GEAR_CALIBRATION_TEST_PLAN.md)
-- [Object detection and hunting plan](docs/OBJECT_DETECTION_HUNTING_PLAN.md)
+- [Robot codebase audit](docs/ROBOT_CODEBASE_AUDIT.md)
 
 ## Files
 
@@ -98,11 +115,10 @@ Available commands:
   local-planner navigation.
 - `TEST AVOID <metres>` - create one temporary waypoint straight ahead and use
   normal navigation/avoidance to reach it.
-- `TEST ESCAPE <metres>` - create one temporary waypoint straight ahead and
-  explicitly exercise the front-blocked escape system: forward motion remains
-  stopped while the virtual front is blocked, then after the no-path debounce
-  the planner may run trusted fake-rear-ToF reverse arcs until forward arcs
-  become valid again.
+- `TEST ESCAPE <metres>` - front-blocked planner escape/recovery diagnostic.
+  Current obstacle testing may run this by explicit operator decision with
+  generous rear clearance and a fake-rear note in the log/mark; it does not
+  prove rear safety or close P0-04/P0-05.
 - `TEST FAN` or `FAN` - print the high forward ToF fan sector table.
 - `TEST OBJECT` or `OBJECT` - print the object/weight ToF table and current
   object-candidate summary. This never moves the motors.
@@ -119,13 +135,12 @@ Available commands:
 - `TEST TURN <degrees>` - turn a fixed signed angle.
 - `TEST TURNPULSE <signed_seconds>` - run a calibrated turn pulse and log its
   one-second coast for turn calibration.
-- `TEST TURNLADDER LEFT|RIGHT` - run a raw slow-turn pulse ladder for new
-  chassis slow-pivot calibration. This requires `TEST ARM` and directly pivots
-  the robot.
+- `TEST TURNLADDER LEFT|RIGHT` - disabled. It is not a runnable movement
+  command because raw blocking pulses cannot be continuously supervised.
 - `MARK <note>` - print and CSV-log a test note. Commas are replaced with
   semicolons in CSV event detail.
 - `MANUAL ARM` / `MANUAL DISARM` - enable or disable live manual drive.
-- `DRIVE <forward> <turn>` - live manual drive command, both values `-100` to `100`.
+- `DRIVE <forward> <turn>` - live manual drive command, both values `-100` to `100`; positive turn is left/CCW.
 - `HOME` - request the return-home state.
 - `ZERO` - stop and reset yaw, pose, local map, encoder references, and PID state.
 - `STOP` - stop motors and set `END_MATCH`.
@@ -135,8 +150,7 @@ accept `0.10` to `2.00` metres. `TEST GOTO` accepts coordinates from `-10.00`
 to `10.00` metres. `TEST SIDE` accepts `1` to `30` seconds and does not
 require `TEST ARM` because it never drives the motors. `TEST TURN` accepts
 signed angles from `-360` to `360` degrees, excluding angles inside the turn
-tolerance. `TEST TURNLADDER` tests offsets `120,160,200,240,280,300 us` from
-neutral with `250 ms` pulses and `500 ms` stopped/coast windows. Motion tests
+tolerance. `TEST TURNLADDER` is disabled. Motion tests
 require `TEST ARM` first and finish by stopping the motors and returning to
 `END_MATCH`.
 
@@ -171,9 +185,12 @@ straight passage; the planner still prefers 50 mm or more of clearance when it
 has a choice. A 400 mm passage cannot support an in-place turn, so the planner
 rejects sustained steering once it has observed both nearby boundaries.
 
-If forward planning remains impossible for 250 ms, V7 enters reverse recovery.
-For this testing build, `RANGE_FAKE_REAR` is a trusted rear ToF reading fixed
-at 4000 mm clear. The planner samples reverse arcs, commands the best one, and
+If forward planning remains impossible for 250 ms, V7 enters reverse recovery
+in software. For this testing build, `RANGE_FAKE_REAR` is temporary test
+scaffolding fixed at 4000 mm clear. Operator decision, 2026-07-14: obstacle
+testing may use this fake rear channel, but the result is not proof of rear
+safety or competition readiness until P0-04/P0-05 are closed. The planner
+samples reverse arcs, commands the best one, and
 tries the normal forward planner first again on every planner tick. If a valid
 forward arc appears while either side still has close inner/outer fan evidence,
 the planner enters a short `post_reverse_escape` side-clearance goal before
@@ -186,6 +203,16 @@ the bypass remains a bounded lane along the waypoint direction. If the same
 lane falls back into recovery, it widens in 80 mm steps up to 240 mm of extra
 offset and emits `side_escape_widen`. Stuck-wheel detection still aborts to
 protect the drivetrain.
+
+P0-07 remediation removed the synthetic `corridor_squeeze_straight` command
+and the reverse-recovery front-footprint grace. A zero-candidate forward or
+reverse search now stops; it cannot turn footprint rejection into motion.
+Front-wall recovery still records its bypass-lane target in
+`obstacle_bypass_phase` telemetry as `target=...`, but a start pose whose
+inflated footprint is already occupied safe-stops instead of reversing through
+that evidence. `final_blocked_reached` remains stop-only: it requires final
+approach, the existing `160 mm` bound, `no_safe_trajectory`, and a clear current
+inflated footprint.
 
 Use the smallest test that exercises the feature being changed:
 
@@ -201,6 +228,14 @@ Use the smallest test that exercises the feature being changed:
 uses signed percentages: positive forward drives forward, negative forward
 reverses, positive turn turns left, and negative turn turns right. The firmware
 stops motors if live drive commands stop arriving for about `350 ms`.
+
+The canonical navigation frame is `+X` forward and `+Y` robot-left.
+`+yaw`, `+heading`, `+turn`, and `+curvature` are counter-clockwise/left. Wheel
+speed is forward-positive, with `left = forward - turn`,
+`right = forward + turn`, and `omega = (right - left) / trackWidth`. The
+installed BNO055's zero-relative raw yaw is clockwise/right-positive, so only
+`navigationHeadingDeg()` converts it to the canonical sign; navigation code
+must not consume raw IMU yaw directly.
 
 When `CSV ON` is active, rows start with `row_type,event,detail`. Regular
 once-per-second samples use `row_type=telemetry`. Event rows use
@@ -261,7 +296,7 @@ offset inside the sensor, which is exactly what the clearance maths needs.
 
 1. Square the robot to a long flat front wall and record each raw fan range at
    three known gaps from the robot's front face (for example 300, 500, and
-   700 mm). Use `CSV ON`, `MARK`, and `FAN`; the ±60 degree outer rays need a
+   700 mm). Use `CSV ON`, `MARK`, and `FAN`; the Â±60 degree outer rays need a
    wall wide enough to intercept them at every gap.
 2. With `D = front_extent + front_face_gap` and readings `r1`, `r2` from two
    positions, fit the beam angle using
@@ -320,8 +355,10 @@ comparison, but they are not part of the V7 build.
 
 ## Weight ToF Stage
 
-See [OBJECT_DETECTION_HUNTING_PLAN.md](docs/OBJECT_DETECTION_HUNTING_PLAN.md) for
-the success gates and next-step checklist for this stage.
+See [CURRENT_STATE_AND_NEXT_STEPS.md](docs/CURRENT_STATE_AND_NEXT_STEPS.md) for
+the current object/search checklist, and
+[ROBOT_CODEBASE_AUDIT.md](docs/ROBOT_CODEBASE_AUDIT.md) for the broader safety
+and architecture concerns around object detection.
 
 The object stage is separate from the VL53L0X navigation fan: four VL53L1X
 object/weight ToFs are mounted at fixed distances from the robot centreline

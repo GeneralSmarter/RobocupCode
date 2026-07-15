@@ -1,4 +1,4 @@
-#include "Robot.h"
+﻿#include "Robot.h"
 
 // =====================================================
 // Object / weight detection scaffold
@@ -458,9 +458,10 @@ void updateObjectTOFSensors() {
 }
 
 void refreshObjectTargetEstimate() {
-  for (int i = 0; i < OBJECT_TOF_COUNT * 2; i++) {
+  // One bounded readiness sweep. updateObjectTOFSensors() already checks
+  // dataReady() and uses read(false), so no measurement wait or delay is needed.
+  for (int i = 0; i < OBJECT_TOF_COUNT; i++) {
     updateObjectTOFSensors();
-    delay(15);
   }
 }
 

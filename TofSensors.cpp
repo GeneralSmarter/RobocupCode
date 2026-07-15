@@ -1,4 +1,4 @@
-#include "Robot.h"
+﻿#include "Robot.h"
 
 // =====================================================
 // TOF sensors
@@ -360,7 +360,17 @@ static void updateFakeRearTofSensor() {
   syncLegacyTofGlobals();
 }
 
+static bool isL0XFanSampleReady(VL53L0X &sensor) {
+  return (sensor.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) != 0;
+}
+
 static void updateL0XFanSensor(RangeSensorId id, VL53L0X &sensor) {
+  // Pololu's range-read call waits until a sample is ready. Poll its public
+  // interrupt-status register first so four fan channels cannot serialize four
+  // 100 ms measurement waits while an old motor command remains latched.
+  if (!isL0XFanSampleReady(sensor)) {
+    return;
+  }
   uint16_t rawDistance = sensor.readRangeContinuousMillimeters();
 
   if (sensor.timeoutOccurred()) {
@@ -396,6 +406,12 @@ bool isRangeSensorValid(RangeSensorId id) {
 
 bool isRangeSensorBlocked(RangeSensorId id) {
   return rangeSensors[id].blocked;
+}
+
+bool isRangeSensorCurrent(RangeSensorId id) {
+  const RangeSensorState &sensor = rangeSensors[id];
+  return sensor.valid && !sensor.stale &&
+         millis() - sensor.lastReadMs <= TOF_STALE_TIMEOUT_MS;
 }
 
 bool isTofCloseReadingRevalidating() {

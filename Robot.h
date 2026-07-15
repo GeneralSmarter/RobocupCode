@@ -1,8 +1,9 @@
-#ifndef ROBOT_H
+﻿#ifndef ROBOT_H
 #define ROBOT_H
 
 #include <Arduino.h>
 #include <Servo.h>
+#include <IntervalTimer.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BNO055.h>
@@ -12,12 +13,15 @@
 
 #include "RobotTypes.h"
 #include "RobotConfig.h"
+#include "TurnConvention.h"
+#include "MotionSafety.h"
 
 // =====================================================
 // Bluetooth serial debug link
 // =====================================================
 extern bool bluetoothOutputEnabled;
 extern bool robotRunEnabled;
+bool isBluetoothCsvStreamEnabled();
 
 class RobotSerialClass {
 public:
@@ -28,7 +32,7 @@ public:
   template <typename... Args>
   size_t print(Args... args) {
     size_t written = ::Serial.print(args...);
-    if (bluetoothOutputEnabled) {
+    if (bluetoothOutputEnabled && !isBluetoothCsvStreamEnabled()) {
       Serial2.print(args...);
     }
     return written;
@@ -37,7 +41,7 @@ public:
   template <typename... Args>
   size_t println(Args... args) {
     size_t written = ::Serial.println(args...);
-    if (bluetoothOutputEnabled) {
+    if (bluetoothOutputEnabled && !isBluetoothCsvStreamEnabled()) {
       Serial2.println(args...);
     }
     return written;
@@ -45,7 +49,7 @@ public:
 
   size_t println() {
     size_t written = ::Serial.println();
-    if (bluetoothOutputEnabled) {
+    if (bluetoothOutputEnabled && !isBluetoothCsvStreamEnabled()) {
       Serial2.println();
     }
     return written;
@@ -53,7 +57,7 @@ public:
 
   void flush() {
     ::Serial.flush();
-    if (bluetoothOutputEnabled) {
+    if (bluetoothOutputEnabled && !isBluetoothCsvStreamEnabled()) {
       Serial2.flush();
     }
   }
@@ -157,6 +161,13 @@ extern bool endMatchPrinted;
 
 extern float desiredForwardSpeed;
 extern float desiredTurnSpeed;
+extern float lastRequestedLeftWheelSpeed;
+extern float lastRequestedRightWheelSpeed;
+extern float lastMeasuredLeftWheelSpeed;
+extern float lastMeasuredRightWheelSpeed;
+extern float lastImuClockwiseYawDeg;
+extern float lastNavigationHeadingDeg;
+extern const char* lastMotorOutputMode;
 
 extern int lastLeftMotorUs;
 extern int lastRightMotorUs;
@@ -164,6 +175,8 @@ extern int lastRightMotorUs;
 extern NavigationGoal navigationGoal;
 extern PlannerTelemetry plannerTelemetry;
 extern bool motorStopRequested;
+extern MotionAuthority motionAuthority;
+extern MotionAuthority motionCommandAuthority;
 extern bool escapeBacktrackEnabled;
 extern unsigned long lastSensorUpdateMs;
 extern unsigned long lastOdometryUpdateMs;
@@ -213,7 +226,7 @@ void updateOdometry();
 
 void connectIMU();
 void zeroYaw();
-float readYawDeg();
+float readImuClockwiseYawDeg();
 float navigationHeadingDeg();
 
 void connectTOFSensors();
@@ -231,6 +244,7 @@ void printObjectTelemetry();
 bool isObjectTargetFresh();
 bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
+bool isRangeSensorCurrent(RangeSensorId id);
 uint16_t getRangeSensorDistance(RangeSensorId id);
 bool isTofCloseReadingRevalidating();
 float getFanSweepClearanceMm(RangeSensorId id);
@@ -240,7 +254,26 @@ const char* objectCandidateKindName(ObjectCandidateKind kind);
 const char* objectSensorRoleName(ObjectTofRole role);
 
 void stopMotors();
-void writeMotorUS(int leftUs, int rightUs);
+void initializeMotorSafetyWatchdog();
+void serviceMotorSafetyWatchdog();
+void noteMainLoopHeartbeat();
+bool isMotorSafetyWatchdogReady();
+bool isMotorCommandLeaseArmed();
+unsigned long motorCommandLeaseTripCount();
+unsigned long currentMainLoopGapMs();
+unsigned long maximumMainLoopGapMs();
+unsigned long mainLoopDeadlineMissCount();
+void recordMainLoopPhaseDuration(const char* phase, unsigned long startedUs);
+const char* maximumMainLoopPhaseName();
+unsigned long maximumMainLoopPhaseUs();
+void resetMainLoopTimingDiagnostics();
+void revokeMotionAuthority();
+bool claimMotionAuthority(MotionAuthority authority);
+bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed, float turnSpeed);
+const char* motionAuthorityName(MotionAuthority authority);
+const char* motionSafetyReasonName(MotionSafetyReason reason);
+MotionSafetyReason lastMotionSafetyReason();
+bool isMotionSafetyStopActive();
 int updatePID(float target, float actual, float &integral, float &lastError, float dt, int baseCommand);
 void updateMotorController();
 
@@ -252,9 +285,11 @@ void printCalibrationSummary();
 
 void setupBluetooth();
 bool handleBluetoothCommands();
+void disarmBluetoothMotionModes();
 void sendBluetoothStatus();
 void sendBluetoothTelemetry();
 void sendBluetoothEvent(const char* eventName, const char* eventDetail);
+void serviceBluetoothTelemetryTx();
 bool isManualDriveActive();
 void updateManualDriveTimeout();
 void printWaitingForStart();

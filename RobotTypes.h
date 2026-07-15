@@ -1,4 +1,4 @@
-#ifndef ROBOT_TYPES_H
+﻿#ifndef ROBOT_TYPES_H
 #define ROBOT_TYPES_H
 
 #include <Arduino.h>
@@ -152,6 +152,28 @@ enum NavigationGoalOwner {
   NAV_OWNER_OBJECT_HUNT
 };
 
+enum MotionAuthority {
+  MOTION_AUTHORITY_NONE,
+  MOTION_AUTHORITY_MISSION,
+  MOTION_AUTHORITY_TEST,
+  MOTION_AUTHORITY_MANUAL
+};
+
+constexpr bool motionAuthorityAllows(MotionAuthority active,
+                                     MotionAuthority claimant) {
+  return active != MOTION_AUTHORITY_NONE && active == claimant;
+}
+
+static_assert(!motionAuthorityAllows(MOTION_AUTHORITY_NONE,
+                                     MOTION_AUTHORITY_NONE),
+              "Disarmed authority must never permit motion");
+static_assert(motionAuthorityAllows(MOTION_AUTHORITY_MISSION,
+                                    MOTION_AUTHORITY_MISSION),
+              "Matching mission authority must be accepted");
+static_assert(!motionAuthorityAllows(MOTION_AUTHORITY_MISSION,
+                                     MOTION_AUTHORITY_TEST),
+              "Mismatched motion authorities must be rejected");
+
 enum PlannerStopReason {
   PLANNER_STOP_NONE,
   PLANNER_STOP_FRONT_BLOCKED,
@@ -160,12 +182,19 @@ enum PlannerStopReason {
   PLANNER_STOP_TURN_SIDE_INVALID,
   PLANNER_STOP_TURN_CLEARANCE,
   PLANNER_STOP_STUCK,
+  PLANNER_STOP_RECOVERY_DIVERGENCE,
+  PLANNER_STOP_RECOVERY_DISPLACEMENT,
+  PLANNER_STOP_RECOVERY_TIME,
+  PLANNER_STOP_RECOVERY_DISTANCE,
+  PLANNER_STOP_RECOVERY_REPEATED,
+  PLANNER_STOP_RECOVERY_NO_PROGRESS,
   PLANNER_STOP_ABORTED
 };
 
 struct NavigationGoal {
   NavigationGoalMode mode;
   NavigationGoalOwner owner;
+  MotionAuthority authority;
   bool active;
   bool completed;
   bool failed;
@@ -184,13 +213,29 @@ struct PlannerTelemetry {
   float selectedCurvature;
   float minimumSweptClearanceMm;
   float speedCapTicksPerSec;
+  float globalGoalDistanceM;
   float localGoalDistanceM;
+  float routeAlongProgressM;
+  float routeSignedLateralErrorM;
+  float recoveryPhaseElapsedS;
+  float cumulativeRecoveryDistanceM;
+  float recoveryBestProgressM;
+  uint8_t recoveryCount;
   int candidateCount;
   PlannerStopReason stopReason;
   const char* planReason;
   const char* replanReason;
   const char* safeStopReason;
   unsigned long lastPlanMs;
+  unsigned long plannerSliceUs;
+  unsigned long plannerSliceMaxUs;
+  unsigned long plannerEpochWorkUs;
+  unsigned long plannerEpochMaxWorkUs;
+  unsigned long plannerEpochAgeMs;
+  unsigned long plannerCommandAgeMs;
+  uint8_t plannerCandidatesProcessed;
+  uint8_t plannerYieldCount;
+  bool plannerEpochActive;
 };
 
 struct Waypoint {

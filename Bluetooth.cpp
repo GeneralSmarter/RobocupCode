@@ -1,4 +1,4 @@
-#include "Robot.h"
+﻿#include "Robot.h"
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,14 +11,18 @@ static int bluetoothCommandLength = 0;
 static bool bluetoothAbortMotionRequested = false;
 static bool bluetoothStreamEnabled = false;
 static bool bluetoothCsvStreamEnabled = false;
+static bool bluetoothCsvClosing = false;
 static bool bluetoothTestArmed = false;
 static bool bluetoothManualArmed = false;
 static bool bluetoothManualActive = false;
 static bool bluetoothSideTestActive = false;
 static bool bluetoothTurnPulseTestActive = false;
+static bool bluetoothArcTestActive = false;
+static bool bluetoothTurnTruthActive = false;
 static bool turnPulseCoasting = false;
 static unsigned long lastManualDriveCommandMs = 0;
-static unsigned long lastBluetoothTelemetryMs = 0;
+static unsigned long lastBluetoothMotionTelemetryMs = 0;
+static unsigned long lastBluetoothFullTelemetryMs = 0;
 static unsigned long sideTestEndMs = 0;
 static unsigned long sideTestNextSampleMs = 0;
 static int sideTestSampleNumber = 0;
@@ -26,8 +30,168 @@ static unsigned long turnPulseEndMs = 0;
 static unsigned long turnPulseCoastEndMs = 0;
 static unsigned long turnPulseNextSampleMs = 0;
 static unsigned long turnPulseStartMs = 0;
-static float turnPulseStartYawDeg = 0.0;
+static float turnPulseStartHeadingDeg = 0.0;
 static float turnPulseCommandTicksPerSec = 0.0;
+static unsigned long arcTestEndMs = 0;
+static unsigned long arcTestStartMs = 0;
+static unsigned long arcTestNextSampleMs = 0;
+static float arcTestForwardTicksPerSec = 0.0;
+static float arcTestTurnTicksPerSec = 0.0;
+static unsigned long turnTruthStartMs = 0;
+static unsigned long turnTruthNextSampleMs = 0;
+
+// CSV/STATUS telemetry must never write synchronously to Serial2. A complete
+// row is first assembled in telemetryStage, then atomically admitted to the
+// bounded byte ring. serviceBluetoothTelemetryTx() drains only bytes that the
+// UART reports writable and only up to a fixed per-loop budget.
+static char telemetryQueue[TELEMETRY_QUEUE_CAPACITY_BYTES];
+static size_t telemetryQueueHead = 0;
+static size_t telemetryQueueTail = 0;
+static size_t telemetryQueueBytes = 0;
+static unsigned long telemetryQueuedRows = 0;
+static unsigned long telemetryDroppedRows = 0;
+static unsigned long telemetryRateLimitedEvents = 0;
+static char lastTelemetryEventName[40] = "";
+static char lastTelemetryEventDetail[64] = "";
+static unsigned long lastTelemetryEventMs = 0;
+static bool telemetryRowAssemblyActive = false;
+
+class TelemetryStagePrint : public Print {
+public:
+  void reset() {
+    length = 0;
+    overflowed = false;
+  }
+
+  size_t write(uint8_t value) override {
+    if (length >= TELEMETRY_STAGE_CAPACITY_BYTES) {
+      overflowed = true;
+      return 0;
+    }
+    buffer[length++] = (char)value;
+    return 1;
+  }
+
+  bool commit(size_t maximumLength = TELEMETRY_STAGE_CAPACITY_BYTES,
+              size_t reservedQueueBytes = 0) {
+    if (overflowed || length == 0 || length > maximumLength ||
+        length + reservedQueueBytes >
+          TELEMETRY_QUEUE_CAPACITY_BYTES - telemetryQueueBytes) {
+      telemetryDroppedRows++;
+      reset();
+      return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+      telemetryQueue[telemetryQueueHead] = buffer[i];
+      telemetryQueueHead = (telemetryQueueHead + 1) % TELEMETRY_QUEUE_CAPACITY_BYTES;
+    }
+    telemetryQueueBytes += length;
+    telemetryQueuedRows++;
+    reset();
+    return true;
+  }
+
+private:
+  char buffer[TELEMETRY_STAGE_CAPACITY_BYTES];
+  size_t length = 0;
+  bool overflowed = false;
+};
+
+static TelemetryStagePrint telemetryStage;
+static TelemetryStagePrint controlLineStage;
+
+static void beginTelemetryRow() {
+  telemetryStage.reset();
+  telemetryRowAssemblyActive = true;
+}
+
+static void commitTelemetryRow(
+    size_t maximumLength = TELEMETRY_STAGE_CAPACITY_BYTES) {
+  telemetryStage.commit(maximumLength, TELEMETRY_EVENT_QUEUE_RESERVE_BYTES);
+  telemetryRowAssemblyActive = false;
+}
+
+static void commitTelemetryEventRow() {
+  telemetryStage.commit();
+  telemetryRowAssemblyActive = false;
+}
+
+void serviceBluetoothTelemetryTx() {
+  size_t writable = Serial2.availableForWrite();
+  if (writable > TELEMETRY_TX_BUDGET_BYTES_PER_LOOP) {
+    writable = TELEMETRY_TX_BUDGET_BYTES_PER_LOOP;
+  }
+  if (writable > telemetryQueueBytes) {
+    writable = telemetryQueueBytes;
+  }
+
+  for (size_t sent = 0; sent < writable; sent++) {
+    const char value = telemetryQueue[telemetryQueueTail];
+    Serial2.write((uint8_t)value);
+    telemetryQueueTail = (telemetryQueueTail + 1) % TELEMETRY_QUEUE_CAPACITY_BYTES;
+    telemetryQueueBytes--;
+    if (value == '\n' && telemetryQueuedRows > 0) {
+      telemetryQueuedRows--;
+    }
+  }
+
+  if (bluetoothCsvClosing && telemetryQueueBytes == 0) {
+    bluetoothCsvClosing = false;
+  }
+}
+
+bool isBluetoothCsvStreamEnabled() {
+  return bluetoothCsvStreamEnabled || bluetoothCsvClosing;
+}
+
+// During CSV capture every Bluetooth output line uses the same bounded queue.
+// This prevents acknowledgements and turn/arc truth diagnostics from cutting
+// through telemetry rows or blocking behind a full UART.
+class BluetoothSerialMux {
+public:
+  void begin(unsigned long baud) { ::Serial2.begin(baud); }
+  int available() { return ::Serial2.available(); }
+  int read() { return ::Serial2.read(); }
+
+  template <typename... Args>
+  size_t print(Args... args) {
+    if (telemetryRowAssemblyActive) {
+      return telemetryStage.print(args...);
+    }
+    if (isBluetoothCsvStreamEnabled()) {
+      return controlLineStage.print(args...);
+    }
+    return ::Serial2.print(args...);
+  }
+
+  template <typename... Args>
+  size_t println(Args... args) {
+    if (telemetryRowAssemblyActive) {
+      return telemetryStage.println(args...);
+    }
+    if (isBluetoothCsvStreamEnabled()) {
+      const size_t written = controlLineStage.println(args...);
+      controlLineStage.commit();
+      return written;
+    }
+    return ::Serial2.println(args...);
+  }
+
+  size_t println() {
+    if (telemetryRowAssemblyActive) {
+      return telemetryStage.println();
+    }
+    if (isBluetoothCsvStreamEnabled()) {
+      const size_t written = controlLineStage.println();
+      controlLineStage.commit();
+      return written;
+    }
+    return ::Serial2.println();
+  }
+};
+
+static BluetoothSerialMux bluetoothSerialMux;
+#define Serial2 bluetoothSerialMux
 
 const float TEST_DRIVE_MIN_METRES = 0.01;
 const float TEST_DRIVE_MAX_METRES = 1.50;
@@ -39,6 +203,13 @@ const float TEST_TURN_MIN_DEG = -360.0;
 const float TEST_TURN_MAX_DEG = 360.0;
 const float TEST_TURN_PULSE_MIN_SECONDS = 0.10;
 const float TEST_TURN_PULSE_MAX_SECONDS = 0.80;
+const float TEST_ARC_MIN_FORWARD_TPS = 300.0;
+const float TEST_ARC_MAX_FORWARD_TPS = 1800.0;
+const float TEST_ARC_MAX_ABS_TURN_TPS = 500.0;
+const float TEST_ARC_MIN_SECONDS = 0.10;
+const float TEST_ARC_MAX_SECONDS = 0.80;
+const unsigned long TEST_TRUTH_FIRST_SAMPLE_MS = 120;
+const unsigned long TEST_TRUTH_SAMPLE_INTERVAL_MS = 1000;
 const unsigned long TEST_TURN_PULSE_SAMPLE_INTERVAL_MS = 100;
 const unsigned long TEST_TURN_PULSE_COAST_MS = 1000;
 const unsigned long TEST_TURN_LADDER_PULSE_MS = 250;
@@ -58,7 +229,6 @@ const float SEARCHTURN_MAX_US = WEIGHT_SCAN_TURN_OFFSET_MAX_US;
 const float MANUAL_COMMAND_MIN = -100.0;
 const float MANUAL_COMMAND_MAX = 100.0;
 const unsigned long MANUAL_DRIVE_TIMEOUT_MS = 350;
-const unsigned long BLUETOOTH_TELEMETRY_INTERVAL_MS = 100;
 
 static bool commandEquals(const char* command, const char* expected) {
   while (*command != '\0' && *expected != '\0') {
@@ -148,6 +318,29 @@ static bool parseTwoFloatArguments(const char* text, float &first, float &second
   return *secondEndPtr == '\0';
 }
 
+static bool parseThreeFloatArguments(const char* text, float &first,
+                                     float &second, float &third) {
+  char* endPtr = NULL;
+  double values[3];
+  for (int i = 0; i < 3; i++) {
+    values[i] = strtod(text, &endPtr);
+    if (endPtr == text || values[i] != values[i]) {
+      return false;
+    }
+    text = endPtr;
+    while (*text != '\0' && isspace(*text)) {
+      text++;
+    }
+  }
+  if (*text != '\0') {
+    return false;
+  }
+  first = (float)values[0];
+  second = (float)values[1];
+  third = (float)values[2];
+  return true;
+}
+
 static void trimCommand(char* command) {
   int length = strlen(command);
 
@@ -178,6 +371,7 @@ static void printBluetoothHelp() {
   Serial2.println("  BUILD          print firmware build label");
   Serial2.println("  START          start robot navigation");
   Serial2.println("  STATUS or P    print robot status");
+  Serial2.println("  LOOP RESET     reset loop-gap diagnostics while motors are neutral");
   Serial2.println("  STREAM ON      send status as fast as the telemetry loop allows");
   Serial2.println("  STREAM OFF     stop periodic status");
   Serial2.println("  CSV ON         send CSV telemetry as fast as the telemetry loop allows");
@@ -201,13 +395,14 @@ static void printBluetoothHelp() {
   Serial2.println("  TEST HUNT      drive to confirmed object target after TEST ARM");
   Serial2.println("  TEST SEARCH    run waypoint-style weight scan/search after TEST ARM");
   Serial2.println("  TEST SIDE <s>  sample avoidance side choice without moving");
-  Serial2.println("  TEST TURN <d>  turn a fixed signed angle in degrees");
-  Serial2.println("  TEST TURNPULSE <signed_s>  full-rate timed turn, then log 1 s coast");
-  Serial2.println("  TEST TURNLADDER LEFT|RIGHT  raw slow-pulse calibration ladder");
+  Serial2.println("  TEST TURN <d>  signed angle; positive is CCW/left");
+  Serial2.println("  TEST ARC <forward_tps> <turn_tps> <s>  bounded wheel-PID sign diagnostic");
+  Serial2.println("  TEST TURNPULSE <signed_s>  positive is CCW/left; log 1 s coast");
+  Serial2.println("  TEST TURNLADDER LEFT|RIGHT  disabled until nonblocking P0-06 conversion");
   Serial2.println("  MARK <note>    print and log a test note");
   Serial2.println("  MANUAL ARM     allow live DRIVE commands");
   Serial2.println("  MANUAL DISARM  stop and disable live DRIVE commands");
-  Serial2.println("  DRIVE <f> <t>  live drive, forward/turn from -100 to 100");
+  Serial2.println("  DRIVE <f> <t>  live drive; positive turn is CCW/left");
   Serial2.println("  HOME           request return home");
   Serial2.println("  ZERO           zero yaw and pose");
   Serial2.println("  STOP or S      stop motors and end match");
@@ -236,6 +431,7 @@ static int displayWaypointIndex() {
 }
 
 void sendBluetoothStatus() {
+  beginTelemetryRow();
   long leftCount;
   long rightCount;
   readEncoderCounts(leftCount, rightCount);
@@ -252,6 +448,38 @@ void sendBluetoothStatus() {
   Serial2.print(bluetoothManualArmed ? 1 : 0);
   Serial2.print(" manualActive=");
   Serial2.print(bluetoothManualActive ? 1 : 0);
+  Serial2.print(" authority=");
+  Serial2.print(motionAuthorityName(motionAuthority));
+  Serial2.print(" goalAuthority=");
+  Serial2.print(motionAuthorityName(navigationGoal.authority));
+  Serial2.print(" safetyStop=");
+  Serial2.print(isMotionSafetyStopActive() ? 1 : 0);
+  Serial2.print(" safetyReason=");
+  Serial2.print(motionSafetyReasonName(lastMotionSafetyReason()));
+  Serial2.print(" watchdogReady=");
+  Serial2.print(isMotorSafetyWatchdogReady() ? 1 : 0);
+  Serial2.print(" commandLease=");
+  Serial2.print(isMotorCommandLeaseArmed() ? 1 : 0);
+  Serial2.print(" leaseTrips=");
+  Serial2.print(motorCommandLeaseTripCount());
+  Serial2.print(" loopGapMs=");
+  Serial2.print(currentMainLoopGapMs());
+  Serial2.print(" loopMaxMs=");
+  Serial2.print(maximumMainLoopGapMs());
+  Serial2.print(" loopMisses=");
+  Serial2.print(mainLoopDeadlineMissCount());
+  Serial2.print(" loopWorstPhase=");
+  Serial2.print(maximumMainLoopPhaseName());
+  Serial2.print(" loopWorstPhaseUs=");
+  Serial2.print(maximumMainLoopPhaseUs());
+  Serial2.print(" telemetryQueuedRows=");
+  Serial2.print(telemetryQueuedRows);
+  Serial2.print(" telemetryQueuedBytes=");
+  Serial2.print(telemetryQueueBytes);
+  Serial2.print(" telemetryDroppedRows=");
+  Serial2.print(telemetryDroppedRows);
+  Serial2.print(" telemetryRateLimitedEvents=");
+  Serial2.print(telemetryRateLimitedEvents);
   Serial2.print(" waypoint=");
   Serial2.print(displayWaypointIndex());
   Serial2.print("/");
@@ -345,6 +573,20 @@ void sendBluetoothStatus() {
   Serial2.print(desiredForwardSpeed, 1);
   Serial2.print(" cmdTurn=");
   Serial2.print(desiredTurnSpeed, 1);
+  Serial2.print(" wheelTargetL=");
+  Serial2.print(lastRequestedLeftWheelSpeed, 1);
+  Serial2.print(" wheelTargetR=");
+  Serial2.print(lastRequestedRightWheelSpeed, 1);
+  Serial2.print(" wheelRateL=");
+  Serial2.print(lastMeasuredLeftWheelSpeed, 1);
+  Serial2.print(" wheelRateR=");
+  Serial2.print(lastMeasuredRightWheelSpeed, 1);
+  Serial2.print(" imuRawCw=");
+  Serial2.print(lastImuClockwiseYawDeg, 2);
+  Serial2.print(" navYaw=");
+  Serial2.print(lastNavigationHeadingDeg, 2);
+  Serial2.print(" motorMode=");
+  Serial2.print(lastMotorOutputMode);
   Serial2.print(" plannerCandidates=");
   Serial2.print(plannerTelemetry.candidateCount);
   Serial2.print(" plannerV=");
@@ -357,6 +599,40 @@ void sendBluetoothStatus() {
   Serial2.print(plannerStopReasonName(plannerTelemetry.stopReason));
   Serial2.print(" plannerReason=");
   Serial2.print(plannerTelemetry.planReason);
+  Serial2.print(" plannerTiming=");
+  Serial2.print(plannerTelemetry.plannerSliceUs);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerSliceMaxUs);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerEpochWorkUs);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerEpochMaxWorkUs);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerEpochAgeMs);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerCommandAgeMs);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerCandidatesProcessed);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerYieldCount);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.plannerEpochActive ? 1 : 0);
+  Serial2.print(" recovery=");
+  Serial2.print(plannerTelemetry.globalGoalDistanceM, 2);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.localGoalDistanceM, 2);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.routeAlongProgressM, 2);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 2);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 1);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 2);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.recoveryCount);
+  Serial2.print("/");
+  Serial2.print(plannerTelemetry.recoveryBestProgressM, 2);
   Serial2.print(" objectTarget=");
   Serial2.print(objectTargetEstimate.valid ? 1 : 0);
   Serial2.print("/");
@@ -371,13 +647,17 @@ void sendBluetoothStatus() {
   Serial2.print(objectTargetEstimate.robotYmm, 1);
   Serial2.print("/");
   Serial2.println(objectTargetEstimate.sourceMask);
+  commitTelemetryRow();
 }
 
 static void sendBluetoothCsvHeader() {
-  Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,front_virtual_mm,front_virtual_valid,fake_rear_mm,fake_rear_valid,fake_rear_blocked,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn,planner_candidates,planner_v_tps,planner_w_tps,planner_curvature,planner_min_clearance_mm,planner_speed_cap_tps,planner_goal_distance_m,planner_stop,planner_reason,planner_replan,planner_safe_stop,object_candidate,object_confirmed,object_direction,object_range_mm,object0_mm,object1_mm,object2_mm,object3_mm,object0_valid,object1_valid,object2_valid,object3_valid,object0_range_status,object1_range_status,object2_range_status,object3_range_status,object_reason,object_target_valid,object_target_fresh,object_target_world_x_m,object_target_world_y_m,object_target_robot_x_mm,object_target_robot_y_mm,object_target_sources,object_target_reason");
+  beginTelemetryRow();
+  Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,front_virtual_mm,front_virtual_valid,fake_rear_mm,fake_rear_valid,fake_rear_blocked,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn,planner_candidates,planner_v_tps,planner_w_tps,planner_curvature,planner_min_clearance_mm,planner_speed_cap_tps,planner_goal_distance_m,planner_global_goal_distance_m,planner_route_progress_m,planner_signed_lateral_error_m,planner_recovery_phase_time_s,planner_recovery_distance_m,planner_recovery_count,planner_best_progress_m,planner_stop,planner_reason,planner_replan,planner_safe_stop,object_candidate,object_confirmed,object_direction,object_range_mm,object0_mm,object1_mm,object2_mm,object3_mm,object0_valid,object1_valid,object2_valid,object3_valid,object0_range_status,object1_range_status,object2_range_status,object3_range_status,object_reason,object_target_valid,object_target_fresh,object_target_world_x_m,object_target_world_y_m,object_target_robot_x_mm,object_target_robot_y_mm,object_target_sources,object_target_reason,wheel_target_l_tps,wheel_target_r_tps,wheel_rate_l_tps,wheel_rate_r_tps,imu_raw_cw_deg,nav_yaw_deg,motor_mode,motion_authority,lease_trips,loop_gap_ms,loop_max_ms,loop_misses,loop_worst_phase,loop_worst_phase_us,telemetry_queued_rows,telemetry_queued_bytes,telemetry_dropped_rows,telemetry_rate_limited_events,planner_slice_us,planner_slice_max_us,planner_epoch_work_us,planner_epoch_max_work_us,planner_epoch_age_ms,planner_command_age_ms,planner_candidates_processed,planner_yields,planner_epoch_active");
+  commitTelemetryRow();
 }
 
 static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName, const char* eventDetail) {
+  beginTelemetryRow();
   long leftCount;
   long rightCount;
   readEncoderCounts(leftCount, rightCount);
@@ -489,6 +769,20 @@ static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName,
   Serial2.print(",");
   Serial2.print(plannerTelemetry.localGoalDistanceM, 3);
   Serial2.print(",");
+  Serial2.print(plannerTelemetry.globalGoalDistanceM, 3);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.routeAlongProgressM, 3);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 3);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 2);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 3);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.recoveryCount);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.recoveryBestProgressM, 3);
+  Serial2.print(",");
   Serial2.print(plannerStopReasonName(plannerTelemetry.stopReason));
   Serial2.print(",");
   Serial2.print(plannerTelemetry.planReason);
@@ -533,19 +827,151 @@ static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName,
   Serial2.print(",");
   Serial2.print(objectTargetEstimate.sourceMask);
   Serial2.print(",");
-  Serial2.println(objectTargetEstimate.reason);
+  Serial2.print(objectTargetEstimate.reason);
+  Serial2.print(",");
+  Serial2.print(lastRequestedLeftWheelSpeed, 1);
+  Serial2.print(",");
+  Serial2.print(lastRequestedRightWheelSpeed, 1);
+  Serial2.print(",");
+  Serial2.print(lastMeasuredLeftWheelSpeed, 1);
+  Serial2.print(",");
+  Serial2.print(lastMeasuredRightWheelSpeed, 1);
+  Serial2.print(",");
+  Serial2.print(lastImuClockwiseYawDeg, 2);
+  Serial2.print(",");
+  Serial2.print(lastNavigationHeadingDeg, 2);
+  Serial2.print(",");
+  Serial2.print(lastMotorOutputMode);
+  Serial2.print(",");
+  Serial2.print(motionAuthorityName(motionAuthority));
+  Serial2.print(",");
+  Serial2.print(motorCommandLeaseTripCount());
+  Serial2.print(",");
+  Serial2.print(currentMainLoopGapMs());
+  Serial2.print(",");
+  Serial2.print(maximumMainLoopGapMs());
+  Serial2.print(",");
+  Serial2.print(mainLoopDeadlineMissCount());
+  Serial2.print(",");
+  Serial2.print(maximumMainLoopPhaseName());
+  Serial2.print(",");
+  Serial2.print(maximumMainLoopPhaseUs());
+  Serial2.print(",");
+  Serial2.print(telemetryQueuedRows);
+  Serial2.print(",");
+  Serial2.print(telemetryQueueBytes);
+  Serial2.print(",");
+  Serial2.print(telemetryDroppedRows);
+  Serial2.print(",");
+  Serial2.print(telemetryRateLimitedEvents);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerSliceUs);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerSliceMaxUs);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerEpochWorkUs);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerEpochMaxWorkUs);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerEpochAgeMs);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerCommandAgeMs);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerCandidatesProcessed);
+  Serial2.print(",");
+  Serial2.print(plannerTelemetry.plannerYieldCount);
+  Serial2.print(",");
+  Serial2.println(plannerTelemetry.plannerEpochActive ? 1 : 0);
+  commitTelemetryRow();
 }
-
 static void sendBluetoothCsvRow() {
   sendBluetoothCsvSnapshot("telemetry", "", "");
+}
+
+// Compact 10 Hz safety/sign/liveness schema consumed by desktop tools as a
+// normal telemetry row. Distances, object detail, and verbose planner strings
+// remain in the slower full snapshot.
+static void sendBluetoothMotionRow() {
+  beginTelemetryRow();
+  Serial2.print("motion,");
+  Serial2.print(millis());
+  Serial2.print(","); Serial2.print(robotStateName(currentState));
+  Serial2.print(","); Serial2.print(robotRunEnabled ? 1 : 0);
+  Serial2.print(","); Serial2.print(bluetoothTestArmed ? 1 : 0);
+  Serial2.print(","); Serial2.print(robotX, 3);
+  Serial2.print(","); Serial2.print(robotY, 3);
+  Serial2.print(","); Serial2.print(robotTheta, 2);
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
+    Serial2.print(","); Serial2.print(isRangeSensorValid((RangeSensorId)i) ? 1 : 0);
+  }
+  const unsigned long now = millis();
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
+    Serial2.print(","); Serial2.print(now - rangeSensors[i].lastReadMs);
+  }
+  Serial2.print(","); Serial2.print(frontBlocked ? 1 : 0);
+  Serial2.print(","); Serial2.print(lastLeftMotorUs);
+  Serial2.print(","); Serial2.print(lastRightMotorUs);
+  Serial2.print(","); Serial2.print(plannerTelemetry.candidateCount);
+  Serial2.print(","); Serial2.print(plannerTelemetry.selectedForwardTicksPerSec, 1);
+  Serial2.print(","); Serial2.print(plannerTelemetry.selectedTurnTicksPerSec, 1);
+  Serial2.print(","); Serial2.print(plannerTelemetry.minimumSweptClearanceMm, 1);
+  Serial2.print(","); Serial2.print(plannerTelemetry.speedCapTicksPerSec, 1);
+  Serial2.print(","); Serial2.print(plannerTelemetry.globalGoalDistanceM, 3);
+  Serial2.print(","); Serial2.print(plannerTelemetry.routeAlongProgressM, 3);
+  Serial2.print(","); Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 3);
+  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 2);
+  Serial2.print(","); Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 3);
+  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryCount);
+  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryBestProgressM, 3);
+  Serial2.print(","); Serial2.print(plannerStopReasonName(plannerTelemetry.stopReason));
+  Serial2.print(","); Serial2.print(lastRequestedLeftWheelSpeed, 1);
+  Serial2.print(","); Serial2.print(lastRequestedRightWheelSpeed, 1);
+  Serial2.print(","); Serial2.print(lastMeasuredLeftWheelSpeed, 1);
+  Serial2.print(","); Serial2.print(lastMeasuredRightWheelSpeed, 1);
+  Serial2.print(","); Serial2.print(lastImuClockwiseYawDeg, 2);
+  Serial2.print(","); Serial2.print(lastNavigationHeadingDeg, 2);
+  Serial2.print(","); Serial2.print(lastMotorOutputMode);
+  Serial2.print(","); Serial2.print(motionAuthorityName(motionAuthority));
+  Serial2.print(","); Serial2.print(motorCommandLeaseTripCount());
+  Serial2.print(","); Serial2.print(maximumMainLoopGapMs());
+  Serial2.print(","); Serial2.print(mainLoopDeadlineMissCount());
+  Serial2.print(","); Serial2.print(maximumMainLoopPhaseName());
+  Serial2.print(","); Serial2.print(maximumMainLoopPhaseUs());
+  Serial2.print(","); Serial2.print(telemetryDroppedRows);
+  Serial2.print(","); Serial2.print(plannerTelemetry.plannerSliceMaxUs);
+  Serial2.print(","); Serial2.print(plannerTelemetry.plannerEpochMaxWorkUs);
+  Serial2.print(","); Serial2.print(plannerTelemetry.plannerEpochAgeMs);
+  Serial2.println();
+  commitTelemetryRow(TELEMETRY_MOTION_ROW_BUDGET_BYTES);
 }
 
 void sendBluetoothEvent(const char* eventName, const char* eventDetail) {
   if (!bluetoothCsvStreamEnabled) {
     return;
   }
+  const unsigned long now = millis();
+  if (strcmp(eventName, lastTelemetryEventName) == 0 &&
+      strcmp(eventDetail, lastTelemetryEventDetail) == 0 &&
+      now - lastTelemetryEventMs < TELEMETRY_DUPLICATE_EVENT_LIMIT_MS) {
+    telemetryRateLimitedEvents++;
+    return;
+  }
+  strncpy(lastTelemetryEventName, eventName, sizeof(lastTelemetryEventName) - 1);
+  lastTelemetryEventName[sizeof(lastTelemetryEventName) - 1] = '\0';
+  strncpy(lastTelemetryEventDetail, eventDetail, sizeof(lastTelemetryEventDetail) - 1);
+  lastTelemetryEventDetail[sizeof(lastTelemetryEventDetail) - 1] = '\0';
+  lastTelemetryEventMs = now;
 
-  sendBluetoothCsvSnapshot("event", eventName, eventDetail);
+  // Events intentionally carry only their identity and timestamp. Repeating a
+  // full telemetry snapshot for every burst was the failed run's worst case.
+  beginTelemetryRow();
+  telemetryStage.print("event,");
+  telemetryStage.print(eventName);
+  telemetryStage.print(",");
+  telemetryStage.print(eventDetail);
+  telemetryStage.print(",");
+  telemetryStage.println(now);
+  commitTelemetryEventRow();
 }
 
 void sendBluetoothTelemetry() {
@@ -553,14 +979,19 @@ void sendBluetoothTelemetry() {
     return;
   }
 
-  unsigned long now = millis();
-  if (now - lastBluetoothTelemetryMs < BLUETOOTH_TELEMETRY_INTERVAL_MS) {
-    return;
+  const unsigned long now = millis();
+  if (bluetoothCsvStreamEnabled &&
+      now - lastBluetoothMotionTelemetryMs >= TELEMETRY_MOTION_INTERVAL_MS) {
+    lastBluetoothMotionTelemetryMs = now;
+    sendBluetoothMotionRow();
   }
 
-  lastBluetoothTelemetryMs = now;
+  if (now - lastBluetoothFullTelemetryMs < TELEMETRY_FULL_INTERVAL_MS) {
+    return;
+  }
+  lastBluetoothFullTelemetryMs = now;
 
-  if (bluetoothStreamEnabled) {
+  if (bluetoothStreamEnabled && !bluetoothCsvStreamEnabled) {
     sendBluetoothStatus();
   }
 
@@ -669,7 +1100,7 @@ static void stopManualDrive() {
 }
 
 static void runManualDriveCommand(float forwardPercent, float turnPercent) {
-  if (!bluetoothManualArmed) {
+  if (!bluetoothManualArmed || motionAuthority != MOTION_AUTHORITY_MANUAL) {
     Serial2.println("ERROR manual drive is disarmed. Send MANUAL ARM first.");
     return;
   }
@@ -708,9 +1139,14 @@ static void runManualDriveCommand(float forwardPercent, float turnPercent) {
 
   // Manual drive remains deliberately direct in intent, but it now feeds the
   // same single motor-output path as autonomous navigation.
-  setMotionCommand(baseTargetSpeed * forwardPercent / 100.0,
-                   baseTargetSpeed * turnPercent / 100.0);
-  motorStopRequested = false;
+  if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_MANUAL,
+                                  baseTargetSpeed * forwardPercent / 100.0,
+                                  baseTargetSpeed * turnPercent / 100.0)) {
+    bluetoothManualActive = false;
+    Serial2.print("MANUAL blocked by continuous safety supervisor: ");
+    Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
+    return;
+  }
 
   bluetoothManualActive = forwardPercent != 0.0 || turnPercent != 0.0;
   lastManualDriveCommandMs = millis();
@@ -733,7 +1169,7 @@ void updateManualDriveTimeout() {
 }
 
 static bool requireBluetoothTestArm() {
-  if (bluetoothTestArmed) {
+  if (bluetoothTestArmed && motionAuthority == MOTION_AUTHORITY_TEST) {
     return true;
   }
 
@@ -1003,8 +1439,179 @@ static void runBluetoothTestTurn(float angleDeg) {
   Serial2.println(" deg.");
 
   beginBluetoothTestMotion();
+  turnTruthStartMs = millis();
+  turnTruthNextSampleMs = turnTruthStartMs + TEST_TRUTH_FIRST_SAMPLE_MS;
+  bluetoothTurnTruthActive = true;
   sendBluetoothEvent("test_turn_start", "manual");
   startNavigationTurn(angleDeg, NAV_OWNER_TEST_TURN);
+}
+
+static void printBluetoothTurnTruth(const char* phase) {
+  long leftCount;
+  long rightCount;
+  readEncoderCounts(leftCount, rightCount);
+  Serial2.print("turn_truth,"); Serial2.print(phase);
+  Serial2.print(",ms="); Serial2.print(millis() - turnTruthStartMs);
+  Serial2.print(";tl="); Serial2.print(lastRequestedLeftWheelSpeed, 1);
+  Serial2.print(";tr="); Serial2.print(lastRequestedRightWheelSpeed, 1);
+  Serial2.print(";pl="); Serial2.print(lastLeftMotorUs);
+  Serial2.print(";pr="); Serial2.print(lastRightMotorUs);
+  Serial2.print(";el="); Serial2.print(leftCount);
+  Serial2.print(";er="); Serial2.print(rightCount);
+  Serial2.print(";rl="); Serial2.print(lastMeasuredLeftWheelSpeed, 1);
+  Serial2.print(";rr="); Serial2.print(lastMeasuredRightWheelSpeed, 1);
+  Serial2.print(";ir="); Serial2.print(lastImuClockwiseYawDeg, 2);
+  Serial2.print(";ny="); Serial2.print(lastNavigationHeadingDeg, 2);
+  Serial2.print(";m="); Serial2.print(lastMotorOutputMode);
+  Serial2.print(";a="); Serial2.print(motionAuthorityName(motionAuthority));
+  Serial2.print(";lt="); Serial2.println(motorCommandLeaseTripCount());
+}
+
+static void updateBluetoothTurnTruth() {
+  if (!bluetoothTurnTruthActive) {
+    return;
+  }
+  const unsigned long now = millis();
+  if (navigationGoal.active && navigationGoal.owner == NAV_OWNER_TEST_TURN) {
+    if (now >= turnTruthNextSampleMs) {
+      printBluetoothTurnTruth("d");
+      turnTruthNextSampleMs = now + TEST_TRUTH_SAMPLE_INTERVAL_MS;
+    }
+    return;
+  }
+
+  printBluetoothTurnTruth(navigationGoal.completed ? "e" : "x");
+  Serial2.print(navigationGoal.completed ? "test_turn_end," : "test_turn_abort,");
+  Serial2.println(plannerTelemetry.safeStopReason);
+  bluetoothTurnTruthActive = false;
+}
+
+static void finishBluetoothArcTest(const char* detail) {
+  long leftCount;
+  long rightCount;
+  readEncoderCounts(leftCount, rightCount);
+  Serial2.print("arc_truth,e,ms=");
+  Serial2.print(millis() - arcTestStartMs);
+  Serial2.print(";f="); Serial2.print(arcTestForwardTicksPerSec, 1);
+  Serial2.print(";t="); Serial2.print(arcTestTurnTicksPerSec, 1);
+  Serial2.print(";tl="); Serial2.print(lastRequestedLeftWheelSpeed, 1);
+  Serial2.print(";tr="); Serial2.print(lastRequestedRightWheelSpeed, 1);
+  Serial2.print(";pl="); Serial2.print(lastLeftMotorUs);
+  Serial2.print(";pr="); Serial2.print(lastRightMotorUs);
+  Serial2.print(";el="); Serial2.print(leftCount);
+  Serial2.print(";er="); Serial2.print(rightCount);
+  Serial2.print(";rl="); Serial2.print(lastMeasuredLeftWheelSpeed, 1);
+  Serial2.print(";rr="); Serial2.print(lastMeasuredRightWheelSpeed, 1);
+  Serial2.print(";ir="); Serial2.print(lastImuClockwiseYawDeg, 2);
+  Serial2.print(";ny="); Serial2.print(lastNavigationHeadingDeg, 2);
+  Serial2.print(";m="); Serial2.print(lastMotorOutputMode);
+  Serial2.print(";lt="); Serial2.println(motorCommandLeaseTripCount());
+  bluetoothArcTestActive = false;
+  bluetoothManualActive = false;
+  robotRunEnabled = false;
+  setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST, 0.0, 0.0);
+  stopMotors();
+  setRobotState(END_MATCH);
+  sendBluetoothEvent("test_arc_end", detail);
+  Serial2.print("test_arc_end,");
+  Serial2.println(detail);
+  Serial2.println("TEST ARC complete; motors neutral.");
+}
+
+static void runBluetoothTestArc(float forwardTicksPerSec,
+                                float turnTicksPerSec,
+                                float durationSeconds) {
+  if (!requireBluetoothTestArm()) {
+    return;
+  }
+  const float leftTarget = leftWheelTargetFromChassis(
+    forwardTicksPerSec, turnTicksPerSec);
+  const float rightTarget = rightWheelTargetFromChassis(
+    forwardTicksPerSec, turnTicksPerSec);
+  if (forwardTicksPerSec < TEST_ARC_MIN_FORWARD_TPS ||
+      forwardTicksPerSec > TEST_ARC_MAX_FORWARD_TPS ||
+      fabs(turnTicksPerSec) > TEST_ARC_MAX_ABS_TURN_TPS ||
+      durationSeconds < TEST_ARC_MIN_SECONDS ||
+      durationSeconds > TEST_ARC_MAX_SECONDS ||
+      leftTarget < 0.0f || rightTarget < 0.0f) {
+    Serial2.println(
+      "ERROR TEST ARC requires forward 300..1800 tps, |turn| <=500 tps, "
+      "duration 0.10..0.80 s, and nonnegative wheel targets.");
+    return;
+  }
+
+  updateTOFSensors();
+  arcTestForwardTicksPerSec = forwardTicksPerSec;
+  arcTestTurnTicksPerSec = turnTicksPerSec;
+  arcTestStartMs = millis();
+  arcTestEndMs = arcTestStartMs + (unsigned long)(durationSeconds * 1000.0f);
+  arcTestNextSampleMs = arcTestStartMs + TEST_TRUTH_FIRST_SAMPLE_MS;
+  bluetoothArcTestActive = true;
+  // Reuse the existing direct-motion scheduler guard so RobotCode.ino does
+  // not overwrite this TEST-authority command with the idle stop branch.
+  bluetoothManualActive = true;
+  lastManualDriveCommandMs = millis();
+  bluetoothAbortMotionRequested = false;
+  robotRunEnabled = false;
+  clearStuckFlags();
+  if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST,
+                                  arcTestForwardTicksPerSec,
+                                  arcTestTurnTicksPerSec)) {
+    bluetoothArcTestActive = false;
+    Serial2.print("ERROR TEST ARC refused by continuous safety supervisor: ");
+    Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
+    return;
+  }
+
+  char detail[64];
+  snprintf(detail, sizeof(detail), "f=%.0f;t=%.0f;l=%.0f;r=%.0f;ms=%lu",
+           forwardTicksPerSec, turnTicksPerSec, leftTarget, rightTarget,
+           (unsigned long)(durationSeconds * 1000.0f));
+  sendBluetoothEvent("test_arc_start", detail);
+  Serial2.print("OK TEST ARC ");
+  Serial2.println(detail);
+}
+
+static void updateBluetoothArcTest() {
+  if (!bluetoothArcTestActive) {
+    return;
+  }
+  if (millis() >= arcTestEndMs) {
+    finishBluetoothArcTest("duration_complete");
+    return;
+  }
+  bluetoothManualActive = true;
+  lastManualDriveCommandMs = millis();
+  if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST,
+                                  arcTestForwardTicksPerSec,
+                                  arcTestTurnTicksPerSec)) {
+    finishBluetoothArcTest("safety_abort");
+    return;
+  }
+  const unsigned long now = millis();
+  if (now >= arcTestNextSampleMs) {
+    long leftCount;
+    long rightCount;
+    readEncoderCounts(leftCount, rightCount);
+    Serial2.print("arc_truth,d,ms=");
+    Serial2.print(now - arcTestStartMs);
+    Serial2.print(";f="); Serial2.print(arcTestForwardTicksPerSec, 1);
+    Serial2.print(";t="); Serial2.print(arcTestTurnTicksPerSec, 1);
+    Serial2.print(";tl="); Serial2.print(lastRequestedLeftWheelSpeed, 1);
+    Serial2.print(";tr="); Serial2.print(lastRequestedRightWheelSpeed, 1);
+    Serial2.print(";pl="); Serial2.print(lastLeftMotorUs);
+    Serial2.print(";pr="); Serial2.print(lastRightMotorUs);
+    Serial2.print(";el="); Serial2.print(leftCount);
+    Serial2.print(";er="); Serial2.print(rightCount);
+    Serial2.print(";rl="); Serial2.print(lastMeasuredLeftWheelSpeed, 1);
+    Serial2.print(";rr="); Serial2.print(lastMeasuredRightWheelSpeed, 1);
+    Serial2.print(";ir="); Serial2.print(lastImuClockwiseYawDeg, 2);
+    Serial2.print(";ny="); Serial2.print(lastNavigationHeadingDeg, 2);
+    Serial2.print(";m="); Serial2.print(lastMotorOutputMode);
+    Serial2.print(";a="); Serial2.print(motionAuthorityName(motionAuthority));
+    Serial2.print(";lt="); Serial2.println(motorCommandLeaseTripCount());
+    arcTestNextSampleMs = now + TEST_TRUTH_SAMPLE_INTERVAL_MS;
+  }
 }
 
 static void printTurnPulseSample(const char* phase) {
@@ -1012,14 +1619,15 @@ static void printTurnPulseSample(const char* phase) {
   Serial2.print(phase);
   Serial2.print(",elapsed_ms,");
   Serial2.print(millis() - turnPulseStartMs);
-  Serial2.print(",yaw_deg,");
-  Serial2.print(wrapAngle(readYawDeg() - turnPulseStartYawDeg), 2);
+  Serial2.print(",nav_heading_delta_deg,");
+  Serial2.print(wrapAngle(navigationHeadingDeg() - turnPulseStartHeadingDeg), 2);
   Serial2.print(",command_tps,");
   Serial2.println(turnPulseCoasting ? 0.0 : turnPulseCommandTicksPerSec, 1);
 }
 
 static void finishBluetoothTurnPulseTest() {
-  float finalYawDeg = wrapAngle(readYawDeg() - turnPulseStartYawDeg);
+  float finalHeadingDeg = wrapAngle(
+    navigationHeadingDeg() - turnPulseStartHeadingDeg);
   bluetoothTurnPulseTestActive = false;
   turnPulseCoasting = false;
   bluetoothManualActive = false;
@@ -1027,8 +1635,8 @@ static void finishBluetoothTurnPulseTest() {
   motorStopRequested = true;
   setMotionCommand(0.0, 0.0);
   setRobotState(END_MATCH);
-  Serial2.print("TURNPULSE complete: final_yaw_deg=");
-  Serial2.println(finalYawDeg, 2);
+  Serial2.print("TURNPULSE complete: final_nav_heading_delta_deg=");
+  Serial2.println(finalHeadingDeg, 2);
   sendBluetoothEvent("test_turnpulse_end", "coast_logged");
 }
 
@@ -1061,7 +1669,7 @@ static void runBluetoothTestTurnPulse(float signedSeconds) {
   bluetoothManualActive = true;
   robotRunEnabled = false;
   clearStuckFlags();
-  turnPulseStartYawDeg = readYawDeg();
+  turnPulseStartHeadingDeg = navigationHeadingDeg();
   unsigned long now = millis();
   turnPulseStartMs = now;
   turnPulseEndMs = now + (unsigned long)(durationSeconds * 1000.0);
@@ -1069,8 +1677,13 @@ static void runBluetoothTestTurnPulse(float signedSeconds) {
   turnPulseNextSampleMs = now;
   turnPulseCoasting = false;
   bluetoothTurnPulseTestActive = true;
-  motorStopRequested = false;
-  setMotionCommand(0.0, turnPulseCommandTicksPerSec);
+  if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST, 0.0,
+                                  turnPulseCommandTicksPerSec)) {
+    Serial2.print("ERROR TEST TURNPULSE refused by continuous safety supervisor: ");
+    Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
+    finishBluetoothTurnPulseTest();
+    return;
+  }
 
   Serial2.print("OK turn pulse ");
   Serial2.print(signedSeconds, 2);
@@ -1079,102 +1692,10 @@ static void runBluetoothTestTurnPulse(float signedSeconds) {
 }
 
 static void runBluetoothTestTurnLadder(const char* directionText) {
-  if (!requireBluetoothTestArm()) {
-    return;
-  }
-
-  bool rightTurn = false;
-  if (commandEquals(directionText, "RIGHT")) {
-    rightTurn = true;
-  } else if (commandEquals(directionText, "LEFT")) {
-    rightTurn = false;
-  } else {
-    Serial2.println("ERROR usage: TEST TURNLADDER LEFT|RIGHT");
-    return;
-  }
-
-  float safetyTurn = rightTurn ? PLANNER_TURN_SLOW_TARGET_SPEED
-                               : -PLANNER_TURN_SLOW_TARGET_SPEED;
-  updateTOFSensors();
-  if (!isTurnDirectionObservable(safetyTurn) || !isTurnSweepSafe()) {
-    Serial2.println("ERROR TEST TURNLADDER refused by turn sensing or sweep clearance.");
-    return;
-  }
-
-  if (isNavigationGoalActive()) {
-    cancelNavigationGoal(PLANNER_STOP_ABORTED, "turnladder_started");
-  }
-  cancelWeightSearch("turnladder_started");
-  bluetoothManualArmed = false;
-  bluetoothManualActive = false;
-  bluetoothTurnPulseTestActive = false;
-  robotRunEnabled = false;
-  clearStuckFlags();
-  motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
-  writeMotorUS(STOP_US, STOP_US);
-  delay(250);
-
-  Serial2.print("turn_ladder_start,direction=");
-  Serial2.print(rightTurn ? "RIGHT" : "LEFT");
-  Serial2.print(",pulse_ms=");
-  Serial2.print(TEST_TURN_LADDER_PULSE_MS);
-  Serial2.print(",coast_ms=");
-  Serial2.println(TEST_TURN_LADDER_COAST_MS);
-  sendBluetoothEvent("test_turnladder_start", rightTurn ? "right" : "left");
-
-  for (int i = 0; i < TEST_TURN_LADDER_STEP_COUNT; i++) {
-    int offset = TEST_TURN_LADDER_OFFSETS_US[i];
-    int leftUs = rightTurn ? STOP_US + offset : STOP_US - offset;
-    int rightUs = rightTurn ? STOP_US - offset : STOP_US + offset;
-
-    updateTOFSensors();
-    if (!isTurnDirectionObservable(safetyTurn) || !isTurnSweepSafe()) {
-      writeMotorUS(STOP_US, STOP_US);
-      motorStopRequested = true;
-      setMotionCommand(0.0, 0.0);
-      Serial2.println("turn_ladder_abort,reason=safety_recheck_failed");
-      sendBluetoothEvent("test_turnladder_abort", "safety_recheck_failed");
-      return;
-    }
-
-    float startYaw = readYawDeg();
-    motorStopRequested = false;
-    setMotionCommand(0.0, 0.0);
-    writeMotorUS(leftUs, rightUs);
-    delay(TEST_TURN_LADDER_PULSE_MS);
-    float driveYaw = readYawDeg();
-    writeMotorUS(STOP_US, STOP_US);
-    motorStopRequested = true;
-    setMotionCommand(0.0, 0.0);
-    delay(TEST_TURN_LADDER_COAST_MS);
-    float finalYaw = readYawDeg();
-
-    Serial2.print("turn_ladder,step=");
-    Serial2.print(i + 1);
-    Serial2.print(",direction=");
-    Serial2.print(rightTurn ? "RIGHT" : "LEFT");
-    Serial2.print(",offset_us=");
-    Serial2.print(offset);
-    Serial2.print(",left_us=");
-    Serial2.print(leftUs);
-    Serial2.print(",right_us=");
-    Serial2.print(rightUs);
-    Serial2.print(",drive_delta_deg=");
-    Serial2.print(wrapAngle(driveYaw - startYaw), 2);
-    Serial2.print(",final_delta_deg=");
-    Serial2.print(wrapAngle(finalYaw - startYaw), 2);
-    Serial2.print(",coast_delta_deg=");
-    Serial2.println(wrapAngle(finalYaw - driveYaw), 2);
-  }
-
-  writeMotorUS(STOP_US, STOP_US);
-  motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
-  robotRunEnabled = false;
-  setRobotState(END_MATCH);
-  Serial2.println("TURNLADDER complete. Motors stopped.");
-  sendBluetoothEvent("test_turnladder_end", rightTurn ? "right" : "left");
+  (void)directionText;
+  stopMotors();
+  Serial2.println(
+    "ERROR TEST TURNLADDER disabled: blocking raw pulses cannot be continuously supervised; defer conversion to P0-06.");
 }
 
 static void updateBluetoothTurnPulseTest() {
@@ -1190,8 +1711,13 @@ static void updateBluetoothTurnPulseTest() {
       finishBluetoothTurnPulseTest();
       return;
     }
-    motorStopRequested = false;
-    setMotionCommand(0.0, turnPulseCommandTicksPerSec);
+    if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST, 0.0,
+                                    turnPulseCommandTicksPerSec)) {
+      Serial2.print("TURNPULSE aborted by continuous safety supervisor: ");
+      Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
+      finishBluetoothTurnPulseTest();
+      return;
+    }
     bluetoothManualActive = true;
     lastManualDriveCommandMs = now;
     if (now >= turnPulseEndMs) {
@@ -1282,8 +1808,33 @@ static void setBluetoothForwardBase(float leftBaseUs, float rightBaseUs) {
   sendBluetoothEvent("fbase_set", "manual");
 }
 
-static void zeroRobotPoseFromBluetooth() {
+static void revokeAndCancelAllMotion(const char* detail) {
+  // Revoke at the motor sink first. Any stale planner command issued during
+  // cleanup is rejected before it can become a physical motor output.
+  revokeMotionAuthority();
+  bluetoothManualActive = false;
+  bluetoothTurnPulseTestActive = false;
+  bluetoothArcTestActive = false;
+  bluetoothSideTestActive = false;
+  if (isNavigationGoalActive()) {
+    cancelNavigationGoal(PLANNER_STOP_ABORTED, detail);
+  }
+  if (isWeightSearchActive()) {
+    cancelWeightSearch(detail);
+  }
   stopMotors();
+}
+
+void disarmBluetoothMotionModes() {
+  bluetoothTestArmed = false;
+  bluetoothManualArmed = false;
+  bluetoothManualActive = false;
+  bluetoothTurnPulseTestActive = false;
+  bluetoothArcTestActive = false;
+}
+
+static void zeroRobotPoseFromBluetooth() {
+  revokeAndCancelAllMotion("zero_command");
   zeroYaw();
 
   robotX = 0.0;
@@ -1317,6 +1868,8 @@ static bool handleCoreBluetoothCommand(const char* command) {
   }
 
   if (commandEquals(command, "START")) {
+    revokeAndCancelAllMotion("start_authority_transition");
+    claimMotionAuthority(MOTION_AUTHORITY_MISSION);
     robotRunEnabled = true;
     bluetoothTestArmed = false;
     bluetoothManualArmed = false;
@@ -1337,6 +1890,17 @@ static bool handleCoreBluetoothCommand(const char* command) {
 
   if (commandEquals(command, "STATUS") || commandEquals(command, "P")) {
     sendBluetoothStatus();
+    return true;
+  }
+
+  if (commandEquals(command, "LOOP RESET")) {
+    if (lastLeftMotorUs != STOP_US || lastRightMotorUs != STOP_US ||
+        isMotorCommandLeaseArmed()) {
+      Serial2.println("ERROR LOOP RESET requires neutral motors and an inactive lease.");
+      return true;
+    }
+    resetMainLoopTimingDiagnostics();
+    Serial2.println("OK loop timing diagnostics reset.");
     return true;
   }
 
@@ -1365,15 +1929,16 @@ static bool handleCoreBluetoothCommand(const char* command) {
   }
 
   if (commandEquals(command, "STOP") || commandEquals(command, "S")) {
+    revokeAndCancelAllMotion("stop_command");
     robotRunEnabled = false;
     bluetoothTestArmed = false;
     bluetoothManualArmed = false;
     bluetoothManualActive = false;
     bluetoothSideTestActive = false;
     bluetoothTurnPulseTestActive = false;
+    bluetoothArcTestActive = false;
     bluetoothAbortMotionRequested = true;
     endMatchPrinted = false;
-    cancelNavigationGoal(PLANNER_STOP_ABORTED, "stop_command");
     stopMotors();
     setRobotState(END_MATCH);
     Serial2.println("OK stopped motors and set END_MATCH.");
@@ -1386,7 +1951,7 @@ static bool handleCoreBluetoothCommand(const char* command) {
 static bool handleStreamAndLogBluetoothCommand(const char* command) {
   if (commandEquals(command, "STREAM ON")) {
     bluetoothStreamEnabled = true;
-    lastBluetoothTelemetryMs = 0;
+    lastBluetoothFullTelemetryMs = 0;
     Serial2.println("OK stream on.");
     return true;
   }
@@ -1398,16 +1963,28 @@ static bool handleStreamAndLogBluetoothCommand(const char* command) {
   }
 
   if (commandEquals(command, "CSV ON")) {
+    if (bluetoothCsvClosing) {
+      Serial2.println("ERROR csv transport is still closing.");
+      return true;
+    }
     bluetoothCsvStreamEnabled = true;
-    lastBluetoothTelemetryMs = 0;
-    Serial2.println("OK csv on.");
+    lastBluetoothMotionTelemetryMs = millis();
+    lastBluetoothFullTelemetryMs = millis();
     sendBluetoothCsvHeader();
+    Serial2.println("OK csv on.");
+    Serial2.println("CSV READY");
     return true;
   }
 
   if (commandEquals(command, "CSV OFF")) {
+    if (!bluetoothCsvStreamEnabled && !bluetoothCsvClosing) {
+      Serial2.println("OK csv off.");
+      return true;
+    }
+    bluetoothCsvClosing = true;
     bluetoothCsvStreamEnabled = false;
     Serial2.println("OK csv off.");
+    Serial2.println("CSV CLOSED");
     return true;
   }
 
@@ -1515,6 +2092,8 @@ static bool handleTuningBluetoothCommand(const char* command) {
 
 static bool handleTestArmBluetoothCommand(const char* command) {
   if (commandEquals(command, "TEST ARM")) {
+    revokeAndCancelAllMotion("test_arm_authority_transition");
+    claimMotionAuthority(MOTION_AUTHORITY_TEST);
     bluetoothTestArmed = true;
     bluetoothManualArmed = false;
     bluetoothManualActive = false;
@@ -1527,27 +2106,14 @@ static bool handleTestArmBluetoothCommand(const char* command) {
   }
 
   if (commandEquals(command, "TEST DISARM")) {
+    revokeAndCancelAllMotion("test_disarmed");
     bluetoothTestArmed = false;
     bluetoothSideTestActive = false;
     bluetoothTurnPulseTestActive = false;
+    bluetoothArcTestActive = false;
     // Disarming must end an already-running TEST GOTO/DRIVE/AVOID/TURN goal,
     // not merely reject the next command. Otherwise updateRobotController()
     // can re-publish an old navigation command after this one-cycle stop.
-    bool activeTestNavigationGoal = isNavigationGoalActive() &&
-      (navigationGoal.owner == NAV_OWNER_TEST_DRIVE ||
-       navigationGoal.owner == NAV_OWNER_TEST_GOTO ||
-       navigationGoal.owner == NAV_OWNER_TEST_AVOID ||
-       navigationGoal.owner == NAV_OWNER_TEST_ESCAPE ||
-       navigationGoal.owner == NAV_OWNER_TEST_TURN ||
-       navigationGoal.owner == NAV_OWNER_TEST_HUNT ||
-       navigationGoal.owner == NAV_OWNER_WEIGHT_SCAN ||
-       navigationGoal.owner == NAV_OWNER_OBJECT_HUNT);
-    if (activeTestNavigationGoal) {
-      cancelNavigationGoal(PLANNER_STOP_ABORTED, "test_disarmed");
-    }
-    if (isWeightSearchActive()) {
-      cancelWeightSearch("test_disarmed");
-    }
     robotRunEnabled = false;
     stopMotors();
     setRobotState(END_MATCH);
@@ -1561,6 +2127,8 @@ static bool handleTestArmBluetoothCommand(const char* command) {
 
 static bool handleManualBluetoothCommand(const char* command) {
   if (commandEquals(command, "MANUAL ARM")) {
+    revokeAndCancelAllMotion("manual_arm_authority_transition");
+    claimMotionAuthority(MOTION_AUTHORITY_MANUAL);
     bluetoothManualArmed = true;
     bluetoothManualActive = false;
     bluetoothTestArmed = false;
@@ -1573,6 +2141,7 @@ static bool handleManualBluetoothCommand(const char* command) {
   }
 
   if (commandEquals(command, "MANUAL DISARM")) {
+    revokeAndCancelAllMotion("manual_disarmed");
     bluetoothManualArmed = false;
     stopManualDrive();
     Serial2.println("OK manual drive disarmed.");
@@ -1597,6 +2166,20 @@ static bool handleManualBluetoothCommand(const char* command) {
 }
 
 static bool handleTestMotionBluetoothCommand(const char* command) {
+  if (commandHasPrefix(command, "TEST ARC")) {
+    float forwardTicksPerSec = 0.0;
+    float turnTicksPerSec = 0.0;
+    float durationSeconds = 0.0;
+    if (!parseThreeFloatArguments(commandArgument(command, "TEST ARC"),
+                                  forwardTicksPerSec, turnTicksPerSec,
+                                  durationSeconds)) {
+      Serial2.println("ERROR usage: TEST ARC <forward_tps> <turn_tps> <seconds>");
+      return true;
+    }
+    runBluetoothTestArc(forwardTicksPerSec, turnTicksPerSec, durationSeconds);
+    return true;
+  }
+
   if (commandHasPrefix(command, "TEST DRIVE")) {
     float distanceMetres = 0.0;
 
@@ -1768,5 +2351,7 @@ bool handleBluetoothCommands() {
 
   updateBluetoothTestSide();
   updateBluetoothTurnPulseTest();
+  updateBluetoothArcTest();
+  updateBluetoothTurnTruth();
   return bluetoothAbortMotionRequested;
 }
