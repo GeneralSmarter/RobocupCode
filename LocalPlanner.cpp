@@ -1047,23 +1047,16 @@ static bool updateObstacleContext(float targetX, float targetY) {
   float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
                      PLANNER_TOTAL_HARD_CLEARANCE_M +
                      LOCAL_MAP_CELL_M * 0.5f;
-  float targetDx = targetX - robotX;
-  float targetDy = targetY - robotY;
-  float targetDistanceM = sqrtf(targetDx * targetDx + targetDy * targetDy);
-  ObstacleEnvelope directBlocker;
-  bool directBlocked = targetDistanceM > WAYPOINT_TOLERANCE_M &&
-    scanRouteObstacle(robotX, robotY,
-                      targetDx / targetDistanceM,
-                      targetDy / targetDistanceM,
-                      targetDistanceM, directBlocker);
-  if (alongM >= obstacleContext.farAlongM + rearClearM && !directBlocked) {
+  if (alongM >= obstacleContext.farAlongM + rearClearM) {
     if (obstacleContext.clearSinceMs == 0) {
       obstacleContext.clearSinceMs = millis();
     }
     if (millis() - obstacleContext.clearSinceMs >= 80) {
       resetObstacleContext("obstacle_cleared");
       resetPlannerEpoch();
-      return false;
+      // The completed envelope owns only this obstacle. Reacquire immediately
+      // so a later blocker gets a fresh envelope and independent side choice.
+      return updateObstacleContext(targetX, targetY);
     }
   } else {
     obstacleContext.clearSinceMs = 0;
