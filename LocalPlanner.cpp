@@ -1706,7 +1706,7 @@ static float candidateScore(float forwardTicks, float turnTicks,
   float clearanceScore = constrain(max(0.0f, clearanceMm) /
                                    (PLANNER_PREFERRED_CLEARANCE_M * 1000.0f),
                                    0.0f, 1.0f);
-  float headingScore = 1.0 - min(1.0f, headingError / 90.0);
+  float headingScore = 1.0 - min(1.0f, headingError / 90.0f);
   // Discourage left-right twitching between successive 40 ms replans. This is
   // intentionally a soft bias so safety/progress can always override it.
   float smoothnessScore = 1.0 - min(1.0f, fabs(turnTicks - previousSelectedTurn) /
@@ -2385,6 +2385,7 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         plannerEpoch.skippedLinePolicy++;
         continue;
       }
+      
       if (forward < PLANNER_MIN_DRIVABLE_SPEED_TPS) {
         continue;
       }
