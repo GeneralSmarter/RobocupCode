@@ -3,6 +3,25 @@
 // =====================================================
 // Local confidence map and receding-horizon navigation
 // =====================================================
+// Responsibility:
+//   Owns local perception-to-motion planning: short-lived occupancy evidence,
+//   footprint collision checks, differential-drive arc rollout/scoring, point
+//   and turn navigation goals, obstacle-local forward bypass, planner telemetry,
+//   and the scheduled controller pipeline.
+// Interacts with:
+//   TofSensors.cpp supplies fan/fake-rear range evidence. Odometry.cpp updates
+//   robot pose. StateMachine.cpp and Bluetooth.cpp create/cancel goals.
+//   MotorControl.cpp is the only physical motor writer and accepts commands
+//   through the planner publish wrapper and the authorized motor-command API.
+// Control flow:
+//   updateRobotController() is called from loop(). It schedules sensors/map,
+//   odometry, updateNavigationController(), updateMotorController(), and
+//   telemetry construction. Point goals use cooperative planner epochs; turn
+//   goals use direct yaw feedback.
+// Global state:
+//   Modifies localMap, navigationGoal, plannerTelemetry, one obstacle-scoped
+//   context, planner epochs, motorStopRequested/desired motion through safe
+//   command APIs, and controller timing stamps.
 // The map is intentionally local.  It gives the planner enough memory to
 // avoid immediately re-entering a wall after a turn without pretending that
 // odometry alone can support a permanent arena map.
@@ -116,6 +135,32 @@ static int lastFootprintRejectCellY = -1;
 static float lastCorridorRejectLeftM = -1.0f;
 static float lastCorridorRejectRightM = -1.0f;
 
+struct ObstacleContext {
+  bool active;
+  float originX;
+  float originY;
+  float routeUx;
+  float routeUy;
+  float routeLengthM;
+  float nearAlongM;
+  float farAlongM;
+  float minLateralM;
+  float maxLateralM;
+  float sideSign;
+  unsigned long startedMs;
+  unsigned long clearSinceMs;
+};
+
+struct ObstacleEnvelope {
+  bool found;
+  float nearAlongM;
+  float farAlongM;
+  float minLateralM;
+  float maxLateralM;
+};
+
+static ObstacleContext obstacleContext = {};
+
 struct SideEscapeEvidence {
   bool sensorsValid;
   bool closeSideEvidence;
@@ -127,9 +172,6 @@ struct SideEscapeEvidence {
   float sideSign;
 };
 
-static void resetPostReverseEscapeState();
-static void resetClearanceEscapeMemory(const char* reason);
-static void resetReverseSurveyState();
 static bool readSideEscapeEvidence(SideEscapeEvidence &evidence);
 static void bumpSideEscapeAdaptiveExtra(float sideSign, const char* reason);
 static const char* obstacleBypassPhaseName(ObstacleBypassPhase phase);
@@ -138,7 +180,7 @@ static bool routeLineFrame(float &routeLengthM, float &routeUx,
                            float &routeUy, float &routeHeadingRad);
 static float routeLineSignedLateralErrorM(float worldX, float worldY,
                                           float routeUx, float routeUy);
-static void resetRecoveryLivenessState();
+static void resetObstacleContext(const char* reason);
 
 enum ReverseSurveyDecision {
   REVERSE_SURVEY_REVERSE,
@@ -191,8 +233,6 @@ struct PlannerEpoch {
   float finalGoalDistanceM;
   float requestedSpeedCap;
   float speedCap;
-  float escapeUrgency;
-  float desiredEscapeTurnSign;
   float routeHeadingRad;
   float previousSelectedTurn;
   float minimumFanClearanceMm;
@@ -204,13 +244,11 @@ struct PlannerEpoch {
   bool leftOuterValid;
   bool finalWaypointIsLocalGoal;
   bool lineFollowActive;
-  bool clearanceEscapeActive;
   int acceptedCount;
   int rejectedTurnObservability;
   int rejectedForwardObservation;
   int rejectedFootprint;
   int rejectedCorridor;
-  int rejectedEscapeCommit;
   int skippedLinePolicy;
   float bestScore;
   float bestForward;
@@ -256,6 +294,8 @@ static ReversePlannerEpoch reversePlannerEpoch = {};
 static unsigned long lastPlannerCommandPublishedMs = 0;
 
 static void resetPlannerEpoch() {
+  // Clears any in-progress forward planning epoch and resets planner timing
+  // telemetry. It does not cancel the navigation goal itself.
   plannerEpoch.active = false;
   plannerEpoch.awaitingRevalidation = false;
   plannerEpoch.commandStoppedForAge = false;
@@ -280,6 +320,8 @@ static void resetReversePlannerEpoch() {
 }
 
 static void closePlannerEpoch() {
+  // Marks the current epoch complete and records its age for telemetry. The
+  // chosen command, if any, has already been published before this is called.
   plannerEpoch.active = false;
   plannerEpoch.awaitingRevalidation = false;
   plannerTelemetry.plannerEpochActive = false;
@@ -293,6 +335,8 @@ static void resetGeometricNoPathEvidence() {
 }
 
 static void noteGeometricNoPathEpoch() {
+  // Counts consecutive no-path epochs that were caused by geometry/footprint
+  // evidence rather than stale sensors, authority loss, or policy retries.
   unsigned long now = millis();
   if (geometricNoPathEpochCount == 0) {
     noSafeTrajectorySinceMs = now;
@@ -693,6 +737,9 @@ static bool snapshotWorldOccupied(const PlannerCollisionSnapshot &snapshot,
 static bool footprintClearOnSnapshot(const PlannerCollisionSnapshot &snapshot,
                                      float worldX, float worldY,
                                      float headingRad) {
+  // Tests one predicted robot pose against an immutable occupancy snapshot.
+  // This lets a planner epoch evaluate many candidates without the map
+  // changing halfway through the comparison.
   const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
                       PLANNER_TOTAL_HARD_CLEARANCE_M;
   const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
@@ -799,6 +846,274 @@ static bool footprintClear(float worldX, float worldY, float headingRad) {
   return true;
 }
 
+static void resetObstacleContext(const char* reason) {
+  bool wasActive = obstacleContext.active;
+  obstacleContext = {};
+  obstacleBypassSideSign = 0.0f;
+  obstacleBypassPhase = BYPASS_IDLE;
+  obstacleBypassPhaseStartedMs = 0;
+  if (wasActive) {
+    plannerTelemetry.replanReason = reason;
+    sendBluetoothEvent("obstacle_context_clear", reason);
+  }
+}
+
+static void obstacleCellRoutePosition(int cellX, int cellY,
+                                      float originX, float originY,
+                                      float routeUx, float routeUy,
+                                      float &alongM, float &lateralM) {
+  float worldX = localMapOriginX + (cellX + 0.5f) * LOCAL_MAP_CELL_M;
+  float worldY = localMapOriginY + (cellY + 0.5f) * LOCAL_MAP_CELL_M;
+  float dx = worldX - originX;
+  float dy = worldY - originY;
+  alongM = dx * routeUx + dy * routeUy;
+  lateralM = -dx * routeUy + dy * routeUx;
+}
+
+static bool scanRouteObstacle(float originX, float originY,
+                              float routeUx, float routeUy,
+                              float routeLengthM,
+                              ObstacleEnvelope &envelope) {
+  envelope = {};
+  float halfWidthM = max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
+                         ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M +
+                     LOCAL_MAP_CELL_M * 0.5f;
+  float endpointReachM = routeLengthM +
+                         ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                         PLANNER_TOTAL_HARD_CLEARANCE_M;
+  int seedX = -1;
+  int seedY = -1;
+  float nearestAlongM = 1000000.0f;
+  float seedLateralM = 0.0f;
+
+  for (int y = 0; y < LOCAL_MAP_CELLS; y++) {
+    for (int x = 0; x < LOCAL_MAP_CELLS; x++) {
+      if (!cellOccupied(x, y)) {
+        continue;
+      }
+      float alongM;
+      float lateralM;
+      obstacleCellRoutePosition(x, y, originX, originY,
+                                routeUx, routeUy, alongM, lateralM);
+      if (alongM >= 0.0f && alongM <= endpointReachM &&
+          fabs(lateralM) <= halfWidthM && alongM < nearestAlongM) {
+        nearestAlongM = alongM;
+        seedLateralM = lateralM;
+        seedX = x;
+        seedY = y;
+      }
+    }
+  }
+  if (seedX < 0 || seedY < 0) {
+    return false;
+  }
+
+  envelope.found = true;
+  envelope.nearAlongM = nearestAlongM;
+  envelope.farAlongM = nearestAlongM;
+  envelope.minLateralM = seedLateralM;
+  envelope.maxLateralM = seedLateralM;
+
+  // Grow the connected observed envelope in route coordinates. This derives
+  // the bypass from the obstacle evidence itself instead of a fixed travel
+  // distance, while tolerating the small gaps produced by separate ToF rays.
+  const float joinM = LOCAL_MAP_CELL_M * 1.75f;
+  for (int pass = 0; pass < 12; pass++) {
+    bool expanded = false;
+    for (int y = 0; y < LOCAL_MAP_CELLS; y++) {
+      for (int x = 0; x < LOCAL_MAP_CELLS; x++) {
+        if (!cellOccupied(x, y)) {
+          continue;
+        }
+        float alongM;
+        float lateralM;
+        obstacleCellRoutePosition(x, y, originX, originY,
+                                  routeUx, routeUy, alongM, lateralM);
+        if (alongM < envelope.nearAlongM - joinM ||
+            alongM > envelope.farAlongM + joinM ||
+            lateralM < envelope.minLateralM - joinM ||
+            lateralM > envelope.maxLateralM + joinM) {
+          continue;
+        }
+        float oldNear = envelope.nearAlongM;
+        float oldFar = envelope.farAlongM;
+        float oldMin = envelope.minLateralM;
+        float oldMax = envelope.maxLateralM;
+        envelope.nearAlongM = min(envelope.nearAlongM, alongM);
+        envelope.farAlongM = max(envelope.farAlongM, alongM);
+        envelope.minLateralM = min(envelope.minLateralM, lateralM);
+        envelope.maxLateralM = max(envelope.maxLateralM, lateralM);
+        expanded = expanded || oldNear != envelope.nearAlongM ||
+                   oldFar != envelope.farAlongM ||
+                   oldMin != envelope.minLateralM ||
+                   oldMax != envelope.maxLateralM;
+      }
+    }
+    if (!expanded) {
+      break;
+    }
+  }
+  return true;
+}
+
+static float chooseObstacleSide(const ObstacleEnvelope &envelope,
+                                float routeUx, float routeUy) {
+  float lateralClearanceM =
+    max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
+        ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
+    PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
+  float leftTargetM = envelope.maxLateralM + lateralClearanceM;
+  float rightTargetM = envelope.minLateralM - lateralClearanceM;
+  float dx = robotX - obstacleContext.originX;
+  float dy = robotY - obstacleContext.originY;
+  float currentLateralM = -dx * routeUy + dy * routeUx;
+  float leftCostM = fabs(leftTargetM - currentLateralM);
+  float rightCostM = fabs(rightTargetM - currentLateralM);
+  if (fabs(leftCostM - rightCostM) > LOCAL_MAP_CELL_M) {
+    return leftCostM < rightCostM ? 1.0f : -1.0f;
+  }
+  float leftRangeM = isRangeSensorValid(RANGE_LEFT_INNER)
+    ? getRangeSensorDistance(RANGE_LEFT_INNER) / 1000.0f : 0.0f;
+  float rightRangeM = isRangeSensorValid(RANGE_RIGHT_INNER)
+    ? getRangeSensorDistance(RANGE_RIGHT_INNER) / 1000.0f : 0.0f;
+  return leftRangeM >= rightRangeM ? 1.0f : -1.0f;
+}
+
+static bool updateObstacleContext(float targetX, float targetY) {
+  if (!obstacleContext.active) {
+    float dx = targetX - robotX;
+    float dy = targetY - robotY;
+    float distanceM = sqrtf(dx * dx + dy * dy);
+    if (distanceM <= WAYPOINT_TOLERANCE_M) {
+      return false;
+    }
+    ObstacleEnvelope envelope;
+    float routeUx = dx / distanceM;
+    float routeUy = dy / distanceM;
+    if (!scanRouteObstacle(robotX, robotY, routeUx, routeUy,
+                           distanceM, envelope)) {
+      return false;
+    }
+    obstacleContext.active = true;
+    obstacleContext.originX = robotX;
+    obstacleContext.originY = robotY;
+    obstacleContext.routeUx = routeUx;
+    obstacleContext.routeUy = routeUy;
+    obstacleContext.routeLengthM = distanceM;
+    obstacleContext.nearAlongM = envelope.nearAlongM;
+    obstacleContext.farAlongM = envelope.farAlongM;
+    obstacleContext.minLateralM = envelope.minLateralM;
+    obstacleContext.maxLateralM = envelope.maxLateralM;
+    obstacleContext.sideSign = chooseObstacleSide(envelope, routeUx, routeUy);
+    obstacleContext.startedMs = millis();
+    obstacleContext.clearSinceMs = 0;
+    obstacleBypassSideSign = obstacleContext.sideSign;
+    obstacleBypassPhase = BYPASS_SIDE_ESCAPE;
+    obstacleBypassPhaseStartedMs = millis();
+    plannerTelemetry.replanReason = "obstacle_context_started";
+    sendBluetoothEvent("obstacle_context_start",
+                       obstacleContext.sideSign > 0.0f ? "left" : "right");
+    resetPlannerEpoch();
+    return true;
+  }
+
+  ObstacleEnvelope observed;
+  if (scanRouteObstacle(obstacleContext.originX,
+                        obstacleContext.originY,
+                        obstacleContext.routeUx,
+                        obstacleContext.routeUy,
+                        obstacleContext.routeLengthM,
+                        observed)) {
+    const float joinM = LOCAL_MAP_CELL_M * 2.0f;
+    bool sameObstacle = observed.nearAlongM <= obstacleContext.farAlongM + joinM &&
+                        observed.farAlongM >= obstacleContext.nearAlongM - joinM;
+    if (sameObstacle) {
+      obstacleContext.nearAlongM = min(obstacleContext.nearAlongM,
+                                       observed.nearAlongM);
+      obstacleContext.farAlongM = max(obstacleContext.farAlongM,
+                                      observed.farAlongM);
+      obstacleContext.minLateralM = min(obstacleContext.minLateralM,
+                                        observed.minLateralM);
+      obstacleContext.maxLateralM = max(obstacleContext.maxLateralM,
+                                        observed.maxLateralM);
+    }
+  }
+
+  float poseDx = robotX - obstacleContext.originX;
+  float poseDy = robotY - obstacleContext.originY;
+  float alongM = poseDx * obstacleContext.routeUx +
+                 poseDy * obstacleContext.routeUy;
+  float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M +
+                     LOCAL_MAP_CELL_M * 0.5f;
+  float targetDx = targetX - robotX;
+  float targetDy = targetY - robotY;
+  float targetDistanceM = sqrtf(targetDx * targetDx + targetDy * targetDy);
+  ObstacleEnvelope directBlocker;
+  bool directBlocked = targetDistanceM > WAYPOINT_TOLERANCE_M &&
+    scanRouteObstacle(robotX, robotY,
+                      targetDx / targetDistanceM,
+                      targetDy / targetDistanceM,
+                      targetDistanceM, directBlocker);
+  if (alongM >= obstacleContext.farAlongM + rearClearM && !directBlocked) {
+    if (obstacleContext.clearSinceMs == 0) {
+      obstacleContext.clearSinceMs = millis();
+    }
+    if (millis() - obstacleContext.clearSinceMs >= 80) {
+      resetObstacleContext("obstacle_cleared");
+      resetPlannerEpoch();
+      return false;
+    }
+  } else {
+    obstacleContext.clearSinceMs = 0;
+  }
+  return true;
+}
+
+static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
+  float lateralClearanceM =
+    max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
+        ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
+    PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
+  float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M +
+                     LOCAL_MAP_CELL_M * 0.5f;
+  float targetLateralM = obstacleContext.sideSign > 0.0f
+    ? obstacleContext.maxLateralM + lateralClearanceM
+    : obstacleContext.minLateralM - lateralClearanceM;
+  if (obstacleContext.sideSign > 0.0f) {
+    targetLateralM = max(targetLateralM, lateralClearanceM);
+  } else {
+    targetLateralM = min(targetLateralM, -lateralClearanceM);
+  }
+  float poseDx = robotX - obstacleContext.originX;
+  float poseDy = robotY - obstacleContext.originY;
+  float currentAlongM = poseDx * obstacleContext.routeUx +
+                        poseDy * obstacleContext.routeUy;
+  float currentLateralM = -poseDx * obstacleContext.routeUy +
+                          poseDy * obstacleContext.routeUx;
+  bool laterallyClear = obstacleContext.sideSign * currentLateralM >=
+    obstacleContext.sideSign * targetLateralM -
+      PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
+  float targetAlongM;
+  if (laterallyClear || currentAlongM >= obstacleContext.nearAlongM) {
+    targetAlongM = obstacleContext.farAlongM + rearClearM;
+  } else {
+    float frontClearM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                        PLANNER_TOTAL_HARD_CLEARANCE_M +
+                        LOCAL_MAP_CELL_M * 0.5f;
+    targetAlongM = max(0.05f, obstacleContext.nearAlongM - frontClearM -
+                              PLANNER_OBSTACLE_TURN_ROOM_M);
+  }
+  localGoalX = obstacleContext.originX +
+               obstacleContext.routeUx * targetAlongM -
+               obstacleContext.routeUy * targetLateralM;
+  localGoalY = obstacleContext.originY +
+               obstacleContext.routeUy * targetAlongM +
+               obstacleContext.routeUx * targetLateralM;
+}
+
 static float minimumFanSweepClearanceMm() {
   // This is a turn-envelope measurement, not the straight-driving body
   // clearance. It is kept for turn safety and as a soft preference signal.
@@ -866,6 +1181,9 @@ const char* plannerStopReasonName(PlannerStopReason reason) {
 }
 
 static bool publishNavigationMotion(float forwardSpeed, float turnSpeed) {
+  // Final planner-to-motor handoff. Inputs are chassis speeds in ticks/s:
+  // positive forward drives +X, positive turn is CCW/left. MotorControl.cpp
+  // may still veto the command if live safety evidence changed.
   if (setAuthorizedMotionCommand(navigationGoal.authority,
                                  forwardSpeed, turnSpeed)) {
     return true;
@@ -914,12 +1232,9 @@ static void finishNavigationGoal(bool success, PlannerStopReason reason, const c
   reverseRecoveryActive = false;
   resetGeometricNoPathEvidence();
   reverseRecoveryRejectsReported = false;
-  resetReverseSurveyState();
-  resetPostReverseEscapeState();
+  resetObstacleContext(success ? "goal_complete" : "goal_abort");
   motorStopRequested = true;
   setMotionCommand(0.0, 0.0);
-  resetClearanceEscapeMemory(success ? "goal_complete" : "goal_abort");
-  resetRecoveryLivenessState();
   navigationGoal.active = false;
   navigationGoal.authority = MOTION_AUTHORITY_NONE;
   navigationGoal.completed = success;
@@ -941,6 +1256,15 @@ static void finishNavigationGoal(bool success, PlannerStopReason reason, const c
 }
 
 void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owner) {
+  // Creates a world-frame point goal in metres.
+  //
+  // Called by:
+  //   goToPoint(), Bluetooth TEST DRIVE/GOTO/AVOID/ESCAPE/HUNT, and the
+  //   weight-search state machine.
+  //
+  // Global effects:
+  //   Resets planner epochs, recovery state, PID/encoder snapshots, goal
+  //   telemetry, and schedules an immediate planner update.
   if (motionAuthority != MOTION_AUTHORITY_MISSION &&
       motionAuthority != MOTION_AUTHORITY_TEST) {
     stopMotors();
@@ -1002,10 +1326,7 @@ void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owne
   resetGeometricNoPathEvidence();
   candidateRejectsReported = false;
   reverseRecoveryRejectsReported = false;
-  resetReverseSurveyState();
-  resetPostReverseEscapeState();
-  resetClearanceEscapeMemory("point_goal_start");
-  resetRecoveryLivenessState();
+  resetObstacleContext("point_goal_start");
   motorStopRequested = false;
   plannerTelemetry.replanReason = "goal_started";
   plannerTelemetry.safeStopReason = "";
@@ -1018,6 +1339,15 @@ void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owne
 }
 
 void startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner) {
+  // Creates a relative in-place yaw goal in degrees.
+  //
+  // Inputs/outputs:
+  //   relativeTurnDeg is positive CCW/left. The stored targetYawDeg is an
+  //   absolute navigation heading wrapped to [-180, +180].
+  //
+  // Safety:
+  //   updateTurnGoal() validates turn-side and full sweep sensing before each
+  //   command and MotorControl.cpp checks again at output time.
   if (motionAuthority != MOTION_AUTHORITY_MISSION &&
       motionAuthority != MOTION_AUTHORITY_TEST) {
     stopMotors();
@@ -1055,12 +1385,9 @@ void startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner) {
   reverseRecoveryActive = false;
   resetGeometricNoPathEvidence();
   reverseRecoveryRejectsReported = false;
-  resetReverseSurveyState();
-  resetPostReverseEscapeState();
   motorStopRequested = true;
   setMotionCommand(0.0, 0.0);
-  resetClearanceEscapeMemory("turn_goal_start");
-  resetRecoveryLivenessState();
+  resetObstacleContext("turn_goal_start");
   motorStopRequested = false;
   plannerTelemetry.replanReason = "turn_started";
   plannerTelemetry.safeStopReason = "";
@@ -1068,6 +1395,9 @@ void startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner) {
 }
 
 void cancelNavigationGoal(PlannerStopReason reason, const char* detail) {
+  // Public cancellation path. If a goal is active, finishNavigationGoal()
+  // performs the full neutral/telemetry cleanup. If no goal is active, keep
+  // telemetry honest and force neutral anyway.
   if (!navigationGoal.active) {
     navigationGoal.authority = MOTION_AUTHORITY_NONE;
     plannerTelemetry.stopReason = reason;
@@ -1115,6 +1445,7 @@ static float calculateSpeedCapTicksPerSec(float requestedCapTicksPerSec) {
   return min(requestedCapTicksPerSec, speedMps * TICKS_PER_METRE);
 }
 
+#if 0
 static float clearanceEscapeUrgency() {
   if (!clearanceEscapeLocalGoalActive) {
     return 0.0f;
@@ -1155,6 +1486,7 @@ static float applyClearanceEscapeSpeedCap(float speedCap) {
     (speedCap - PLANNER_ESCAPE_MIN_SPEED_TPS) * urgency;
   return max(PLANNER_MIN_DRIVABLE_SPEED_TPS, min(speedCap, escapeCap));
 }
+#endif
 
 static bool epochTurnDirectionObservable(const PlannerEpoch &epoch,
                                          float turnTicks) {
@@ -1287,6 +1619,29 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
                               (2.0f * segmentLengthSquared);
         if (entryProgress >= 0.0f && entryProgress <= 1.0f) {
           arrivalTimeS = elapsed + entryProgress * PLANNER_ROLLOUT_STEP_S;
+          if (epoch.finalWaypointIsLocalGoal) {
+            float arrivalX = segmentStartX + segmentDx * entryProgress;
+            float arrivalY = segmentStartY + segmentDy * entryProgress;
+            float arrivalHeading = segmentStartHeading +
+              (heading - segmentStartHeading) * entryProgress;
+            float arrivalTravelM = linearMps * arrivalTimeS;
+            if (arrivalTravelM + leadingEnvelopeM > observedForwardM) {
+              rejectReason = CANDIDATE_REJECT_FORWARD_OBSERVATION;
+              return false;
+            }
+            if (!footprintClearOnSnapshot(epoch.collision,
+                                          arrivalX, arrivalY,
+                                          arrivalHeading)) {
+              rejectReason = CANDIDATE_REJECT_FOOTPRINT;
+              return false;
+            }
+            finalX = arrivalX;
+            finalY = arrivalY;
+            finalHeadingRad = arrivalHeading;
+            closestGoalDistanceM = 0.0f;
+            headingAtClosestGoalRad = arrivalHeading;
+            return true;
+          }
         }
       }
     }
@@ -1323,15 +1678,12 @@ static float candidateScore(float forwardTicks, float turnTicks,
                             float localGoalX, float localGoalY,
                             float plannerStartX, float plannerStartY,
                             float previousSelectedTurn,
-                            unsigned long scoringMs,
                             float closestGoalDistanceM,
                             float headingAtClosestGoalRad,
                             float finalX,
                             float finalY,
                             float finalHeadingRad,
                             float clearanceMm,
-                            float escapeUrgency,
-                            float desiredEscapeTurnSign,
                             bool lineFollowActive,
                             float routeStartX,
                             float routeStartY,
@@ -1366,23 +1718,7 @@ static float candidateScore(float forwardTicks, float turnTicks,
   // intentionally a soft bias so safety/progress can always override it.
   float smoothnessScore = 1.0 - min(1.0f, fabs(turnTicks - previousSelectedTurn) /
                                           max(1.0f, baseTargetSpeed));
-  float repeatedHeadingPenalty = 0.0;
-  if (recentBlockedTurnDirection != 0 &&
-      scoringMs - recentBlockedTurnMs < MAP_DYNAMIC_EXPIRY_MS &&
-      ((turnTicks > 0.0 && recentBlockedTurnDirection > 0) ||
-       (turnTicks < 0.0 && recentBlockedTurnDirection < 0))) {
-    repeatedHeadingPenalty = 1.0;
-  }
-  float escapeTurnScore = 0.0;
-  if (escapeUrgency > 0.0f && desiredEscapeTurnSign != 0.0f &&
-      fabs(turnTicks) > 1.0f) {
-    float turnSign = turnTicks > 0.0f ? 1.0f : -1.0f;
-    float turnMagnitude = constrain(curvature / PLANNER_MAX_TURN_RATIO,
-                                    0.0f, 1.0f);
-    escapeTurnScore = escapeUrgency *
-      (turnSign == desiredEscapeTurnSign ? 1.8f * turnMagnitude : -2.0f);
-  }
-  float curvaturePenaltyWeight = 0.8f * (1.0f - 0.75f * escapeUrgency);
+  const float curvaturePenaltyWeight = 0.8f;
   float lineScore = 0.0f;
   float routeHeadingScore = 0.0f;
   float nearGoalStraightPenalty = 0.0f;
@@ -1403,8 +1739,7 @@ static float candidateScore(float forwardTicks, float turnTicks,
   }
   return 3.0 * progressScore + 2.2 * headingScore + 1.4 * clearanceScore +
          0.8 * smoothnessScore + 1.6 * lineScore + 1.0 * routeHeadingScore -
-         curvaturePenaltyWeight * curvature - nearGoalStraightPenalty +
-         escapeTurnScore - repeatedHeadingPenalty;
+         curvaturePenaltyWeight * curvature - nearGoalStraightPenalty;
 }
 
 static bool routeLineFrame(float &routeLengthM, float &routeUx,
@@ -1617,6 +1952,7 @@ static bool routeLineClearlyMissed(float routeLengthM, float routeUx, float rout
          lateralErrorM <= PLANNER_LINE_FOLLOW_LATERAL_TOLERANCE_M;
 }
 
+#if 0
 static bool sideEscapeRejoinActive(float routeLengthM, float routeUx, float routeUy) {
   if (!clearanceEscapeRouteDetourActive || routeLengthM <= 0.0f) {
     return false;
@@ -1646,6 +1982,7 @@ static void clearSideEscapeDetourIfActive(const char* reason) {
   clearanceEscapeRouteDetourActive = false;
   sendBluetoothEvent("side_escape_final_approach", reason);
 }
+#endif
 
 static bool huntPickupCarryThroughActive(float routeLengthM, float routeUx,
                                          float routeUy) {
@@ -1660,19 +1997,21 @@ static bool huntPickupCarryThroughActive(float routeLengthM, float routeUx,
          lateralErrorM <= PLANNER_HUNT_FINISH_LATERAL_M;
 }
 
+#if 0
 static bool obstacleBypassSpeedLimited() {
   return clearanceEscapeLocalGoalActive ||
          postReverseEscapeActive ||
          obstacleBypassPhase == BYPASS_SIDE_ESCAPE ||
          obstacleBypassPhase == BYPASS_FRONT_WALL_REVERSE;
 }
+#endif
 
 static float requestedPointGoalSpeedCap(bool routeLineActive,
                                         float routeLengthM, float routeUx,
                                         float routeUy) {
   float requestedCap = baseTargetSpeed;
-  if (obstacleBypassSpeedLimited()) {
-    requestedCap = min(requestedCap, PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS);
+  if (obstacleContext.active) {
+    requestedCap = min(requestedCap, PLANNER_OBSTACLE_MAX_SPEED_TPS);
   }
   if (routeLineActive && huntPickupCarryThroughActive(routeLengthM, routeUx, routeUy)) {
     requestedCap = min(PLANNER_HUNT_PICKUP_MAX_SPEED_TPS,
@@ -1823,20 +2162,16 @@ static TrajectoryPlanResult failPlannerEpochNoPath(const char* safeReason,
   lastForwardNoPathWasGeometric =
     plannerEpoch.acceptedCount == 0 &&
     plannerEpoch.rejectedTurnObservability == 0 &&
-    plannerEpoch.rejectedEscapeCommit == 0 &&
     plannerEpoch.skippedLinePolicy == 0;
   if (plannerEpoch.acceptedCount == 0 && !candidateRejectsReported) {
     char detail[224];
     snprintf(detail, sizeof(detail),
-             "turn=%d;observed=%d;footprint=%d;corridor=%d;escape_commit=%d;policy=%d;urg=%.2f;side=%.0f;fp=%.3f/%.3f@%d/%d;corr=%.2f/%.2f",
+             "turn=%d;observed=%d;footprint=%d;corridor=%d;policy=%d;fp=%.3f/%.3f@%d/%d;corr=%.2f/%.2f",
              plannerEpoch.rejectedTurnObservability,
              plannerEpoch.rejectedForwardObservation,
              plannerEpoch.rejectedFootprint,
              plannerEpoch.rejectedCorridor,
-             plannerEpoch.rejectedEscapeCommit,
              plannerEpoch.skippedLinePolicy,
-             plannerEpoch.escapeUrgency,
-             plannerEpoch.desiredEscapeTurnSign,
              lastFootprintRejectWorldX, lastFootprintRejectWorldY,
              lastFootprintRejectCellX, lastFootprintRejectCellY,
              lastCorridorRejectLeftM, lastCorridorRejectRightM);
@@ -1867,6 +2202,9 @@ static TrajectoryPlanResult retryPlannerEpoch(PlannerStopReason stopReason,
 }
 
 static TrajectoryPlanResult beginPlannerEpoch(float goalX, float goalY) {
+  // Captures a coherent planning snapshot for one local point goal.
+  // goalX/goalY are world metres for the current local target, which may be a
+  // lookahead point, side-escape waypoint, or final waypoint.
   memset(&plannerEpoch, 0, sizeof(plannerEpoch));
   lastForwardNoPathWasGeometric = false;
   plannerEpoch.active = true;
@@ -1893,33 +2231,15 @@ static TrajectoryPlanResult beginPlannerEpoch(float goalX, float goalY) {
   float routeUx = 1.0f;
   float routeUy = 0.0f;
   plannerEpoch.lineFollowActive =
-    !clearanceEscapeLocalGoalActive &&
+    !obstacleContext.active &&
     routeLineTrackingEligible(routeLengthM, routeUx, routeUy,
                               plannerEpoch.routeHeadingRad);
-  plannerEpoch.clearanceEscapeActive = clearanceEscapeLocalGoalActive;
   plannerEpoch.requestedSpeedCap = requestedPointGoalSpeedCap(
     plannerEpoch.lineFollowActive, routeLengthM, routeUx, routeUy);
-  plannerEpoch.speedCap = applyClearanceEscapeSpeedCap(
-    calculateSpeedCapTicksPerSec(plannerEpoch.requestedSpeedCap));
-  plannerEpoch.escapeUrgency = clearanceEscapeUrgency();
+  plannerEpoch.speedCap =
+    calculateSpeedCapTicksPerSec(plannerEpoch.requestedSpeedCap);
   plannerEpoch.previousSelectedTurn =
     plannerTelemetry.selectedTurnTicksPerSec;
-
-  if (clearanceEscapeLocalGoalActive) {
-    float committedSideSign = postReverseEscapeActive
-      ? postReverseEscapeSideSign : lastClearanceEscapeSideSign;
-    if (committedSideSign != 0.0f) {
-      plannerEpoch.desiredEscapeTurnSign = committedSideSign;
-    } else {
-      float goalBodyY = -dx * sinf(plannerEpoch.startHeadingRad) +
-                        dy * cosf(plannerEpoch.startHeadingRad);
-      if (goalBodyY < -0.02f) {
-        plannerEpoch.desiredEscapeTurnSign = -1.0f;
-      } else if (goalBodyY > 0.02f) {
-        plannerEpoch.desiredEscapeTurnSign = 1.0f;
-      }
-    }
-  }
 
   plannerTelemetry.speedCapTicksPerSec = plannerEpoch.speedCap;
   plannerTelemetry.localGoalDistanceM = plannerEpoch.localGoalDistanceM;
@@ -2006,7 +2326,6 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         break;
       }
       int candidateIndex = plannerEpoch.candidateIndex++;
-      processedThisSlice++;
       plannerTelemetry.plannerCandidatesProcessed =
         plannerEpoch.candidateIndex;
       int speedIndex = candidateIndex / PLANNER_CURVATURE_SAMPLES;
@@ -2020,6 +2339,51 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         (1.0f + fabs(normalized * PLANNER_MAX_TURN_RATIO)));
       float turn = forward * normalized * PLANNER_MAX_TURN_RATIO;
 
+      if (obstacleContext.active) {
+        float signedTurnRatio = turn / max(1.0f, forward);
+        float poseDx = plannerEpoch.startX - obstacleContext.originX;
+        float poseDy = plannerEpoch.startY - obstacleContext.originY;
+        float currentAlongM = poseDx * obstacleContext.routeUx +
+                              poseDy * obstacleContext.routeUy;
+        float currentLateralM = -poseDx * obstacleContext.routeUy +
+                                poseDy * obstacleContext.routeUx;
+        float lateralClearanceM =
+          max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
+              ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
+          PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
+        float targetLateralM = obstacleContext.sideSign > 0.0f
+          ? obstacleContext.maxLateralM + lateralClearanceM
+          : obstacleContext.minLateralM - lateralClearanceM;
+        if (obstacleContext.sideSign > 0.0f) {
+          targetLateralM = max(targetLateralM, lateralClearanceM);
+        } else {
+          targetLateralM = min(targetLateralM, -lateralClearanceM);
+        }
+        float routeHeadingDeg = atan2f(obstacleContext.routeUy,
+                                       obstacleContext.routeUx) * RAD_TO_DEG;
+        float outwardHeadingDeg = obstacleContext.sideSign * wrapAngle(
+          plannerEpoch.startHeadingRad * RAD_TO_DEG - routeHeadingDeg);
+        bool needsLateralClearance = currentAlongM < obstacleContext.nearAlongM &&
+          obstacleContext.sideSign * currentLateralM <
+            obstacleContext.sideSign * targetLateralM -
+              PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
+        if (needsLateralClearance && outwardHeadingDeg < 35.0f &&
+            obstacleContext.sideSign * signedTurnRatio <
+              PLANNER_OBSTACLE_MIN_OUTWARD_TURN_RATIO) {
+          continue;
+        }
+        float desiredHeadingDeg = atan2f(plannerEpoch.goalY - plannerEpoch.startY,
+                                         plannerEpoch.goalX - plannerEpoch.startX) *
+                                  RAD_TO_DEG;
+        float localHeadingErrorDeg = wrapAngle(
+          desiredHeadingDeg - plannerEpoch.startHeadingRad * RAD_TO_DEG);
+        if (fabs(localHeadingErrorDeg) > 10.0f &&
+            (localHeadingErrorDeg > 0.0f ? 1.0f : -1.0f) * signedTurnRatio <
+              0.15f) {
+          continue;
+        }
+      }
+
       if (plannerEpoch.lineFollowActive &&
           plannerEpoch.finalGoalDistanceM <=
             PLANNER_NEAR_GOAL_STRAIGHTEN_DISTANCE_M &&
@@ -2028,21 +2392,10 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         plannerEpoch.skippedLinePolicy++;
         continue;
       }
-      if (plannerEpoch.clearanceEscapeActive &&
-          plannerEpoch.escapeUrgency >= PLANNER_ESCAPE_FORCE_TURN_URGENCY &&
-          plannerEpoch.desiredEscapeTurnSign != 0.0f) {
-        float turnRatio = turn / max(1.0f, forward);
-        bool committedToEscapeSide =
-          turnRatio * plannerEpoch.desiredEscapeTurnSign > 0.0f &&
-          fabs(turnRatio) >= PLANNER_ESCAPE_FORCE_TURN_MIN_RATIO;
-        if (!committedToEscapeSide) {
-          plannerEpoch.rejectedEscapeCommit++;
-          continue;
-        }
-      }
       if (forward < PLANNER_MIN_DRIVABLE_SPEED_TPS) {
         continue;
       }
+      processedThisSlice++;
 
       float clearanceMm = -1.0f;
       float closestGoalDistanceM = plannerEpoch.localGoalDistanceM;
@@ -2074,10 +2427,9 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
       float score = candidateScore(
         forward, turn, plannerEpoch.goalX, plannerEpoch.goalY,
         plannerEpoch.startX, plannerEpoch.startY,
-        plannerEpoch.previousSelectedTurn, plannerEpoch.startedMs,
+        plannerEpoch.previousSelectedTurn,
         closestGoalDistanceM, headingAtClosestGoalRad,
         finalX, finalY, finalHeadingRad, clearanceMm,
-        plannerEpoch.escapeUrgency, plannerEpoch.desiredEscapeTurnSign,
         plannerEpoch.lineFollowActive,
         navigationGoal.startX, navigationGoal.startY,
         plannerEpoch.routeHeadingRad, plannerEpoch.finalGoalDistanceM);
@@ -2137,8 +2489,8 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
     closePlannerEpoch();
     return TRAJECTORY_PLAN_NO_PATH;
   }
-  float freshSpeedCap = applyClearanceEscapeSpeedCap(
-    calculateSpeedCapTicksPerSec(plannerEpoch.requestedSpeedCap));
+  float freshSpeedCap =
+    calculateSpeedCapTicksPerSec(plannerEpoch.requestedSpeedCap);
   if (freshSpeedCap < PLANNER_MIN_DRIVABLE_SPEED_TPS) {
     recordPlannerSlice(sliceStartedUs);
     return retryPlannerEpoch(PLANNER_STOP_NO_SAFE_TRAJECTORY,
@@ -2213,6 +2565,11 @@ static void reportPlannerStopIfChanged() {
   sendBluetoothEvent("planner_safe_stop", plannerStopReasonName(plannerTelemetry.stopReason));
 }
 
+#if 0
+// Retained temporarily as a readable comparison with RobotCode - Copy (3).
+// The forward-only obstacle-context planner below does not compile or call
+// reverse recovery, side-memory latching, adaptive escape, route rejoin, or
+// final-approach behavior.
 static bool canStartReverseRecovery() {
   return navigationGoal.mode == NAV_GOAL_POINT &&
          escapeBacktrackEnabled &&
@@ -2235,6 +2592,9 @@ static void resetReverseSurveyState() {
 }
 
 static void startReverseRecovery() {
+  // Enters reverse recovery after repeated geometric no-forward-path evidence.
+  // It preserves the original point goal and uses reverse planner epochs only
+  // until a forward arc becomes available again.
   resetReversePlannerEpoch();
   float adaptiveSideSign = postReverseEscapeActive
     ? postReverseEscapeSideSign
@@ -2412,6 +2772,8 @@ static void updateObservedPreferredSide(const SideEscapeEvidence &evidence) {
 }
 
 static bool readSideEscapeEvidence(SideEscapeEvidence &evidence) {
+  // Reads the four fan rays into a compact side-escape summary. sideSign is
+  // -1 for robot-right and +1 for robot-left in the navigation frame.
   evidence.sensorsValid =
     isRangeSensorValid(RANGE_RIGHT_INNER) &&
     isRangeSensorValid(RANGE_LEFT_INNER) &&
@@ -2885,6 +3247,8 @@ static TrajectoryPlanResult retryReversePlannerEpoch(const char* safeReason,
 }
 
 static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
+  // Captures the snapshot used to evaluate reverse recovery arcs. In the
+  // current test build, rear evidence comes from RANGE_FAKE_REAR.
   memset(&reversePlannerEpoch, 0, sizeof(reversePlannerEpoch));
   reversePlannerEpoch.active = true;
   reversePlannerEpoch.startedMs = millis();
@@ -2924,6 +3288,9 @@ static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
 
 static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
                                                              float goalY) {
+  // Cooperative reverse-arc sampler. It mirrors selectTrajectory(): evaluate
+  // a bounded number of candidates per loop, then revalidate the winner before
+  // publication.
   if (!reversePlannerEpoch.active) {
     unsigned long sliceStartedUs = micros();
     TrajectoryPlanResult beginResult =
@@ -3300,6 +3667,7 @@ static void startPostReverseEscape(const SideEscapeEvidence &evidence) {
                              obstacleBypassSideSign,
                              evidence);
 }
+#endif
 
 static void updatePointGoal() {
   float dx = navigationGoal.targetX - robotX;
@@ -3323,12 +3691,7 @@ static void updatePointGoal() {
     routeFrameValid &&
     fabs(wrapAngle(routeHeadingRad * RAD_TO_DEG - navigationHeadingDeg())) <=
       PLANNER_LINE_FOLLOW_ENABLE_HEADING_DEG;
-  bool detourRejoinActive =
-    routeFrameValid && sideEscapeRejoinActive(routeLengthM, routeUx, routeUy);
 
-  // Object pickup is complete by position, not by final heading. Once the
-  // robot has driven through the hunt pickup zone, stop before the generic
-  // point-goal alignment cleanup can rotate the chassis away from the pickup.
   if (routeFrameValid && huntPickupZoneReached(routeLengthM, routeUx, routeUy)) {
     finishNavigationGoal(true, PLANNER_STOP_NONE, "hunt_pickup_zone_reached");
     return;
@@ -3336,12 +3699,11 @@ static void updatePointGoal() {
 
   bool huntCarryThroughActive =
     routeLineEligible && huntPickupCarryThroughActive(routeLengthM, routeUx, routeUy);
+  bool avoidanceActive = updateObstacleContext(navigationGoal.targetX,
+                                               navigationGoal.targetY);
   float targetHeadingDeg = atan2f(dy, dx) * RAD_TO_DEG;
   float targetHeadingErrorDeg = wrapAngle(targetHeadingDeg - navigationHeadingDeg());
-  bool sideEscapeBypassAlignment = sideEscapeShouldBypassPointAlignment();
-  if (!plannerEpoch.active && !reversePlannerEpoch.active &&
-      !reverseRecoveryActive &&
-      !sideEscapeBypassAlignment &&
+  if (!plannerEpoch.active && !avoidanceActive &&
       !huntCarryThroughActive &&
       fabs(targetHeadingErrorDeg) > PLANNER_POINT_ALIGN_START_DEG) {
     commandPointAlignmentTurn(targetHeadingErrorDeg);
@@ -3350,130 +3712,29 @@ static void updatePointGoal() {
   pointAlignTurnActive = false;
   pointAlignTurnDirection = 0.0;
 
-  // Long routes are planned toward a nearby point on the target line. This
-  // keeps the local map relevant and lets every 40 ms replan react to new
-  // obstacle evidence without needing a global A* route. When the point is
-  // mostly ahead, track the original start->target route line rather than
-  // chasing the final coordinate from the current drifted pose. This turns
-  // ordinary physical sideways error into a controlled line-follow problem.
   float localGoalX = 0.0f;
   float localGoalY = 0.0f;
-  if (routeLineEligible || detourRejoinActive) {
-    // After a side-escape, rejoin the original route only while still before
-    // the final approach window. Past that boundary, hand back to normal point
-    // approach/alignment so the robot cannot extend the detour indefinitely.
-    buildRouteLineLocalGoal(routeLengthM, routeUx, routeUy, localGoalX, localGoalY);
+  if (avoidanceActive) {
+    buildObstacleLocalGoal(localGoalX, localGoalY);
+    plannerTelemetry.planReason = "obstacle_local_bypass";
   } else {
     float lookaheadM = min(distanceM, WAYPOINT_LOOKAHEAD_M);
     localGoalX = robotX + (dx / distanceM) * lookaheadM;
     localGoalY = robotY + (dy / distanceM) * lookaheadM;
+    plannerTelemetry.planReason = "direct_waypoint";
   }
 
-  bool frontWallBypassActive =
-    obstacleBypassSideSign != 0.0f &&
-    obstacleBypassTargetOutwardM >= PLANNER_FRONT_WALL_BYPASS_OUTWARD_M - 0.001f &&
-    (reverseRecoveryActive ||
-     obstacleBypassPhase == BYPASS_FRONT_WALL_REVERSE);
-  if (!frontWallBypassActive &&
-      obstacleBypassPhase == BYPASS_SIDE_ESCAPE &&
-      obstacleBypassSideSign != 0.0f &&
-      obstacleBypassTargetOutwardM >= PLANNER_FRONT_WALL_BYPASS_OUTWARD_M - 0.001f &&
-      routeFrameValid) {
-    float outwardM = obstacleBypassSideSign *
-      routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy);
-    frontWallBypassActive = outwardM < obstacleBypassTargetOutwardM;
-  }
-  if (frontWallBypassActive) {
-    buildSideEscapeLocalGoal(obstacleBypassSideSign,
-                             0.0f,
-                             localGoalX,
-                             localGoalY);
-    clearanceEscapeLocalGoalActive = true;
-    plannerTelemetry.replanReason = "front_wall_bypass_waypoint";
-  } else {
-    clearanceEscapeLocalGoalActive = buildClearanceEscapeLocalGoal(localGoalX, localGoalY);
-  }
-  float reverseRecoveryGoalX = localGoalX;
-  float reverseRecoveryGoalY = localGoalY;
-  bool pendingPostReverseEscapeStart = false;
-  float pendingPostReverseEscapeSideSign = 0.0f;
-  SideEscapeEvidence pendingPostReverseEscapeEvidence = {};
-  if (postReverseEscapeActive) {
-    clearanceEscapeLocalGoalActive =
-      buildPostReverseEscapeLocalGoal(localGoalX,
-                                      localGoalY,
-                                      false,
-                                      pendingPostReverseEscapeStart,
-                                      pendingPostReverseEscapeSideSign,
-                                      pendingPostReverseEscapeEvidence) ||
-      clearanceEscapeLocalGoalActive;
-  } else if (reverseRecoveryActive &&
-             reverseSurveyReadyToTryForward &&
-             buildPostReverseEscapeLocalGoal(localGoalX,
-                                             localGoalY,
-                                             true,
-                                             pendingPostReverseEscapeStart,
-                                             pendingPostReverseEscapeSideSign,
-                                             pendingPostReverseEscapeEvidence)) {
-    clearanceEscapeLocalGoalActive = true;
-  }
-
-  if (!clearanceEscapeLocalGoalActive &&
-      !postReverseEscapeActive &&
-      obstacleBypassPhase == BYPASS_SIDE_ESCAPE &&
-      obstacleBypassSideSign != 0.0f &&
-      routeFrameValid &&
-      detourRejoinActive) {
-    float outwardM = obstacleBypassSideSign *
-      routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy);
-    float requiredOutwardM =
-      max(PLANNER_SIDE_ESCAPE_MIN_OUTWARD_M, obstacleBypassTargetOutwardM);
-    if (outwardM < requiredOutwardM) {
-      buildSideEscapeLocalGoal(obstacleBypassSideSign,
-                               0.0f,
-                               localGoalX,
-                               localGoalY);
-      clearanceEscapeLocalGoalActive = true;
-      plannerTelemetry.replanReason = "side_escape_hold_waypoint";
-    }
-  }
-
-  if (clearanceEscapeRouteDetourActive &&
-      !clearanceEscapeLocalGoalActive &&
-      !postReverseEscapeActive &&
-      detourRejoinActive &&
-      obstacleBypassPhase != BYPASS_ROUTE_REJOIN) {
-    setObstacleBypassPhase(BYPASS_ROUTE_REJOIN, "side_clear_route_rejoin");
-  }
-
-  if (clearanceEscapeRouteDetourActive && !detourRejoinActive &&
-      !clearanceEscapeLocalGoalActive && !postReverseEscapeActive) {
-    clearSideEscapeDetourIfActive("final_approach_window");
-  }
-
-  float localGoalDistanceM =
-    sqrtf((localGoalX - robotX) * (localGoalX - robotX) +
-          (localGoalY - robotY) * (localGoalY - robotY));
-  if (updateRecoveryLiveness(distanceM, localGoalDistanceM,
-                             routeFrameValid, routeUx, routeUy)) {
-    return;
-  }
-
-  // For mostly-forward point goals, the useful physical task is crossing the
-  // target plane while staying close to the requested route. A strict 60 mm
-  // centre-point circle is retained above, but it is too brittle as the only
-  // success condition once the drivetrain drifts a little at speed.
-  if (!clearanceEscapeLocalGoalActive && routeLineEligible &&
+  if (!avoidanceActive && routeLineEligible &&
       routeLineGoalReached(routeLengthM, routeUx, routeUy, routeHeadingRad)) {
     finishNavigationGoal(true, PLANNER_STOP_NONE, "route_line_reached");
     return;
   }
-  if (!clearanceEscapeLocalGoalActive && routeLineEligible &&
+  if (!avoidanceActive && routeLineEligible &&
       routeLineOvershootStopReached(routeLengthM, routeUx, routeUy, routeHeadingRad)) {
     finishNavigationGoal(true, PLANNER_STOP_NONE, "route_line_overshoot_reached");
     return;
   }
-  if (!clearanceEscapeLocalGoalActive && routeLineEligible &&
+  if (!avoidanceActive && routeLineEligible &&
       routeLineClearlyMissed(routeLengthM, routeUx, routeUy)) {
     finishNavigationGoal(false, PLANNER_STOP_ABORTED, "route_line_missed");
     return;
@@ -3483,35 +3744,6 @@ static void updatePointGoal() {
     plannerTelemetry.replanReason = "wheel_progress_stalled";
     finishNavigationGoal(false, PLANNER_STOP_STUCK, "drive_progress_stalled");
     return;
-  }
-
-  if (reverseRecoveryActive) {
-    if (reversePlannerEpoch.active) {
-      TrajectoryPlanResult reverseResult =
-        selectReverseRecoveryTrajectory(reverseRecoveryGoalX,
-                                         reverseRecoveryGoalY);
-      if (reverseResult == TRAJECTORY_PLAN_NO_PATH) {
-        motorStopRequested = true;
-        setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
-        reportPlannerStopIfChanged();
-      }
-      return;
-    }
-    ReverseSurveyDecision surveyDecision = updateReverseSurveyDecision();
-    if (surveyDecision == REVERSE_SURVEY_HOLD) {
-      return;
-    }
-    if (surveyDecision == REVERSE_SURVEY_REVERSE) {
-      TrajectoryPlanResult reverseResult =
-        selectReverseRecoveryTrajectory(reverseRecoveryGoalX,
-                                         reverseRecoveryGoalY);
-      if (reverseResult == TRAJECTORY_PLAN_NO_PATH) {
-        motorStopRequested = true;
-        setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
-        reportPlannerStopIfChanged();
-      }
-      return;
-    }
   }
 
   TrajectoryPlanResult trajectoryResult =
@@ -3525,60 +3757,10 @@ static void updatePointGoal() {
     return;
   }
   if (trajectoryResult == TRAJECTORY_PLAN_SUCCESS) {
-    if (reverseRecoveryActive) {
-      if (pendingPostReverseEscapeStart) {
-        startPostReverseEscape(pendingPostReverseEscapeEvidence);
-        endReverseRecovery("forward_path_found_post_escape");
-      } else {
-        setObstacleBypassPhase(BYPASS_ROUTE_REJOIN,
-                               "reverse_forward_path_side_clear");
-        endReverseRecovery("forward_path_found");
-      }
-    }
-    // Any safe forward arc breaks the no-path streak. The recovery condition
-    // is therefore genuinely "no forward path exists", not merely "an
-    // obstacle was briefly visible".
     resetGeometricNoPathEvidence();
     return;
   }
 
-  if (!reverseRecoveryActive &&
-      obstacleBypassPhase == BYPASS_FINAL_APPROACH &&
-      distanceM <= PLANNER_FINAL_BLOCKED_ACCEPTANCE_M &&
-      plannerTelemetry.stopReason == PLANNER_STOP_NO_SAFE_TRAJECTORY &&
-      footprintClear(robotX, robotY, navigationHeadingRad())) {
-    // This is a bounded stop-only completion, not permission to traverse the
-    // rejected rollout. finishNavigationGoal() clears the command before the
-    // success event is published.
-    finishNavigationGoal(true, PLANNER_STOP_NONE, "final_blocked_reached");
-    return;
-  }
-
-  if (reverseRecoveryActive) {
-    if (reverseSurveyReadyToTryForward) {
-      if (reverseSurveyForcedByMaxRetreat &&
-          reverseRecoveryRetreatDistanceM() >=
-            PLANNER_REVERSE_SURVEY_MAX_REVERSE_M - 0.01f) {
-        finishNavigationGoal(false,
-                             PLANNER_STOP_NO_SAFE_TRAJECTORY,
-                             "reverse_survey_no_escape");
-        return;
-      }
-      requestReverseSurveyRetry("forward_arc_rejected");
-    }
-    TrajectoryPlanResult reverseResult =
-      selectReverseRecoveryTrajectory(reverseRecoveryGoalX,
-                                       reverseRecoveryGoalY);
-    if (reverseResult == TRAJECTORY_PLAN_NO_PATH) {
-      motorStopRequested = true;
-      setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
-      reportPlannerStopIfChanged();
-    }
-    return;
-  }
-
-  // A first failure is a safe stop. The debounce filters a one-frame
-  // map/sensor disagreement before reverse recovery becomes eligible.
   motorStopRequested = true;
   setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
   reportPlannerStopIfChanged();
@@ -3587,22 +3769,11 @@ static void updatePointGoal() {
     return;
   }
   noteGeometricNoPathEpoch();
-  unsigned long now = millis();
-  if (now - noSafeTrajectorySinceMs >= PLANNER_NO_PATH_BACKTRACK_DELAY_MS &&
-      canStartReverseRecovery()) {
-    if (recoveryAttemptCount >= PLANNER_RECOVERY_MAX_COUNT) {
-      abortRecoveryLiveness(PLANNER_STOP_RECOVERY_REPEATED,
-                            "recovery_count_exhausted");
-      return;
-    }
-    startReverseRecovery();
-    TrajectoryPlanResult reverseResult =
-      selectReverseRecoveryTrajectory(localGoalX, localGoalY);
-    if (reverseResult == TRAJECTORY_PLAN_NO_PATH) {
-      motorStopRequested = true;
-      setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
-      reportPlannerStopIfChanged();
-    }
+  if (millis() - noSafeTrajectorySinceMs >= PLANNER_NO_PATH_ABORT_MS) {
+    finishNavigationGoal(false, PLANNER_STOP_NO_SAFE_TRAJECTORY,
+                         avoidanceActive
+                           ? "obstacle_has_no_safe_forward_bypass"
+                           : "no_safe_forward_trajectory");
   }
 }
 
@@ -3740,7 +3911,7 @@ void updateNavigationController() {
     : PLANNER_UPDATE_INTERVAL_MS;
   bool plannerEpochPending =
     navigationGoal.mode == NAV_GOAL_POINT &&
-    (plannerEpoch.active || reversePlannerEpoch.active);
+    plannerEpoch.active;
   if (!plannerEpochPending && now - lastPlannerUpdateMs < updateIntervalMs) {
     return;
   }
@@ -3765,10 +3936,7 @@ void initializeNavigationController() {
   resetReversePlannerEpoch();
   lastPlannerCommandPublishedMs = 0;
   resetEncodersAndPID();
-  resetReverseSurveyState();
-  resetPostReverseEscapeState();
-  resetClearanceEscapeMemory("controller_initialised");
-  resetRecoveryLivenessState();
+  resetObstacleContext("controller_initialised");
   plannerTelemetry.planReason = "initialised";
 }
 
@@ -3800,19 +3968,8 @@ void updateRobotController() {
       plannerTelemetry.replanReason = "tof_close_revalidating";
     }
 
-    // Reverse recovery owns rearward motion while no forward arc exists. Front
-    // blocked evidence remains the trigger for recovery, but it must not
-    // cancel the trusted rear-arc command that is moving the chassis out.
-    if (!immediateSafetyStop && navigationGoal.active && !reverseRecoveryActive &&
+    if (!immediateSafetyStop && navigationGoal.active &&
         isRangeSensorBlocked(RANGE_FRONT)) {
-      // Remember the turn direction that would steer into the tighter side.
-      // Positive turn is robot-left in the navigation frame; negative is
-      // robot-right. Penalising that sign prevents repeated retries into the
-      // same side obstruction.
-      recentBlockedTurnDirection =
-        getRangeSensorDistance(RANGE_RIGHT_INNER) <= getRangeSensorDistance(RANGE_LEFT_INNER)
-          ? -1 : 1;
-      recentBlockedTurnMs = now;
       immediateSafetyStop = true;
       motorStopRequested = true;
       setMotionCommand(0.0, 0.0);
@@ -3821,11 +3978,8 @@ void updateRobotController() {
       plannerTelemetry.replanReason = "front_blocked";
       reportPlannerStopIfChanged();
       if (navigationGoal.mode == NAV_GOAL_POINT) {
-        // Keep the emergency motor stop, but let point-goal planning observe
-        // the persistent blocked-front state. selectTrajectory() still
-        // rejects all forward arcs while front_blocked is true; after the
-        // no-path debounce this can enter reverse-arc recovery
-        // instead of freezing forever at the first blocked reading.
+        // Keep the immediate neutral command, then allow the point planner to
+        // publish only if a fresh forward arc passes the same sensor/map veto.
         immediateSafetyStop = false;
       } else if (navigationGoal.mode == NAV_GOAL_TURN) {
         cancelNavigationGoal(PLANNER_STOP_FRONT_BLOCKED, "front_blocked_during_turn");
@@ -3834,14 +3988,11 @@ void updateRobotController() {
 
     RangeSensorId diagonalSensor;
     float diagonalClearanceMm = 0.0;
-    if (!immediateSafetyStop && navigationGoal.active && !reverseRecoveryActive &&
+    if (!immediateSafetyStop && navigationGoal.active &&
         getDiagonalClearanceWarning(diagonalSensor, diagonalClearanceMm)) {
       // This is the fast, current-pose guard. It uses chassis-footprint
       // clearance rather than turn radius, so it can stop an imminent clip
       // without wrongly forbidding a pre-aligned narrow straight passage.
-      recentBlockedTurnDirection =
-        FAN_SENSOR_GEOMETRY[(int)diagonalSensor].angleDeg < 0.0 ? -1 : 1;
-      recentBlockedTurnMs = now;
       immediateSafetyStop = true;
       motorStopRequested = true;
       setMotionCommand(0.0, 0.0);

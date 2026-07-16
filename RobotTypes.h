@@ -1,8 +1,31 @@
 ﻿#ifndef ROBOT_TYPES_H
 #define ROBOT_TYPES_H
 
+// =====================================================
+// Shared enums and lightweight data structures
+// =====================================================
+// Responsibility:
+//   Defines the vocabulary used by the firmware: sensor identifiers, robot
+//   states, navigation goal ownership, motion authority, telemetry payloads,
+//   and simple geometry records.
+// Interacts with:
+//   Included through Robot.h by all modules. Bluetooth.cpp prints many of
+//   these fields, LocalPlanner.cpp consumes navigation and planner structs,
+//   TofSensors.cpp fills RangeSensorState, ObjectDetection.cpp fills object
+//   structs, and MotorControl.cpp enforces MotionAuthority.
+// Control flow:
+//   No executable runtime logic except small constexpr policy checks and
+//   static_assert invariants for motion authority.
+// Global state:
+//   These are type definitions only. Instances live in Globals.cpp and are
+//   read/modified by the subsystem that owns each behavior.
+
 #include <Arduino.h>
 
+// Physical fan sensors come first and match FAN_SENSOR_GEOMETRY indices.
+// RANGE_FRONT/RANGE_LEFT/RANGE_RIGHT are derived aggregate views; there is no
+// physical front-centre ToF in this layout. RANGE_FAKE_REAR is temporary test
+// scaffolding and must not be treated as competition-ready rear coverage.
 enum RangeSensorId {
   RANGE_RIGHT_OUTER,
   RANGE_RIGHT_INNER,
@@ -16,6 +39,7 @@ enum RangeSensorId {
 };
 
 struct RobotFootprintGeometry {
+  // Millimetres from the drive-wheel midpoint to each chassis edge.
   float frontExtentMm;
   float rearExtentMm;
   float leftExtentMm;
@@ -23,12 +47,15 @@ struct RobotFootprintGeometry {
 };
 
 struct FanSensorGeometry {
+  // Robot-frame mounting pose in millimetres/degrees. +X is forward, +Y left.
   float xMm;
   float yMm;
   float angleDeg;
 };
 
 struct RangeSensorState {
+  // A ToF reading is more than a number: validity, staleness and blocked state
+  // are kept separately so unknown or old evidence can fail closed.
   const char* name;
   int angleDeg;
   uint16_t distanceMm;
@@ -53,6 +80,7 @@ enum ObjectTofRole {
   OBJECT_ROLE_UPPER
 };
 
+// Object detection is advisory for search/hunt behavior, not a safety input.
 enum ObjectCandidateKind {
   OBJECT_CANDIDATE_DISABLED,
   OBJECT_CANDIDATE_NONE,
@@ -96,6 +124,8 @@ struct ObjectCandidateState {
 };
 
 struct ObjectTargetEstimate {
+  // robotXmm/robotYmm are in the robot body frame; worldX/worldY are the same
+  // target transformed into the odometry frame at the time of estimation.
   bool valid;
   float robotXmm;
   float robotYmm;
@@ -121,6 +151,9 @@ struct AvoidSideClearance {
   float scoreMm;
 };
 
+// The active mission currently uses INIT, FOLLOW_PATH, RETURN_HOME and
+// END_MATCH. Other labels are retained so telemetry keeps a stable schema
+// while future mission phases are built.
 enum RobotState {
   INIT,
   FOLLOW_PATH,
@@ -139,6 +172,8 @@ enum NavigationGoalMode {
   NAV_GOAL_TURN
 };
 
+// Owner identifies why a goal exists. It affects completion events,
+// test-vs-route cleanup, and special object-hunt finish behavior.
 enum NavigationGoalOwner {
   NAV_OWNER_ROUTE,
   NAV_OWNER_RETURN_HOME,
@@ -152,6 +187,8 @@ enum NavigationGoalOwner {
   NAV_OWNER_OBJECT_HUNT
 };
 
+// Exactly one of these may own motion at a time. MotorControl.cpp enforces it
+// at command acceptance and again at the final motor writer.
 enum MotionAuthority {
   MOTION_AUTHORITY_NONE,
   MOTION_AUTHORITY_MISSION,
@@ -192,6 +229,9 @@ enum PlannerStopReason {
 };
 
 struct NavigationGoal {
+  // Active goal in world metres/degrees. For NAV_GOAL_POINT, targetX/Y are the
+  // desired waypoint. For NAV_GOAL_TURN, targetYawDeg is an absolute
+  // navigation-frame heading, positive CCW/left.
   NavigationGoalMode mode;
   NavigationGoalOwner owner;
   MotionAuthority authority;
@@ -208,6 +248,9 @@ struct NavigationGoal {
 };
 
 struct PlannerTelemetry {
+  // Public planner state for STATUS/CSV. Speeds are ticks/s, distances are
+  // metres unless suffixed with Mm, and timings are milliseconds/microseconds
+  // as named. String pointers reference static literals, not owned buffers.
   float selectedForwardTicksPerSec;
   float selectedTurnTicksPerSec;
   float selectedCurvature;
@@ -239,6 +282,8 @@ struct PlannerTelemetry {
 };
 
 struct Waypoint {
+  // Default route point in world metres plus an action string such as PAUSE,
+  // HOME, or SEARCH. StateMachine.cpp interprets the action.
   float x;
   float y;
   const char* action;

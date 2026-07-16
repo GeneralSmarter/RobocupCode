@@ -3,9 +3,28 @@
 // =====================================================
 // Compatibility diagnostics for the local planner
 // =====================================================
+// Responsibility:
+//   Provides the stationary TEST SIDE diagnostic for comparing left/right
+//   fan clearance. It is not the active motion planner.
+// Interacts with:
+//   Bluetooth.cpp calls evaluateAvoidTurnDirection() when printing side
+//   samples. TofSensors.cpp supplies fan validity and turn-sweep clearance.
+// Control flow:
+//   TEST SIDE repeatedly samples this logic while motors are stopped.
+// Global state:
+//   Reads range sensor state only. It does not command motors or modify the
+//   navigation goal.
 // Obstacle avoidance is no longer a scripted manoeuvre.  The only decision
 // retained here is the stationary fan diagnostic used by TEST SIDE.
 
+// Evaluates one side's two fan rays for pivot-style sweep clearance.
+//
+// Inputs/outputs:
+//   choice selects left or right; assessment is filled with validity,
+//   pass/fail, individual clearances in millimetres, and a score.
+//
+// LEARNING NOTE: This is deliberately a turn-sweep diagnostic, which is more
+// conservative than straight-drive footprint clearance.
 static void assessAvoidSideClearance(AvoidTurnChoice choice,
                                      AvoidSideClearance &assessment) {
   const RangeSensorId innerId = choice == AVOID_TURN_LEFT ? RANGE_LEFT_INNER : RANGE_RIGHT_INNER;
@@ -27,6 +46,11 @@ static void assessAvoidSideClearance(AvoidTurnChoice choice,
   assessment.passable = assessment.scoreMm >= AVOID_CLEARANCE_MARGIN_MM;
 }
 
+// Chooses the side with enough and preferably greater sweep clearance.
+//
+// SAFETY: This diagnostic never authorizes motion by itself. The actual
+// planner still evaluates swept trajectories and MotorControl.cpp performs
+// continuous safety checks before any servo pulse changes.
 AvoidTurnChoice evaluateAvoidTurnDirection(AvoidSideClearance &left,
                                            AvoidSideClearance &right,
                                            const char* &reason) {

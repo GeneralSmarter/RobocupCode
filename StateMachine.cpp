@@ -3,6 +3,23 @@
 // =====================================================
 // Mission state machine
 // =====================================================
+// Responsibility:
+//   Owns high-level mission progression: boot init, waypoint route following,
+//   return-home request handling, END_MATCH cleanup, and the object/weight
+//   search mini-state-machine.
+// Interacts with:
+//   Navigation.cpp/LocalPlanner.cpp receive goals through goToPoint(),
+//   startNavigationPoint(), and startNavigationTurn(). ObjectDetection.cpp
+//   supplies candidate/target state. Bluetooth.cpp starts tests and prints
+//   state telemetry. MotorControl.cpp remains the only motor-output owner.
+// Control flow:
+//   RobotCode.ino calls runStateMachine() only when robotRunEnabled is true
+//   and manual drive is inactive. This file assigns goals and watches goal
+//   completion/failure; it never writes servo pulses directly.
+// Global state:
+//   Modifies currentState/previousState, currentWaypointIndex, route pause
+//   timers, returnHomeRequested, robotRunEnabled during END_MATCH, weight
+//   search latches, and navigation goal results via LocalPlanner APIs.
 // Motion is never executed from this state machine.  It only assigns goals to
 // the incremental navigation controller and observes their results.
 
@@ -65,6 +82,8 @@ static void clearWeightSearchState() {
 }
 
 static void resumeInterruptedRoute(const char* eventName, const char* detail) {
+  // Ends a route interrupt without advancing the waypoint. A short pause gives
+  // the route controller a clean stopped handoff before it resumes.
   sendBluetoothEvent(eventName, detail);
   clearWeightSearchState();
   weightInterruptLastMs = millis();
@@ -76,6 +95,9 @@ static void resumeInterruptedRoute(const char* eventName, const char* detail) {
 }
 
 static void completeWeightSearch(const char* eventName, const char* detail) {
+  // Common success/no-target exit. TEST searches stop the robot; route
+  // searches either resume the interrupted route or advance past the SEARCH
+  // waypoint.
   sendBluetoothEvent(eventName, detail);
   WeightSearchMode completedMode = weightSearchMode;
   clearWeightSearchState();
@@ -105,6 +127,8 @@ static void completeWeightSearch(const char* eventName, const char* detail) {
 }
 
 static void failWeightSearch(const char* detail) {
+  // Fail closed on object-hunt/search faults. The current implementation does
+  // not try to continue the mission after a hunt failure.
   sendBluetoothEvent("weight_search_hunt_failed", detail);
   clearWeightSearchState();
   motorStopRequested = true;
@@ -131,6 +155,9 @@ static void beginSearchTargetConfirm(const char* detail,
 
 static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
                               const char* detail) {
+  // Starts the search scan from either the current pose or a route waypoint
+  // anchor. The scan itself is built from ordinary navigation turn goals, so
+  // it remains safety-supervised.
   sendBluetoothEvent("weight_search_start", detail);
   weightSearchMode = mode;
   if (mode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT &&
@@ -148,6 +175,9 @@ static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
 }
 
 static void beginRouteWeightInterrupt(WeightSearchMode mode, const char* detail) {
+  // Cancels the route-owned goal before beginning an opportunistic object
+  // confirmation. This prevents route and hunt goals from owning motion at
+  // the same time.
   if (isNavigationGoalActive()) {
     cancelNavigationGoal(PLANNER_STOP_ABORTED, detail);
   }
@@ -166,6 +196,9 @@ static void beginRouteWeightInterrupt(WeightSearchMode mode, const char* detail)
 }
 
 static void lockSearchTarget(const char* detail) {
+  // Converts the current confirmed object target into a normal point goal.
+  // LocalPlanner.cpp handles the pickup carry-through behavior for object
+  // hunt owners.
   sendBluetoothEvent("weight_search_target_locked", detail);
   startNavigationPoint(objectTargetEstimate.worldX, objectTargetEstimate.worldY,
                        NAV_OWNER_OBJECT_HUNT);
@@ -175,6 +208,9 @@ static void lockSearchTarget(const char* detail) {
 
 static void beginSearchTargetConfirm(const char* detail,
                                      WeightSearchPhase resumePhase) {
+  // If the detected object is not centered, turn toward its estimated bearing
+  // before locking the hunt target. The turn angle is clamped so a noisy target
+  // estimate cannot demand a large spin.
   weightSearchConfirmResumePhase = resumePhase;
   weightSearchConfirmDetail = detail;
 
@@ -210,11 +246,15 @@ static bool checkSearchTargetWindow(const char* detail,
 }
 
 void startWeightSearchTest() {
+  // Bluetooth TEST SEARCH entry point. It uses the same phase machine as route
+  // searches but finishes by stopping in END_MATCH.
   clearNavigationGoalResult();
   beginWeightSearch(WEIGHT_SEARCH_MODE_TEST, false, "test_search");
 }
 
 void cancelWeightSearch(const char* detail) {
+  // Cancels any scan/hunt-owned navigation goal and returns the mission layer
+  // to a stopped, non-searching state.
   if (isNavigationGoalActive() &&
       (navigationGoal.owner == NAV_OWNER_WEIGHT_SCAN ||
        navigationGoal.owner == NAV_OWNER_OBJECT_HUNT)) {
@@ -228,6 +268,9 @@ void cancelWeightSearch(const char* detail) {
 }
 
 static bool updateWeightSearchTurn(float relativeTurnDeg, WeightSearchPhase nextPhase) {
+  // Starts a turn goal once, then waits across loop iterations for the planner
+  // to report completion/failure. This is the nonblocking replacement for a
+  // delay-based scan.
   if (!weightSearchTurnStarted) {
     startNavigationTurn(relativeTurnDeg, NAV_OWNER_WEIGHT_SCAN);
     weightSearchTurnStarted = true;
@@ -251,6 +294,8 @@ static bool updateWeightSearchTurn(float relativeTurnDeg, WeightSearchPhase next
 }
 
 static void updateWeightSearchAlignment() {
+  // Aligns the robot to face the SEARCH waypoint before the centre/left/right
+  // scan windows. All angles are navigation degrees, positive CCW/left.
   if (currentWaypointIndex >= NUM_POINTS) {
     completeWeightSearch("weight_search_align_failed", "no_search_waypoint");
     return;
@@ -294,6 +339,9 @@ static void updateWeightSearchAlignment() {
 }
 
 static void updateWeightSearch() {
+  // Runs one tick of the weight-search phase machine. Settle phases command
+  // neutral and wait for fresh object readings; turn phases delegate to
+  // LocalPlanner.cpp; hunt phase delegates to a point goal.
   if (currentWaypointIndex >= NUM_POINTS) {
     clearWeightSearchState();
     return;
@@ -457,6 +505,9 @@ static void updateWeightSearch() {
 }
 
 static bool assignSearchWaypointStandoffOrStartSearch() {
+  // SEARCH waypoints are approached from a short standoff distance. This gives
+  // the object sensors space to observe the target before the hunt goal is
+  // created.
   if (currentWaypointIndex >= NUM_POINTS) {
     return false;
   }
@@ -496,6 +547,8 @@ static bool assignSearchWaypointStandoffOrStartSearch() {
 }
 
 static bool tryStartRouteWeightInterrupt() {
+  // Opportunistic route interrupt: if a confirmed object appears during a
+  // route-owned navigation goal, pause the route and handle one target.
   if (weightInterruptCooldownActive() ||
       currentWaypointIndex >= NUM_POINTS ||
       !isNavigationGoalActive() ||
@@ -515,6 +568,8 @@ static bool tryStartRouteWeightInterrupt() {
 }
 
 void runStateMachine() {
+  // Dispatches the high-level robot state. Obstacle/recovery labels are kept
+  // for telemetry compatibility but no longer run separate scripted routines.
   switch (currentState) {
     case INIT:
       runInitState();
@@ -541,6 +596,8 @@ void runStateMachine() {
 }
 
 void runInitState() {
+  // Resets mission-owned latches and assigns the first active state. It does
+  // not reset yaw/pose; ZERO owns coordinate reset explicitly.
   setMotionCommand(0.0, 0.0);
   motorStopRequested = true;
   currentWaypointIndex = 0;
@@ -627,6 +684,9 @@ void runFollowPathState() {
 }
 
 void runReturnHomeState() {
+  // Assigns a single local-planner point goal at world origin and waits for
+  // completion. Failure currently leaves the result visible rather than
+  // attempting an unproven recovery.
   if (!isNavigationGoalActive() && !didNavigationGoalComplete() && !didNavigationGoalFail()) {
     Serial.println("RETURN_HOME: assigning local navigation goal x=0.000 y=0.000");
     startNavigationPoint(0.0, 0.0, NAV_OWNER_RETURN_HOME);
@@ -641,6 +701,8 @@ void runReturnHomeState() {
 }
 
 void runUnusedState(const char* stateName) {
+  // Placeholder states fail safe. They are named in RobotState but not yet
+  // implemented as a scoring mission.
   motorStopRequested = true;
   setMotionCommand(0.0, 0.0);
   Serial.print(stateName);
@@ -649,6 +711,9 @@ void runUnusedState(const char* stateName) {
 }
 
 void runEndMatchState() {
+  // END_MATCH is the normal stopped terminal state. It keeps requesting
+  // neutral and disables robotRunEnabled so loop() cannot keep advancing
+  // autonomous logic.
   motorStopRequested = true;
   setMotionCommand(0.0, 0.0);
   robotRunEnabled = false;
@@ -684,6 +749,9 @@ static void enforceEndMatchMotionSafety() {
 }
 
 void setRobotState(RobotState newState) {
+  // Central state transition helper. Entering END_MATCH first revokes motion
+  // authority and cancels goals so no old owner can publish a command during
+  // cleanup.
   if (newState == END_MATCH) {
     enforceEndMatchMotionSafety();
   }
@@ -713,6 +781,9 @@ const char* robotStateName(RobotState state) {
 }
 
 void setMotionCommand(float forwardSpeed, float turnSpeed) {
+  // Legacy neutral/direct desired-speed setter. Non-neutral safety-supervised
+  // commands should flow through setAuthorizedMotionCommand(); a neutral call
+  // is allowed here for cleanup from any module.
   if (fabs(forwardSpeed) < 1.0f && fabs(turnSpeed) < 1.0f) {
     stopMotors();
     return;

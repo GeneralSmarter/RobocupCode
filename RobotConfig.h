@@ -1,6 +1,32 @@
 ﻿#ifndef ROBOT_CONFIG_H
 #define ROBOT_CONFIG_H
 
+// =====================================================
+// Calibration, geometry, timing, and safety constants
+// =====================================================
+// Responsibility:
+//   Holds the firmware's tunable constants and hardware pin/address mapping.
+//   Values here define real robot behavior: motor pulses, encoder scale,
+//   sensor addresses, chassis geometry, planner margins, timing budgets,
+//   and recovery limits.
+// Interacts with:
+//   All behavior modules read this file through Robot.h. MotorControl.cpp uses
+//   motor/PID/timing values, TofSensors.cpp and ObjectDetection.cpp use sensor
+//   configuration, LocalPlanner.cpp uses geometry/planner/recovery values,
+//   and Bluetooth.cpp exposes selected tuning knobs at runtime.
+// Control flow:
+//   No functions run here. static_assert checks catch configuration contracts
+//   at compile time, such as planner command age staying shorter than the
+//   motor command lease.
+// Global state:
+//   Constants are read-only at runtime except for runtime copies such as
+//   baseTargetSpeed, leftForwardBaseUs, rightForwardBaseUs, and
+//   weightScanTurnOffsetUs, which Bluetooth commands can adjust for this boot.
+//
+// COORDINATE CONVENTION: Robot geometry is measured from the midpoint between
+// the drive wheels: +X forward, +Y robot-left, angles positive CCW/left.
+// Units are encoded in names: mm, m, ms, us, ticks/s, and degrees.
+
 #include <Arduino.h>
 #include "RobotTypes.h"
 
@@ -408,6 +434,13 @@ const float PLANNER_POINT_ALIGN_SIDE_TIE_MM = 50.0;
 // Reverse recovery is an explicit no-forward-path recovery. For this testing
 // build, RANGE_FAKE_REAR is trusted as a real rear clearance sensor.
 const unsigned long PLANNER_NO_PATH_BACKTRACK_DELAY_MS = 250;
+// Forward-only planner: after repeated coherent geometric failures, remain
+// neutral and end the goal instead of entering rear-sensor recovery.
+const unsigned long PLANNER_NO_PATH_ABORT_MS = 1200;
+const float PLANNER_OBSTACLE_MAX_SPEED_TPS = 1600.0;
+const float PLANNER_OBSTACLE_MIN_OUTWARD_TURN_RATIO = 0.50;
+const float PLANNER_OBSTACLE_TURN_ROOM_M = 0.12;
+const float PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M = 0.10;
 const uint8_t PLANNER_REVERSE_MIN_GEOMETRIC_NO_PATH_EPOCHS = 2;
 const float PLANNER_REVERSE_RECOVERY_MAX_SPEED_TPS = 1700.0;
 const float PLANNER_REVERSE_RECOVERY_MIN_SPEED_TPS = PLANNER_MIN_DRIVABLE_SPEED_TPS;

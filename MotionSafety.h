@@ -1,6 +1,21 @@
 ﻿#ifndef MOTION_SAFETY_H
 #define MOTION_SAFETY_H
 
+// =====================================================
+// Pure motion-safety policy helpers
+// =====================================================
+// Responsibility:
+//   Defines why the final motor writer may reject motion and provides
+//   constexpr policy functions for lease and direction-aware sensor safety.
+// Interacts with:
+//   MotorControl.cpp gathers live evidence, calls these policies, and turns
+//   any non-clear result into neutral motor output plus telemetry.
+// Control flow:
+//   No hardware access happens here. The functions are pure so the policy can
+//   be checked by static_assert and by host-side tests without a Teensy.
+// Global state:
+//   None. Callers provide all evidence as parameters.
+
 enum MotionSafetyReason {
   MOTION_SAFETY_CLEAR,
   MOTION_SAFETY_FRONT_INVALID,
@@ -28,6 +43,9 @@ constexpr MotionSafetyReason motorLeasePolicy(bool nonNeutral,
 }
 
 struct MotionSafetyEvidence {
+  // Each boolean is already direction-filtered by the caller. For example,
+  // turnSideValid means the side being swept by the requested turn is valid,
+  // not merely that some side sensor exists.
   bool frontValid;
   bool frontClear;
   bool closeReadingStable;
@@ -40,6 +58,10 @@ struct MotionSafetyEvidence {
 
 // Pure policy kept separate from sensor access so the direction contract is
 // compile-time checkable. Compound motion must satisfy every relevant branch.
+//
+// SAFETY: Unknown evidence fails closed for the direction that needs it.
+// Neutral motion deliberately remains available so cleanup can always write
+// STOP_US even when sensors or watchdog setup are unhealthy.
 constexpr MotionSafetyReason motionSafetyPolicy(
     bool needsForward, bool needsReverse, bool needsTurnSide,
     bool needsTurnSweep, MotionSafetyEvidence evidence) {

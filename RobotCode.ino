@@ -1,8 +1,22 @@
 ﻿// =====================================================
 // ROBOCUP ROBOT CODE
 // =====================================================
-// V7 local-planner firmware. This sketch only performs setup and schedules
-// the module-owned control loop.
+// Responsibility:
+//   Arduino entry point for the active V7 Teensy 4.0 robot firmware.
+//   This file owns hardware startup and the top-level loop schedule only.
+// Interacts with:
+//   Robot.h for all shared objects, Bluetooth.cpp for operator commands,
+//   StateMachine.cpp for mission decisions, LocalPlanner.cpp for sensing,
+//   odometry and navigation updates, and MotorControl.cpp for the only
+//   periodic servo output path.
+// Control flow:
+//   setup() initializes hardware and shared state once. loop() repeatedly
+//   services safety, command input, mission logic, the controller pipeline,
+//   and queued telemetry.
+// Global state:
+//   Initializes motors, encoder interrupts, IMU/ToF hardware, pose
+//   (robotX/robotY/robotTheta), navigation controller state, timing
+//   diagnostics, and motor safety watchdog state.
 // =====================================================
 
 #include "Robot.h"
@@ -10,6 +24,15 @@
 // =====================================================
 // Setup
 // =====================================================
+// Called once by the Arduino runtime after reset or upload.
+//
+// LEARNING NOTE: Arduino sketches do not have a visible main() here. The
+// Teensy/Arduino core calls setup() once, then calls loop() forever.
+//
+// SAFETY: setup() attaches motors, immediately writes neutral, and starts the
+// motor lease/watchdog before any navigation goal can be created. It also
+// blocks until the IMU and navigation ToF sensors are connected, so the robot
+// does not enter the normal control loop with missing required hardware.
 void setup() {
   Serial.begin(115200);
   setupBluetooth();
@@ -55,6 +78,18 @@ void setup() {
 // =====================================================
 // Main loop
 // =====================================================
+// Called repeatedly by the Arduino runtime.
+//
+// CONTROL FLOW: This is the complete normal runtime order. Command parsing can
+// arm/start/stop modes, the state machine can assign navigation goals, and
+// updateRobotController() performs sensing, map updates, odometry, planning,
+// motor control, and telemetry construction.
+//
+// SAFETY: The motor watchdog is serviced before command/state/controller work,
+// and updateRobotController() ends at updateMotorController(), the sole
+// periodic servo writer. If robotRunEnabled is false and manual drive is not
+// active, this loop requests neutral instead of letting an old goal keep
+// publishing commands.
 void loop() {
   noteMainLoopHeartbeat();
   unsigned long phaseStartedUs = micros();

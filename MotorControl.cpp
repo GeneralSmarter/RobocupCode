@@ -1,5 +1,28 @@
 ﻿#include "Robot.h"
 
+// =====================================================
+// Motor authority, live safety supervision, watchdog, and PID output
+// =====================================================
+// Responsibility:
+//   Owns all periodic physical motor output. It enforces motion authority,
+//   checks live direction-aware safety evidence, manages the command lease and
+//   independent watchdog timer, mixes chassis velocity into wheel targets, and
+//   converts wheel-speed errors into servo microsecond pulses.
+// Interacts with:
+//   StateMachine.cpp/LocalPlanner.cpp/Bluetooth.cpp request motion through
+//   setMotionCommand() or setAuthorizedMotionCommand(). TofSensors.cpp and
+//   LocalPlanner.cpp provide safety predicates. Encoders feed PID speed
+//   feedback. RobotCode.ino calls serviceMotorSafetyWatchdog() and
+//   updateMotorController() every loop.
+// Control flow:
+//   Commands are accepted only through setAuthorizedMotionCommand(). The final
+//   servo write happens through writeMotorUS(), which re-checks the motor lease
+//   before touching the Servo objects.
+// Global state:
+//   Owns desiredForwardSpeed/desiredTurnSpeed acceptance, motionAuthority,
+//   motionCommandAuthority, safety-stop latches, motor lease diagnostics,
+//   PID snapshot usage, last motor pulse diagnostics, and loop timing metrics.
+
 static MotionSafetyReason lastSafetyReason = MOTION_SAFETY_CLEAR;
 static bool safetyStopActive = false;
 static IntervalTimer motorSafetyWatchdogTimer;
@@ -17,6 +40,8 @@ static unsigned long maxMainLoopPhaseDurationUs = 0;
 static void writeMotorUS(int leftUs, int rightUs);
 
 static void disarmMotorCommandLease() {
+  // The lease is the "fresh command" proof. Disarming it means any non-neutral
+  // writeMotorUS() call will be converted to STOP_US.
   noInterrupts();
   motorCommandLeaseArmed = false;
   motorCommandLeaseTicksRemaining = 0;
@@ -24,6 +49,8 @@ static void disarmMotorCommandLease() {
 }
 
 static void renewMotorCommandLease() {
+  // Called only after a command passes authority and safety checks. The
+  // IntervalTimer ISR counts this down independently of the main loop.
   noInterrupts();
   motorCommandLeaseTicksRemaining =
     MOTOR_COMMAND_LEASE_MS / MOTOR_COMMAND_WATCHDOG_TICK_MS;
@@ -32,6 +59,8 @@ static void renewMotorCommandLease() {
 }
 
 static void motorSafetyWatchdogISR() {
+  // Runs in interrupt context every MOTOR_COMMAND_WATCHDOG_TICK_MS. Keep this
+  // short and deterministic: no printing, no allocation, no sensor reads.
   if (!motorCommandLeaseArmed) {
     return;
   }
@@ -54,6 +83,8 @@ static void motorSafetyWatchdogISR() {
 }
 
 void initializeMotorSafetyWatchdog() {
+  // Starts the independent timer that can neutralize motors even if the main
+  // loop stalls after publishing a command.
   disarmMotorCommandLease();
   motorSafetyWatchdogReady = motorSafetyWatchdogTimer.begin(
     motorSafetyWatchdogISR, MOTOR_COMMAND_WATCHDOG_TICK_MS * 1000UL);
@@ -63,6 +94,8 @@ void initializeMotorSafetyWatchdog() {
 }
 
 void noteMainLoopHeartbeat() {
+  // Records loop-to-loop timing so STATUS/CSV can show whether code paths are
+  // exceeding MAIN_LOOP_DEADLINE_MS while motors are active.
   const unsigned long now = millis();
   if (lastMainLoopHeartbeatMs != 0) {
     lastMainLoopGapMs = now - lastMainLoopHeartbeatMs;
@@ -150,6 +183,8 @@ static bool turnSideCurrent(float turnSpeed) {
 static MotionSafetyReason evaluateMotionSafety(MotionAuthority claimant,
                                                float forwardSpeed,
                                                float turnSpeed) {
+  // Builds the evidence object consumed by the pure policy in MotionSafety.h.
+  // The requested command determines which directions need proof.
   // Match the motor controller's non-neutral boundary exactly. A command at
   // precisely 1 tick/s must not fall between the stop and safety thresholds.
   const bool needsForward = forwardSpeed >= 1.0f;
@@ -212,6 +247,9 @@ bool isMotionSafetyStopActive() {
 }
 
 static void rejectUnsafeMotion(MotionSafetyReason reason) {
+  // Central fail-closed path for unsafe accepted/pending commands. It clears
+  // desired chassis speeds, disarms the lease, drops command authority, writes
+  // neutral, and emits one event per changed reason.
   disarmMotorCommandLease();
   desiredForwardSpeed = 0.0f;
   desiredTurnSpeed = 0.0f;
@@ -230,6 +268,8 @@ static void noteSafeMotion() {
 }
 
 void serviceMotorSafetyWatchdog() {
+  // Converts the ISR's volatile trip latch into normal-loop state and
+  // telemetry. The ISR already wrote neutral; this records why.
   noInterrupts();
   const bool tripPending = motorCommandLeaseTripPending;
   motorCommandLeaseTripPending = false;
@@ -248,6 +288,8 @@ void serviceMotorSafetyWatchdog() {
 // Motor and PID helpers
 // =====================================================
 void stopMotors() {
+  // Public neutral command. It is intentionally available even without motion
+  // authority so every cleanup path can force STOP_US.
   disarmMotorCommandLease();
   desiredForwardSpeed = 0.0f;
   desiredTurnSpeed = 0.0f;
@@ -267,11 +309,15 @@ const char* motionAuthorityName(MotionAuthority authority) {
 }
 
 void revokeMotionAuthority() {
+  // Removes the current owner first, then stops. After this, an old planner or
+  // manual command cannot be accepted by setAuthorizedMotionCommand().
   motionAuthority = MOTION_AUTHORITY_NONE;
   stopMotors();
 }
 
 bool claimMotionAuthority(MotionAuthority authority) {
+  // Grants exclusive ownership to mission, test, or manual mode. The stop call
+  // resets any previous desired command before the new owner begins.
   if (authority == MOTION_AUTHORITY_NONE || motionAuthority != MOTION_AUTHORITY_NONE) {
     return false;
   }
@@ -281,6 +327,12 @@ bool claimMotionAuthority(MotionAuthority authority) {
 }
 
 bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed, float turnSpeed) {
+  // Accepts a chassis command in encoder ticks/s only if the caller owns the
+  // current motion authority and the latest safety evidence permits it.
+  //
+  // SAFETY: Passing this function does not directly write the motors. It only
+  // stores desired speeds and renews the lease; updateMotorController() still
+  // performs a fresh safety check before output.
   if (!motionAuthorityAllows(motionAuthority, authority)) {
     stopMotors();
     return false;
@@ -314,6 +366,9 @@ bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed, f
 }
 
 static void writeMotorUS(int leftUs, int rightUs) {
+  // Final servo-output gate. Even if a bug computes a non-neutral pulse after
+  // the lease expires, this function clamps it back to STOP_US before writing
+  // the Servo objects.
   leftUs = constrain(leftUs, MIN_US, MAX_US);
   rightUs = constrain(rightUs, MIN_US, MAX_US);
 
@@ -336,16 +391,30 @@ static void writeMotorUS(int leftUs, int rightUs) {
 }
 
 int updatePID(float target, float actual, float &integral, float &lastError, float dt, int baseCommand) {
+  // PID correction around a feed-forward servo pulse.
+  // Inputs:
+  //   target/actual are wheel speeds in encoder ticks/s, dt is seconds, and
+  //   baseCommand is the feed-forward pulse in microseconds.
+  // Output:
+  //   Servo pulse in microseconds, clamped to a small band around baseCommand
+  //   and to the global servo min/max.
   float error = target - actual;
 
+  // Integral accumulates persistent error so a wheel that is consistently slow
+  // receives more pulse width over time. The clamp prevents wind-up after a
+  // stall or blocked wheel.
   integral += error * dt;
   integral = constrain(integral, -3000.0, 3000.0);
 
+  // Derivative looks at how fast error is changing. Kd is currently zero, but
+  // keeping the term visible makes future tuning easier.
   float derivative = (error - lastError) / dt;
   float correction = Kp * error + Ki * integral + Kd * derivative;
 
   lastError = error;
 
+  // Add closed-loop correction to the feed-forward estimate. This code assumes
+  // a larger pulse magnitude in the requested direction means more wheel speed.
   int command = baseCommand + correction;
 
   command = constrain(command, baseCommand - 150, baseCommand + 150);
@@ -356,6 +425,8 @@ int updatePID(float target, float actual, float &integral, float &lastError, flo
 
 static int wheelFeedForwardBase(float targetTicksPerSec, int forwardBaseUs,
                                 int reverseBaseUs, float fullScaleTicksPerSec) {
+  // Converts the requested wheel speed into an approximate open-loop pulse.
+  // PID then trims around this value using encoder feedback.
   float scale = constrain(fabs(targetTicksPerSec) / fullScaleTicksPerSec, 0.0, 1.0);
   if (targetTicksPerSec >= 0.0) {
     return STOP_US + (int)((forwardBaseUs - STOP_US) * scale);

@@ -1,6 +1,33 @@
 ﻿#ifndef ROBOT_H
 #define ROBOT_H
 
+#ifdef ROBOT_HOST_SIM
+#include "HostSimRobot.h"
+#else
+
+// =====================================================
+// Shared firmware interface and global state declarations
+// =====================================================
+// Responsibility:
+//   Central include file for the active firmware. It gathers Arduino/library
+//   includes, project types/configuration, extern declarations for shared
+//   hardware/runtime globals, and function prototypes used across modules.
+// Interacts with:
+//   Every RobotCode module includes this file. Globals are defined in
+//   Globals.cpp, while behavior is implemented by Bluetooth.cpp,
+//   StateMachine.cpp, LocalPlanner.cpp, MotorControl.cpp, TofSensors.cpp,
+//   Odometry.cpp, Imu.cpp, Encoders.cpp, ObjectDetection.cpp, and helpers.
+// Control flow:
+//   This file does not execute code, but it exposes the contracts that let
+//   RobotCode.ino schedule the system and let modules call each other without
+//   owning each other's internals.
+// Global state:
+//   Declares motors, encoders, pose, PID state, IMU, ToF sensors, navigation
+//   goals, telemetry, motion authority, route waypoints, and timing stamps.
+//   Units are documented beside the owning constants/types where possible:
+//   pose in metres/degrees, ranges in millimetres, speeds in encoder ticks/s,
+//   and motor commands in servo microseconds.
+
 #include <Arduino.h>
 #include <Servo.h>
 #include <IntervalTimer.h>
@@ -25,6 +52,9 @@ bool isBluetoothCsvStreamEnabled();
 
 class RobotSerialClass {
 public:
+  // Mirrors normal Serial output to the Bluetooth link unless CSV streaming is
+  // active. CSV mode uses Bluetooth.cpp's bounded queue so free-form debug
+  // prints cannot split a machine-readable telemetry row.
   void begin(unsigned long baud) {
     ::Serial.begin(baud);
   }
@@ -72,9 +102,14 @@ extern RobotSerialClass robotSerial;
 extern Servo leftMotor;
 extern Servo rightMotor;
 
+// Volatile because the encoder interrupt service routines update these counts
+// asynchronously while normal loop code reads them. Always use
+// readEncoderCounts() rather than reading these directly.
 extern volatile long leftRawCount;
 extern volatile long rightRawCount;
 
+// Encoder snapshots for speed/PID and odometry. These are intentionally
+// separate so resetting a control segment does not erase odometry history.
 extern long lastLeftCount;
 extern long lastRightCount;
 
@@ -161,6 +196,8 @@ extern bool endMatchPrinted;
 
 extern float desiredForwardSpeed;
 extern float desiredTurnSpeed;
+// DEBUGGING TIP: requested/measured wheel speeds are ticks/s and are published
+// in STATUS/CSV to prove the command-to-encoder chain.
 extern float lastRequestedLeftWheelSpeed;
 extern float lastRequestedRightWheelSpeed;
 extern float lastMeasuredLeftWheelSpeed;
@@ -175,6 +212,8 @@ extern int lastRightMotorUs;
 extern NavigationGoal navigationGoal;
 extern PlannerTelemetry plannerTelemetry;
 extern bool motorStopRequested;
+// Motion authority is the high-level owner (mission/test/manual). The command
+// authority records who last submitted the current desiredForward/Turn command.
 extern MotionAuthority motionAuthority;
 extern MotionAuthority motionCommandAuthority;
 extern bool escapeBacktrackEnabled;
@@ -307,4 +346,5 @@ void setRobotState(RobotState newState);
 const char* robotStateName(RobotState state);
 void setMotionCommand(float forwardSpeed, float turnSpeed);
 
-#endif
+#endif  // ROBOT_HOST_SIM
+#endif  // ROBOT_H

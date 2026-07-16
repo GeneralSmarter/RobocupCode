@@ -3,6 +3,22 @@
 // =====================================================
 // Object / weight detection scaffold
 // =====================================================
+// Responsibility:
+//   Owns the VL53L1X object/weight ToF subsystem, object candidate
+//   classification, and conversion from low-sensor endpoints to a world-frame
+//   pickup target.
+// Interacts with:
+//   TofSensors.cpp starts object pins as part of ToF setup. StateMachine.cpp
+//   uses objectCandidate/objectTargetEstimate for search and hunt behavior.
+//   Bluetooth.cpp exposes TEST OBJECT, TEST HUNT TARGET, TEST HUNT, and CSV
+//   fields. LocalPlanner.cpp treats hunt targets as ordinary point goals.
+// Control flow:
+//   updateObjectTOFSensors() updates one VL53L1X channel per call to avoid a
+//   long sensor burst in the main loop. refreshObjectTargetEstimate() performs
+//   one bounded sweep for command-time diagnostics.
+// Global state:
+//   Modifies objectSensors, objectCandidate, objectTargetEstimate, and the
+//   nextObjectSensorToUpdate round-robin index.
 // This subsystem is intentionally separate from the high VL53L0X navigation
 // fan. It can identify object candidates for slow approach, but it does not
 // provide travel-safety clearance to the V7 local planner.
@@ -93,6 +109,9 @@ static bool isObjectLowNear(ObjectTofId id) {
 }
 
 static bool isObjectUpperClearForLow(ObjectTofId upperId, uint16_t lowDistanceMm) {
+  // If the upper sensor is absent/weak, the system currently treats the low
+  // return as potentially weight-sized. This is useful for bring-up but is a
+  // known classifier limitation: invalid upper data is not proof of material.
   const ObjectSensorState &upper = objectSensors[upperId];
   if (!upper.valid) {
     return true;
@@ -128,6 +147,8 @@ static void invalidateObjectTargetEstimate(const char* reason) {
 
 static void transformObjectTargetToWorld(float robotXmm, float robotYmm,
                                          float &worldX, float &worldY) {
+  // Converts a robot-body-frame point (millimetres) into odometry/world metres.
+  // Uses the same +X forward, +Y left convention as the local planner.
   float headingRad = navigationHeadingDeg() * DEG_TO_RAD;
   float localX = robotXmm / 1000.0;
   float localY = robotYmm / 1000.0;
@@ -140,6 +161,8 @@ static bool accumulateObjectLowEndpoint(ObjectTofId id, uint8_t sourceBit,
                                         uint8_t &sourceCount,
                                         uint8_t &sourceMask,
                                         uint16_t &rangeMm) {
+  // Projects one low sensor's range along its mounted yaw angle to estimate
+  // where the detected object sits in the robot frame.
   if (!isObjectLowNear(id)) {
     return false;
   }
@@ -159,6 +182,9 @@ static bool accumulateObjectLowEndpoint(ObjectTofId id, uint8_t sourceBit,
 }
 
 static void updateObjectTargetEstimateFromCandidate(const char* reason) {
+  // Only confirmed weight-sized candidates produce a hunt target. The target
+  // is biased forward by OBJECT_PICKUP_OVERSHOOT_MM so a hunt goal carries the
+  // intake through the estimated object point instead of stopping short.
   if (objectCandidate.kind != OBJECT_CANDIDATE_WEIGHT_SIZED ||
       !objectCandidate.confirmed) {
     invalidateObjectTargetEstimate(reason);
@@ -227,6 +253,11 @@ static void resetObjectSensorStates(const char* reason) {
 }
 
 static void updateObjectCandidate() {
+  // Classification rule of thumb:
+  //   low near + upper clear/weak -> weight-sized candidate
+  //   low near + upper near/strong -> tall obstacle
+  //   low near + unclear upper evidence -> unknown
+  // The result is advisory and should not be used as a safety clearance.
   if (!OBJECT_TOF_ENABLED) {
     objectCandidate.confirmCount = 0;
     setCandidate(OBJECT_CANDIDATE_DISABLED, "object_tof_disabled", false, 0, OBJECT_NO_READING_MM);
@@ -345,6 +376,9 @@ static void updateObjectStaleFlags() {
 }
 
 static void connectObjectSensor(ObjectTofId id) {
+  // Object ToFs are optional bring-up sensors. A missing sensor degrades the
+  // object subsystem and emits telemetry, but it does not block navigation
+  // startup because these sensors are not part of the motion safety kernel.
   ObjectSensorState &state = objectSensors[id];
   VL53L1X* sensor = objectTof(id);
   if (sensor == NULL) {
@@ -392,6 +426,8 @@ static void connectObjectSensor(ObjectTofId id) {
 }
 
 void prepareObjectTOFPinsForStartup() {
+  // Keeps object sensors quiet on the shared I2C bus until connectObjectSensor
+  // assigns addresses, or permanently if the subsystem is disabled.
   if (!OBJECT_TOF_ENABLED && !OBJECT_TOF_HOLD_DISABLED_IN_RESET) {
     return;
   }
@@ -404,6 +440,9 @@ void prepareObjectTOFPinsForStartup() {
 }
 
 void connectObjectTOFSensors() {
+  // Called after the SX1509 expander is connected. Each VL53L1X is started
+  // independently so one missing object sensor does not prevent others from
+  // reporting.
   resetObjectSensorStates("object_tof_disabled");
 
   if (!OBJECT_TOF_ENABLED) {
@@ -420,6 +459,8 @@ void connectObjectTOFSensors() {
 }
 
 void updateObjectTOFSensors() {
+  // Nonblocking round-robin update. Each call checks at most one object sensor
+  // for dataReady(); if no sample is ready, the function returns quickly.
   if (!OBJECT_TOF_ENABLED) {
     return;
   }
@@ -466,6 +507,9 @@ void refreshObjectTargetEstimate() {
 }
 
 void printObjectTelemetry() {
+  // Stationary diagnostic used by TEST OBJECT. It refreshes one object-sensor
+  // pass and prints candidate, target, raw distance, validity, range status,
+  // signal rate, and ambient rate.
   updateObjectTOFSensors();
 
   Serial2.print("object_summary,enabled=");
@@ -538,6 +582,8 @@ void printObjectTelemetry() {
 }
 
 bool isObjectTargetFresh() {
+  // A target must be both valid and recent. The robot should not hunt an old
+  // pose estimate after it has moved or the object has disappeared.
   return objectTargetEstimate.valid &&
          millis() - objectTargetEstimate.lastUpdateMs <= OBJECT_TARGET_STALE_TIMEOUT_MS;
 }

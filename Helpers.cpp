@@ -3,12 +3,40 @@
 // =====================================================
 // General helpers
 // =====================================================
+// Responsibility:
+//   Provides small shared utilities for angle wrapping, navigation heading,
+//   encoder/PID reset snapshots, atomic encoder reads, and startup/status
+//   printing.
+// Interacts with:
+//   Odometry.cpp and LocalPlanner.cpp use wrapAngle()/navigationHeadingDeg().
+//   MotorControl.cpp and Odometry.cpp depend on readEncoderCounts() snapshots.
+//   Bluetooth.cpp and RobotCode.ino use the print helpers for operator output.
+// Control flow:
+//   These helpers do not own behavior; they are called by the owning modules.
+// Global state:
+//   Reads IMU/encoder globals, updates PID and encoder snapshot globals in
+//   resetEncodersAndPID(), and prints current config/pose to Serial.
+
+// Wraps an angle in degrees into [-180, +180].
+//
+// LEARNING NOTE: Keeping heading errors in this range makes "turn the shortest
+// way" easy. For example, a target error of +190 degrees is equivalent to
+// -170 degrees, so the robot should turn right rather than left almost a full
+// circle.
 float wrapAngle(float angle) {
   while (angle > 180.0) angle -= 360.0;
   while (angle < -180.0) angle += 360.0;
   return angle;
 }
 
+// Reads the BNO055 yaw and converts it into the project navigation convention.
+//
+// Inputs/outputs:
+//   Returns degrees, positive CCW/left, wrapped to [-180, +180].
+//   It reads the IMU via readImuClockwiseYawDeg() and does not modify pose.
+//
+// SAFETY: Navigation, planning, and turn control should use this helper rather
+// than raw IMU yaw so the sign inversion happens exactly once.
 float navigationHeadingDeg() {
   // The BNO055 mounting reports a physical right turn as positive yaw. The
   // robot/map convention is +Y left with counter-clockwise-positive heading,
@@ -16,6 +44,11 @@ float navigationHeadingDeg() {
   return wrapAngle(navigationYawFromImuClockwise(readImuClockwiseYawDeg()));
 }
 
+// Resets encoder and PID reference snapshots without zeroing raw encoder totals.
+//
+// Called when a new navigation/test segment starts or when ZERO explicitly
+// resets the robot. This changes lastLeft/RightCount, lastOdomLeft/RightCount,
+// PID integrals, and last errors.
 void resetEncodersAndPID() {
   // Encoder totals are intentionally never reset during navigation.  Local
   // planning, odometry, and recovery all need one continuous motion history.
@@ -37,6 +70,13 @@ void resetEncodersAndPID() {
   lastRightError = 0.0;
 }
 
+// Atomically reads encoder totals and applies the configured signs.
+//
+// Inputs/outputs:
+//   Writes signed tick totals into leftCount/rightCount references.
+//
+// LEARNING NOTE: noInterrupts()/interrupts() prevents an ISR from updating a
+// multi-byte long halfway through the read on the microcontroller.
 void readEncoderCounts(long &leftCount, long &rightCount) {
   long leftRaw;
   long rightRaw;
@@ -50,6 +90,7 @@ void readEncoderCounts(long &leftCount, long &rightCount) {
   rightCount = RIGHT_ENCODER_SIGN * rightRaw;
 }
 
+// Prints the current odometry pose in metres/degrees for human diagnostics.
 void printPose() {
   Serial.print("POSE  x: ");
   Serial.print(robotX, 3);
@@ -60,6 +101,9 @@ void printPose() {
   Serial.println(" deg");
 }
 
+// Prints the boot-time calibration summary used to tie a test log to the
+// exact firmware settings: motor pulses, encoder signs, ticks/m, PID gains,
+// ToF thresholds, and sensor layout.
 void printCalibrationSummary() {
   Serial.println();
   Serial.println("CALIBRATION SUMMARY");
@@ -121,6 +165,8 @@ void printCalibrationSummary() {
   Serial.println("Use Bluetooth command CSV ON for maximum-rate machine-readable telemetry.");
 }
 
+// Human prompt shown after boot and after END_MATCH so the operator knows the
+// robot is waiting for a Bluetooth START command.
 void printWaitingForStart() {
   Serial.println("WAITING_FOR_START: open the CH9143 COM port at 115200 and send START.");
 }

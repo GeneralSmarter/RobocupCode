@@ -6,6 +6,22 @@
 // =====================================================
 // Bluetooth serial debug link on Serial2
 // =====================================================
+// Responsibility:
+//   Implements the CH9143 Serial2 operator console, command parser, runtime
+//   test harnesses, manual drive interface, telemetry queue, CSV/status
+//   output, and command-time tuning controls.
+// Interacts with:
+//   StateMachine.cpp is started/stopped by START/STOP/HOME and test commands.
+//   LocalPlanner.cpp receives navigation/test goals. MotorControl.cpp provides
+//   motion authority, safety, PID/output diagnostics, and manual/test command
+//   acceptance. TofSensors.cpp/ObjectDetection.cpp provide diagnostics.
+// Control flow:
+//   RobotCode.ino calls handleBluetoothCommands() every loop and
+//   serviceBluetoothTelemetryTx() after the controller update. Commands are
+//   line-oriented text terminated by CR/LF.
+// Global state:
+//   Owns Bluetooth/test/manual mode flags, command buffer, telemetry queue,
+//   test timers, and runtime-tunable copies of speed/base/scan-turn settings.
 static char bluetoothCommand[64];
 static int bluetoothCommandLength = 0;
 static bool bluetoothAbortMotionRequested = false;
@@ -101,6 +117,8 @@ static TelemetryStagePrint telemetryStage;
 static TelemetryStagePrint controlLineStage;
 
 static void beginTelemetryRow() {
+  // Starts building a single STATUS/CSV row in RAM. The row is committed to
+  // the bounded queue only after it is complete, preventing interleaved output.
   telemetryStage.reset();
   telemetryRowAssemblyActive = true;
 }
@@ -117,6 +135,8 @@ static void commitTelemetryEventRow() {
 }
 
 void serviceBluetoothTelemetryTx() {
+  // Drains a small number of queued bytes per main-loop pass. This protects
+  // the control loop from blocking on a slow UART or a full Bluetooth buffer.
   size_t writable = Serial2.availableForWrite();
   if (writable > TELEMETRY_TX_BUDGET_BYTES_PER_LOOP) {
     writable = TELEMETRY_TX_BUDGET_BYTES_PER_LOOP;
@@ -141,6 +161,8 @@ void serviceBluetoothTelemetryTx() {
 }
 
 bool isBluetoothCsvStreamEnabled() {
+  // RobotSerialClass uses this to decide whether free-form Serial prints may
+  // be mirrored directly or must avoid corrupting CSV output.
   return bluetoothCsvStreamEnabled || bluetoothCsvClosing;
 }
 
@@ -231,6 +253,7 @@ const float MANUAL_COMMAND_MAX = 100.0;
 const unsigned long MANUAL_DRIVE_TIMEOUT_MS = 350;
 
 static bool commandEquals(const char* command, const char* expected) {
+  // Case-insensitive exact command match. Commands are trimmed before routing.
   while (*command != '\0' && *expected != '\0') {
     if (toupper(*command) != toupper(*expected)) {
       return false;
@@ -244,6 +267,8 @@ static bool commandEquals(const char* command, const char* expected) {
 }
 
 static bool commandHasPrefix(const char* command, const char* prefix) {
+  // Case-insensitive prefix match where the next character must be whitespace
+  // or the end of the command. This prevents TEST TURN matching TEST TURNXYZ.
   while (*command != '\0' && *prefix != '\0') {
     if (toupper(*command) != toupper(*prefix)) {
       return false;
@@ -271,6 +296,8 @@ static const char* commandArgument(const char* command, const char* prefix) {
 }
 
 static bool parseFloatArgument(const char* text, float &value) {
+  // Parses one finite float and rejects trailing non-space text. This keeps
+  // command inputs deterministic and avoids partial parses like "1.0abc".
   char* endPtr = NULL;
   double parsedValue = strtod(text, &endPtr);
 
@@ -342,6 +369,8 @@ static bool parseThreeFloatArguments(const char* text, float &first,
 }
 
 static void trimCommand(char* command) {
+  // Mutates the command buffer in place, removing leading/trailing whitespace
+  // before the handler chain sees it.
   int length = strlen(command);
 
   while (length > 0 && isspace(command[length - 1])) {
@@ -409,6 +438,8 @@ static void printBluetoothHelp() {
 }
 
 void setupBluetooth() {
+  // Starts Serial2 and prints the command help. Called before setup() enables
+  // sensors so boot/progress messages can be mirrored to the operator link.
   Serial2.begin(BLUETOOTH_BAUD);
   bluetoothOutputEnabled = true;
   delay(100);
@@ -431,6 +462,9 @@ static int displayWaypointIndex() {
 }
 
 void sendBluetoothStatus() {
+  // Human-readable snapshot used by STATUS/P and stream mode. It includes
+  // pose, sensing, authority, motor, planner, object, timing, and telemetry
+  // diagnostics in one line for saved regression oracles.
   beginTelemetryRow();
   long leftCount;
   long rightCount;
@@ -651,12 +685,17 @@ void sendBluetoothStatus() {
 }
 
 static void sendBluetoothCsvHeader() {
+  // Machine-readable schema for saved navigation regressions. Keep field order
+  // stable unless the desktop parser/tests are updated with the same schema.
   beginTelemetryRow();
   Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,front_virtual_mm,front_virtual_valid,fake_rear_mm,fake_rear_valid,fake_rear_blocked,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn,planner_candidates,planner_v_tps,planner_w_tps,planner_curvature,planner_min_clearance_mm,planner_speed_cap_tps,planner_goal_distance_m,planner_global_goal_distance_m,planner_route_progress_m,planner_signed_lateral_error_m,planner_recovery_phase_time_s,planner_recovery_distance_m,planner_recovery_count,planner_best_progress_m,planner_stop,planner_reason,planner_replan,planner_safe_stop,object_candidate,object_confirmed,object_direction,object_range_mm,object0_mm,object1_mm,object2_mm,object3_mm,object0_valid,object1_valid,object2_valid,object3_valid,object0_range_status,object1_range_status,object2_range_status,object3_range_status,object_reason,object_target_valid,object_target_fresh,object_target_world_x_m,object_target_world_y_m,object_target_robot_x_mm,object_target_robot_y_mm,object_target_sources,object_target_reason,wheel_target_l_tps,wheel_target_r_tps,wheel_rate_l_tps,wheel_rate_r_tps,imu_raw_cw_deg,nav_yaw_deg,motor_mode,motion_authority,lease_trips,loop_gap_ms,loop_max_ms,loop_misses,loop_worst_phase,loop_worst_phase_us,telemetry_queued_rows,telemetry_queued_bytes,telemetry_dropped_rows,telemetry_rate_limited_events,planner_slice_us,planner_slice_max_us,planner_epoch_work_us,planner_epoch_max_work_us,planner_epoch_age_ms,planner_command_age_ms,planner_candidates_processed,planner_yields,planner_epoch_active");
   commitTelemetryRow();
 }
 
 static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName, const char* eventDetail) {
+  // Full once-per-second CSV row. Units are encoded in column names:
+  // x/y metres, theta degrees, ranges millimetres, wheel speeds ticks/s,
+  // motor commands microseconds, and timing fields ms/us.
   beginTelemetryRow();
   long leftCount;
   long rightCount;
@@ -946,6 +985,8 @@ static void sendBluetoothMotionRow() {
 }
 
 void sendBluetoothEvent(const char* eventName, const char* eventDetail) {
+  // Queues a compact event row during CSV capture. Duplicate rate limiting
+  // prevents a persistent fault from filling the telemetry ring every loop.
   if (!bluetoothCsvStreamEnabled) {
     return;
   }
@@ -975,6 +1016,9 @@ void sendBluetoothEvent(const char* eventName, const char* eventDetail) {
 }
 
 void sendBluetoothTelemetry() {
+  // Builds periodic telemetry rows. Transmission itself is performed later by
+  // serviceBluetoothTelemetryTx() so row construction and UART draining stay
+  // bounded separately.
   if (!bluetoothStreamEnabled && !bluetoothCsvStreamEnabled) {
     return;
   }
@@ -1100,6 +1144,9 @@ static void stopManualDrive() {
 }
 
 static void runManualDriveCommand(float forwardPercent, float turnPercent) {
+  // Live manual drive command. Percent inputs are scaled by baseTargetSpeed
+  // into ticks/s, then submitted through the same authority/safety path as
+  // autonomy.
   if (!bluetoothManualArmed || motionAuthority != MOTION_AUTHORITY_MANUAL) {
     Serial2.println("ERROR manual drive is disarmed. Send MANUAL ARM first.");
     return;
@@ -1157,6 +1204,8 @@ bool isManualDriveActive() {
 }
 
 void updateManualDriveTimeout() {
+  // Deadman for live manual drive. If DRIVE commands stop arriving, neutralize
+  // before a stale command can persist.
   if (!bluetoothManualActive) {
     return;
   }
@@ -1169,6 +1218,9 @@ void updateManualDriveTimeout() {
 }
 
 static bool requireBluetoothTestArm() {
+  // Test motion is a two-step action: TEST ARM claims TEST authority, then the
+  // movement command creates a goal. This protects against accidental moves
+  // from a single mistyped command.
   if (bluetoothTestArmed && motionAuthority == MOTION_AUTHORITY_TEST) {
     return true;
   }
@@ -1178,6 +1230,8 @@ static bool requireBluetoothTestArm() {
 }
 
 static void beginBluetoothTestMotion() {
+  // Common setup for TEST DRIVE/GOTO/AVOID/ESCAPE/TURN/HUNT/SEARCH. It enables
+  // the normal state/controller loop but disables manual ownership.
   bluetoothAbortMotionRequested = false;
   bluetoothManualArmed = false;
   bluetoothManualActive = false;
@@ -1188,6 +1242,8 @@ static void beginBluetoothTestMotion() {
 }
 
 static void runBluetoothTestDrive(float distanceMetres) {
+  // TEST DRIVE creates a point goal straight ahead from the current pose.
+  // distanceMetres is metres; heading comes from navigationHeadingDeg().
   if (!requireBluetoothTestArm()) {
     return;
   }
@@ -1221,6 +1277,9 @@ static void runBluetoothTestDrive(float distanceMetres) {
 }
 
 static void runBluetoothTestGoto(float targetX, float targetY) {
+  // TEST GOTO creates an absolute world-frame point goal in metres. The field
+  // UI intentionally does not call this until a safe transform/confirmation
+  // flow exists.
   if (!requireBluetoothTestArm()) {
     return;
   }
@@ -1316,6 +1375,8 @@ static void runBluetoothTestSearch() {
 }
 
 static void runBluetoothTestAvoid(float distanceMetres) {
+  // TEST AVOID is a straight-ahead point goal intended to exercise normal
+  // planner obstacle response, not a separate scripted avoidance routine.
   if (!requireBluetoothTestArm()) {
     return;
   }
@@ -1346,6 +1407,8 @@ static void runBluetoothTestAvoid(float distanceMetres) {
 }
 
 static void runBluetoothTestEscape(float distanceMetres) {
+  // TEST ESCAPE uses the same point goal as TEST AVOID but is intended for
+  // front-blocked reverse-recovery diagnostics.
   if (!requireBluetoothTestArm()) {
     return;
   }
@@ -1420,6 +1483,8 @@ static void updateBluetoothTestSide() {
 }
 
 static void runBluetoothTestTurn(float angleDeg) {
+  // TEST TURN creates a relative yaw goal in degrees. Positive is CCW/left in
+  // the navigation convention.
   if (!requireBluetoothTestArm()) {
     return;
   }
@@ -1521,6 +1586,9 @@ static void finishBluetoothArcTest(const char* detail) {
 static void runBluetoothTestArc(float forwardTicksPerSec,
                                 float turnTicksPerSec,
                                 float durationSeconds) {
+  // Direct bounded wheel-PID sign diagnostic. It bypasses navigation goals but
+  // still claims TEST authority and uses setAuthorizedMotionCommand() so final
+  // safety supervision remains active.
   if (!requireBluetoothTestArm()) {
     return;
   }
@@ -1641,6 +1709,9 @@ static void finishBluetoothTurnPulseTest() {
 }
 
 static void runBluetoothTestTurnPulse(float signedSeconds) {
+  // Physical turn calibration pulse. The sign selects direction, magnitude is
+  // duration in seconds, and the coast phase is logged without continuing the
+  // drive command.
   if (!requireBluetoothTestArm()) {
     return;
   }
@@ -1834,6 +1905,8 @@ void disarmBluetoothMotionModes() {
 }
 
 static void zeroRobotPoseFromBluetooth() {
+  // ZERO is a full software coordinate reset: stop/revoke first, zero yaw and
+  // pose, reset encoder/PID references, clear local map, and park in END_MATCH.
   revokeAndCancelAllMotion("zero_command");
   zeroYaw();
 
@@ -1857,6 +1930,8 @@ static void zeroRobotPoseFromBluetooth() {
 }
 
 static bool handleCoreBluetoothCommand(const char* command) {
+  // Core commands affect run state or global safety: START, STOP, ZERO, HOME,
+  // STATUS, BUILD, CAL, and loop timing reset.
   if (commandEquals(command, "HELP") || commandEquals(command, "H")) {
     printBluetoothHelp();
     return true;
@@ -1949,6 +2024,8 @@ static bool handleCoreBluetoothCommand(const char* command) {
 }
 
 static bool handleStreamAndLogBluetoothCommand(const char* command) {
+  // Telemetry/logging commands. CSV ON starts the schema and enables queued
+  // machine-readable rows; MARK inserts an event into saved logs.
   if (commandEquals(command, "STREAM ON")) {
     bluetoothStreamEnabled = true;
     lastBluetoothFullTelemetryMs = 0;
@@ -1997,6 +2074,8 @@ static bool handleStreamAndLogBluetoothCommand(const char* command) {
 }
 
 static bool handleTuningBluetoothCommand(const char* command) {
+  // Runtime tuning commands affect only this boot. They deliberately modify
+  // global runtime copies rather than RobotConfig.h constants.
   if (commandEquals(command, "SPEED RESET")) {
     baseTargetSpeed = DEFAULT_BASE_TARGET_SPEED;
     Serial2.print("OK base target speed reset to ");
@@ -2091,6 +2170,8 @@ static bool handleTuningBluetoothCommand(const char* command) {
 }
 
 static bool handleTestArmBluetoothCommand(const char* command) {
+  // Arming/disarming TEST authority. Disarm cancels old goals so a previous
+  // test cannot republish motion after one neutral cycle.
   if (commandEquals(command, "TEST ARM")) {
     revokeAndCancelAllMotion("test_arm_authority_transition");
     claimMotionAuthority(MOTION_AUTHORITY_TEST);
@@ -2126,6 +2207,8 @@ static bool handleTestArmBluetoothCommand(const char* command) {
 }
 
 static bool handleManualBluetoothCommand(const char* command) {
+  // Manual mode owns MOTION_AUTHORITY_MANUAL and requires a live stream of
+  // DRIVE commands. It is separate from TEST and MISSION authority.
   if (commandEquals(command, "MANUAL ARM")) {
     revokeAndCancelAllMotion("manual_arm_authority_transition");
     claimMotionAuthority(MOTION_AUTHORITY_MANUAL);
@@ -2166,6 +2249,9 @@ static bool handleManualBluetoothCommand(const char* command) {
 }
 
 static bool handleTestMotionBluetoothCommand(const char* command) {
+  // TEST motion and diagnostics. Motion-producing commands call
+  // requireBluetoothTestArm(); stationary diagnostics such as TEST FAN/OBJECT
+  // and TEST SIDE do not move motors.
   if (commandHasPrefix(command, "TEST ARC")) {
     float forwardTicksPerSec = 0.0;
     float turnTicksPerSec = 0.0;
@@ -2309,6 +2395,9 @@ static bool handleTestMotionBluetoothCommand(const char* command) {
 }
 
 static void handleBluetoothCommandLine(char* command) {
+  // Routes a complete line through focused handler groups. The order matters:
+  // more specific command families should claim their commands before the
+  // unknown-command fallback.
   trimCommand(command);
 
   if (command[0] == '\0') {
@@ -2330,6 +2419,9 @@ static void handleBluetoothCommandLine(char* command) {
 }
 
 bool handleBluetoothCommands() {
+  // Reads available Serial2 bytes into a fixed command buffer and dispatches
+  // complete CR/LF-terminated lines. Also advances nonblocking test harnesses
+  // such as TEST SIDE, TEST ARC, TEST TURNPULSE, and turn truth logging.
   while (Serial2.available() > 0) {
     char incoming = Serial2.read();
 

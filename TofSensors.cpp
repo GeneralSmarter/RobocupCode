@@ -3,6 +3,23 @@
 // =====================================================
 // TOF sensors
 // =====================================================
+// Responsibility:
+//   Owns the high forward VL53L0X navigation fan, derived legacy aggregate
+//   readings, front-block debounce, stale/timeout handling, and the temporary
+//   fake rear ToF scaffold.
+// Interacts with:
+//   RobotCode.ino calls connectTOFSensors() during setup. LocalPlanner.cpp and
+//   MotorControl.cpp read rangeSensors through the accessor functions.
+//   Bluetooth.cpp prints raw fan/aggregate telemetry. ObjectDetection.cpp owns
+//   the separate VL53L1X object sensors.
+// Control flow:
+//   updateRobotController() calls updateTOFSensors() on a 20 ms schedule.
+//   Sensor reads are polled for readiness before using the library read call
+//   so the control loop does not block behind four long ranging waits.
+// Global state:
+//   Modifies rangeSensors, legacy front/left/right globals, frontBlocked,
+//   front debounce counters, pending-close revalidation state, and fake rear
+//   validity/blocked fields.
 const uint16_t TOF_NO_READING_MM = RANGE_NO_READING_MM;
 const uint16_t L0X_VALID_MAX_MM = 8191;
 static uint16_t pendingCloseDistanceMm[RANGE_SENSOR_COUNT] = {0};
@@ -131,6 +148,14 @@ static void syncLegacyTofGlobals() {
 }
 
 static void setRangeSensorReading(RangeSensorId id, uint16_t distanceMm, bool valid) {
+  // Inputs:
+  //   distanceMm is a raw millimetre range from a ToF channel or synthetic
+  //   fake rear source. valid means it falls inside that sensor's calibrated
+  //   usable range, not necessarily that the path is safe.
+  //
+  // Global effects:
+  //   Updates rangeSensors[id], pending close-read filters, legacy aggregate
+  //   front/left/right state, and frontBlocked through sync/update calls.
   RangeSensorState &sensor = rangeSensors[id];
 
   // A fan beam cannot physically move hundreds of millimetres closer in one
@@ -173,6 +198,9 @@ static void setRangeSensorReading(RangeSensorId id, uint16_t distanceMm, bool va
 }
 
 static void markRangeSensorTimeout(RangeSensorId id) {
+  // A timeout means the channel did not provide a trustworthy measurement in
+  // time. Mark it invalid and let the safety policy treat unknown space as
+  // blocked where that direction is needed.
   RangeSensorState &sensor = rangeSensors[id];
   pendingCloseReadCount[(uint8_t)id] = 0;
   sensor.distanceMm = TOF_NO_READING_MM;
@@ -189,6 +217,8 @@ static bool isTofStale(bool valid, unsigned long lastReadMs, unsigned long now) 
 }
 
 static void updateTofStaleFlags() {
+  // Called every sensor cycle. A stale valid reading is worse than no reading
+  // because it can look like fresh clearance. Stop first, then mark invalid.
   unsigned long now = millis();
 
   for (int i = 0; i < RANGE_SENSOR_COUNT; i++) {
@@ -218,6 +248,8 @@ static void updateTofStaleFlags() {
 }
 
 static void connectL0XFanSensor(VL53L0X &sensor, RangeSensorId id) {
+  // Brings up one physical VL53L0X. All sensors share I2C, so each one is
+  // held in reset with XSHUT until it can be assigned a unique address.
   while (true) {
     Serial.print("Starting ");
     Serial.print(rangeSensors[id].name);
@@ -247,6 +279,8 @@ static void connectL0XFanSensor(VL53L0X &sensor, RangeSensorId id) {
 }
 
 void connectTOFSensors() {
+  // Initializes the SX1509 GPIO expander, holds every ToF in reset, then
+  // starts each fan sensor one at a time. This runs before the robot can move.
   while (true) {
     Serial.println("Connecting to SX1509...");
 
@@ -347,6 +381,9 @@ static void updateFrontBlockState() {
 }
 
 static void updateFakeRearTofSensor() {
+  // SAFETY: This is explicit unsafe test scaffolding, not real rear sensing.
+  // It keeps the current recovery API wired during software tests but cannot
+  // prove physical rear clearance.
   setRangeSensorReading(RANGE_FAKE_REAR,
                         FAKE_REAR_TOF_DISTANCE_MM,
                         isValidFakeRearTofDistance(FAKE_REAR_TOF_DISTANCE_MM));
@@ -385,12 +422,17 @@ static void updateL0XFanSensor(RangeSensorId id, VL53L0X &sensor) {
 }
 
 void updateTOFSensors() {
+  // Full range update used by the controller. Object ToFs are updated here as
+  // well so object candidates are based on the same main-loop schedule.
   updateFanTOFSensors();
   updateObjectTOFSensors();
   updateTofStaleFlags();
 }
 
 void updateFanTOFSensors() {
+  // Updates the four navigation fan rays and the derived fake rear/front
+  // state. The pending-close flag is reset each cycle and set only if a sudden
+  // close sample is waiting for confirmation.
   tofCloseReadingRevalidating = false;
   updateL0XFanSensor(RANGE_RIGHT_OUTER, rightOuterTOF);
   updateL0XFanSensor(RANGE_RIGHT_INNER, rightInnerTOF);
@@ -409,6 +451,8 @@ bool isRangeSensorBlocked(RangeSensorId id) {
 }
 
 bool isRangeSensorCurrent(RangeSensorId id) {
+  // "Current" means valid, not stale, and younger than the stale timeout.
+  // MotorControl.cpp uses this stricter check before allowing motion.
   const RangeSensorState &sensor = rangeSensors[id];
   return sensor.valid && !sensor.stale &&
          millis() - sensor.lastReadMs <= TOF_STALE_TIMEOUT_MS;
@@ -423,6 +467,9 @@ uint16_t getRangeSensorDistance(RangeSensorId id) {
 }
 
 static float getRobotTurnSweepRadiusMm() {
+  // Radius from drive-wheel midpoint to the farthest chassis corner. During a
+  // pivot, every corner can sweep this circle, so turn safety uses this radius
+  // rather than only the front edge.
   const float frontLeft = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm * ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
                                 ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm * ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm);
   const float frontRight = sqrtf(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm * ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
@@ -487,6 +534,9 @@ static float getFanFootprintClearanceMm(RangeSensorId id) {
 }
 
 bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
+  // Returns true when a current fan endpoint is too close to the present
+  // rectangular footprint. This is an immediate current-pose warning used by
+  // the safety supervisor before the planner has time to roll out a new arc.
   sensorId = RANGE_SENSOR_COUNT;
   clearanceMm = 1000000.0;
 
@@ -519,6 +569,9 @@ bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
 }
 
 void printFanTelemetry() {
+  // Stationary diagnostic used by TEST FAN. It refreshes sensors once, then
+  // prints raw fan channels plus derived aggregate readings to the Bluetooth
+  // link. It does not command motion.
   updateTOFSensors();
 
   Serial2.println("fan_idx,name,model,angle_deg,xshut,address,distance_mm,valid,blocked,stale,timeouts,invalids");
