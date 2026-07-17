@@ -284,6 +284,7 @@ bool isObjectTargetFresh();
 bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 bool isRangeSensorCurrent(RangeSensorId id);
+bool hasTrustedRearCoverage();
 uint16_t getRangeSensorDistance(RangeSensorId id);
 bool isTofCloseReadingRevalidating();
 float getFanSweepClearanceMm(RangeSensorId id);

@@ -120,11 +120,13 @@ physical validation.
 
 Evidence: `RobotConfig.h` reports a fake 4000mm rear reading and `TofSensors.cpp` continuously marks it valid. `LocalPlanner` paints rear free and can erase remembered obstacles, while reverse is enabled by default.
 
-Current testing note, 2026-07-14: the operator explicitly permits obstacle
-testing with the existing fake rear channel for now. Label those runs as
-fake-rear tests and do not use them as proof of real rear coverage.
+Current software disposition: `RANGE_FAKE_REAR` remains visible for diagnostics,
+but `hasTrustedRearCoverage()` is false on the physical build and the final
+motor-safety policy rejects reverse. WASM uses a field-raycast rear channel to
+exercise evidence-driven recovery without claiming physical validation.
 
-Recommended fix: Make fake rear invalid in competition builds through a compile-time assert. Either install real rear/side sensing or remove reverse from autonomous recovery.
+Remaining fix: install and validate real rear/side coverage before changing
+the physical trusted-rear capability.
 
 ### P0-05: Sensing cannot prove safety (still open)
 

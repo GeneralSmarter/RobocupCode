@@ -411,7 +411,7 @@ static void printBluetoothHelp() {
   Serial2.println("  SEARCHTURN <us>|RESET  set TEST SEARCH scan turn offset");
   Serial2.println("  FBASE <l> <r>  set temporary forward motor base pulses");
   Serial2.println("  FBASE RESET    restore default forward motor base pulses");
-  Serial2.println("  ESCAPE ON/OFF/STATUS  enable or disable front-blocked reverse recovery");
+  Serial2.println("  ESCAPE ON/OFF/STATUS  reverse policy (trusted rear coverage required)");
   Serial2.println("  TEST ARM       allow one or more test motion commands");
   Serial2.println("  TEST DISARM    disable test motion commands");
   Serial2.println("  TEST DRIVE <m> drive a fixed distance at current heading");
@@ -1431,7 +1431,7 @@ static void runBluetoothTestEscape(float distanceMetres) {
   Serial2.print(targetY, 3);
   Serial2.print(" heading=");
   Serial2.print(headingDeg, 2);
-  Serial2.println(" deg. Front block still stops forward motion; reverse recovery may keep retrying.");
+  Serial2.println(" deg. Reverse repositioning still requires trusted rear coverage.");
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_escape_start", "manual");
@@ -2143,14 +2143,16 @@ static bool handleTuningBluetoothCommand(const char* command) {
 
   if (commandEquals(command, "ESCAPE ON")) {
     escapeBacktrackEnabled = true;
-    Serial2.println("OK front-blocked reverse recovery enabled.");
+    Serial2.println(hasTrustedRearCoverage()
+      ? "OK reverse repositioning enabled."
+      : "OK reverse policy enabled; motion remains gated without trusted rear coverage.");
     sendBluetoothEvent("escape_set", "on");
     return true;
   }
 
   if (commandEquals(command, "ESCAPE OFF")) {
     escapeBacktrackEnabled = false;
-    Serial2.println("OK front-blocked reverse recovery disabled. Front block will safe-stop only.");
+    Serial2.println("OK reverse repositioning disabled. Geometric no-path will safe-stop only.");
     sendBluetoothEvent("escape_set", "off");
     return true;
   }

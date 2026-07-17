@@ -9,7 +9,7 @@
 //   and turn navigation goals, obstacle-local forward bypass, planner telemetry,
 //   and the scheduled controller pipeline.
 // Interacts with:
-//   TofSensors.cpp supplies fan/fake-rear range evidence. Odometry.cpp updates
+//   TofSensors.cpp supplies fan and rear range evidence. Odometry.cpp updates
 //   robot pose. StateMachine.cpp and Bluetooth.cpp create/cancel goals.
 //   MotorControl.cpp is the only physical motor writer and accepts commands
 //   through the planner publish wrapper and the authorized motor-command API.
@@ -61,17 +61,12 @@ static bool pointAlignTurnActive = false;
 static float pointAlignTurnDirection = 0.0;
 static unsigned long turnSideInvalidSinceMs = 0;
 static unsigned long turnSweepInvalidSinceMs = 0;
-// Reverse recovery is an in-goal recovery mode. It keeps the original point
-// target, tries normal forward planning first on every planner tick, and uses
-// RANGE_FAKE_REAR to sample trusted reverse arcs only while no forward path is
-// available.
+// Reverse recovery is an in-goal repositioning mode. It preserves the point
+// target and permits only swept footprints already marked clear in the local
+// map. A separately trusted rear channel is still required for publication.
 enum ObstacleBypassPhase {
   BYPASS_IDLE,
-  BYPASS_SIDE_ESCAPE,
-  BYPASS_FRONT_WALL_REVERSE,
-  BYPASS_POST_REVERSE_ESCAPE,
-  BYPASS_ROUTE_REJOIN,
-  BYPASS_FINAL_APPROACH
+  BYPASS_SIDE_ESCAPE
 };
 
 static bool reverseRecoveryActive = false;
@@ -79,28 +74,29 @@ static float reverseRecoveryStartX = 0.0;
 static float reverseRecoveryStartY = 0.0;
 static unsigned long reverseRecoveryStartedMs = 0;
 static unsigned long reverseRecoveryStepCount = 0;
-static bool reverseSurveySettling = false;
-static unsigned long reverseSurveySettleStartedMs = 0;
-static bool reverseSurveyReadyReported = false;
-static bool reverseSurveyReadyToTryForward = false;
-static bool reverseSurveyForcedByMaxRetreat = false;
-static float reverseSurveyRequiredRetreatM = PLANNER_REVERSE_SURVEY_MIN_REVERSE_M;
 static unsigned long noSafeTrajectorySinceMs = 0;
 static uint8_t geometricNoPathEpochCount = 0;
 static bool lastForwardNoPathWasGeometric = false;
 static bool candidateRejectsReported = false;
 static bool reverseRecoveryRejectsReported = false;
+struct ReverseRecoveryState {
+  bool active;
+  bool checkingForward;
+  float startX;
+  float startY;
+  float currentClearanceM;
+  float endpointClearanceM;
+  float clearanceGainM;
+  float unexploredScore;
+  float previousTurn;
+  uint8_t plateauCount;
+};
+static ReverseRecoveryState reverseRecoveryState = {};
+static bool recoveryAttemptResetPending = false;
+static float recoveryExitX = 0.0f;
+static float recoveryExitY = 0.0f;
 static ObstacleBypassPhase obstacleBypassPhase = BYPASS_IDLE;
-// Sensor geometry is observational and may change on every refresh.  The
-// active side is a manoeuvre contract: once non-zero it is changed only by a
-// stopped reset followed by a new, stable observation.
-static float obstacleObservedPreferredSideSign = 0.0f;
-static float obstacleObservedCandidateSideSign = 0.0f;
-static uint8_t obstacleObservedStableCount = 0;
-static unsigned long obstacleObservedLastUpdateMs = 0;
 static float obstacleBypassSideSign = 0.0f;
-static float obstacleBypassMaxOutwardM = 0.0f;
-static float obstacleBypassTargetOutwardM = 0.0f;
 static unsigned long obstacleBypassPhaseStartedMs = 0;
 static bool recoveryLivenessActive = false;
 static float recoveryLivenessStartX = 0.0f;
@@ -117,17 +113,6 @@ static float recoveryCumulativeDistanceM = 0.0f;
 static float recoveryBestProgressM = 0.0f;
 static uint8_t recoveryAttemptCount = 0;
 static unsigned long recoveryLastProgressMs = 0;
-static bool clearanceEscapeLocalGoalActive = false;
-static bool clearanceEscapeRouteDetourActive = false;
-static bool postReverseEscapeActive = false;
-static float postReverseEscapeSideSign = 0.0f;
-static unsigned long postReverseEscapeStartedMs = 0;
-static float lastClearanceEscapeSideSign = 0.0f;
-static unsigned long lastClearanceEscapeMs = 0;
-static float sideEscapeAdaptiveExtraM = 0.0f;
-static float sideEscapeAdaptiveSideSign = 0.0f;
-static uint8_t sideEscapeAdaptiveFailureCount = 0;
-static unsigned long sideEscapeAdaptiveLastBumpMs = 0;
 static float lastFootprintRejectWorldX = 0.0f;
 static float lastFootprintRejectWorldY = 0.0f;
 static int lastFootprintRejectCellX = -1;
@@ -161,21 +146,7 @@ struct ObstacleEnvelope {
 
 static ObstacleContext obstacleContext = {};
 
-struct SideEscapeEvidence {
-  bool sensorsValid;
-  bool closeSideEvidence;
-  bool sidePreferenceValid;
-  float rightM;
-  float leftM;
-  float restrictedM;
-  float triggerM;
-  float sideSign;
-};
-
-static bool readSideEscapeEvidence(SideEscapeEvidence &evidence);
-static void bumpSideEscapeAdaptiveExtra(float sideSign, const char* reason);
-static const char* obstacleBypassPhaseName(ObstacleBypassPhase phase);
-static void setObstacleBypassPhase(ObstacleBypassPhase phase, const char* reason);
+static void resetRecoveryLivenessState();
 static bool routeLineFrame(float &routeLengthM, float &routeUx,
                            float &routeUy, float &routeHeadingRad);
 static float routeLineSignedLateralErrorM(float worldX, float worldY,
@@ -194,7 +165,8 @@ enum CandidateRejectReason {
   CANDIDATE_REJECT_FORWARD_OBSERVATION,
   CANDIDATE_REJECT_REAR_OBSERVATION,
   CANDIDATE_REJECT_FOOTPRINT,
-  CANDIDATE_REJECT_CORRIDOR
+  CANDIDATE_REJECT_CORRIDOR,
+  CANDIDATE_REJECT_CLEAR_EVIDENCE
 };
 
 enum TrajectoryPlanResult {
@@ -212,6 +184,7 @@ struct PlannerCollisionSnapshot {
   float originX;
   float originY;
   uint8_t occupied[PLANNER_OCCUPANCY_BYTES];
+  uint8_t knownClear[PLANNER_OCCUPANCY_BYTES];
 };
 
 struct PlannerEpoch {
@@ -286,6 +259,14 @@ struct ReversePlannerEpoch {
   float bestReverse;
   float bestTurn;
   float bestRearClearance;
+  float bestEndpointClearanceM;
+  float bestSweepClearanceM;
+  float bestForwardQuality;
+  float bestUnexploredScore;
+  float bestFinalX;
+  float bestFinalY;
+  float bestFinalHeadingRad;
+  int bestClearanceBand;
   PlannerCollisionSnapshot collision;
 };
 
@@ -530,6 +511,12 @@ static void markEndpointEvidence(RangeSensorId id, float worldX, float worldY,
         cell.dynamicEvidence = (int8_t)clampEvidence(cell.dynamicEvidence + dynamicEvidence);
         cell.staticEvidence = (int8_t)clampEvidence(cell.staticEvidence + staticEvidence);
         cell.freeEvidence = (int8_t)clampEvidence(cell.freeEvidence - dynamicEvidence / 2);
+        if (cell.staticEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD ||
+            cell.dynamicEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD) {
+          // Contradictory obstacle evidence revokes persistent reverse
+          // permission until a later clear observation earns it again.
+          cell.freeEvidence = 0;
+        }
         cell.lastObservedMs = millis();
       }
     }
@@ -606,70 +593,45 @@ void updateLocalMapFromSensors() {
     markEndpointEvidence(id, endpointX, endpointY, rayHeading);
   }
 
-  if (isRangeSensorValid(RANGE_FAKE_REAR)) {
-    float sensorWorldX;
-    float sensorWorldY;
-    transformRobotPoint(FAKE_REAR_TOF_GEOMETRY.xMm / 1000.0f,
-                        FAKE_REAR_TOF_GEOMETRY.yMm / 1000.0f,
-                        headingRad, sensorWorldX, sensorWorldY);
-
-    float rayHeading = headingRad + FAKE_REAR_TOF_GEOMETRY.angleDeg * DEG_TO_RAD;
-    float rangeM = getRangeSensorDistance(RANGE_FAKE_REAR) / 1000.0f;
-    float rearHalfWidthM = max(MAP_FREE_RAY_HALF_WIDTH_M,
-      max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
-          ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
-      PLANNER_TOTAL_HARD_CLEARANCE_M);
-
-    float freeLengthM = min(rangeM, LOCAL_MAP_SIZE_M * 0.5f);
-    for (float distance = 0.0f; distance <= freeLengthM; distance += LOCAL_MAP_CELL_M * 0.5f) {
-      float centreX = sensorWorldX + cosf(rayHeading) * distance;
-      float centreY = sensorWorldY + sinf(rayHeading) * distance;
-      for (float lateral = -rearHalfWidthM;
-           lateral <= rearHalfWidthM;
-           lateral += LOCAL_MAP_CELL_M) {
-        float freeX = centreX - sinf(rayHeading) * lateral;
-        float freeY = centreY + cosf(rayHeading) * lateral;
-        addFreeEvidence(freeX, freeY, 10);
-      }
-    }
-
-    if (getRangeSensorDistance(RANGE_FAKE_REAR) < FAKE_REAR_TOF_DISTANCE_MM) {
-      float endpointX = sensorWorldX + cosf(rayHeading) * rangeM;
-      float endpointY = sensorWorldY + sinf(rayHeading) * rangeM;
-      markEndpointEvidence(RANGE_FAKE_REAR, endpointX, endpointY, rayHeading);
-    }
-  }
 }
 
 void markTraversedFreeSpace() {
-  // The robot's own recent footprint is stronger evidence than a distant ToF
-  // ray. Sample a 3x3 set over the chassis rather than a single centre point
-  // so the map remembers the whole swept rectangle as recently traversed.
+  // The robot's own footprint is durable clear evidence. Include the hard
+  // planning margin where it has no contradictory obstacle evidence so the
+  // same validated corridor remains usable for a later reverse traversal.
   recenterLocalMapIfNeeded();
   const float headingRad = navigationHeadingRad();
-  const float sampleX[] = {
-    -ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f,
-    0.0,
-    ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f
-  };
-  const float sampleY[] = {
-    -ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f,
-    0.0,
-    ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f
-  };
-
-  for (unsigned int ix = 0; ix < sizeof(sampleX) / sizeof(sampleX[0]); ix++) {
-    for (unsigned int iy = 0; iy < sizeof(sampleY) / sizeof(sampleY[0]); iy++) {
+  const float actualFront = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f;
+  const float actualRear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f;
+  const float actualLeft = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f;
+  const float actualRight = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f;
+  const float sampleStepM = LOCAL_MAP_CELL_M * 0.5f;
+  for (float localX = -actualRear - PLANNER_TOTAL_HARD_CLEARANCE_M;
+       localX <= actualFront + PLANNER_TOTAL_HARD_CLEARANCE_M + 0.001f;
+       localX += sampleStepM) {
+    for (float localY = -actualRight - PLANNER_TOTAL_HARD_CLEARANCE_M;
+         localY <= actualLeft + PLANNER_TOTAL_HARD_CLEARANCE_M + 0.001f;
+         localY += sampleStepM) {
       float worldX;
       float worldY;
-      transformRobotPoint(sampleX[ix], sampleY[iy], headingRad, worldX, worldY);
+      transformRobotPoint(localX, localY, headingRad, worldX, worldY);
       int x;
       int y;
       if (worldToCell(worldX, worldY, x, y)) {
         LocalMapCell &cell = localMap[y][x];
+        bool insideActualFootprint =
+          localX >= -actualRear && localX <= actualFront &&
+          localY >= -actualRight && localY <= actualLeft;
+        bool occupied = cell.staticEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD ||
+                        cell.dynamicEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD;
+        if (!insideActualFootprint && occupied) {
+          continue;
+        }
         cell.traversedEvidence = 255;
         cell.freeEvidence = 100;
-        cell.dynamicEvidence = 0;
+        if (insideActualFootprint) {
+          cell.dynamicEvidence = 0;
+        }
         cell.lastTraversedMs = millis();
       }
     }
@@ -688,24 +650,19 @@ static bool cellOccupied(int cellX, int cellY) {
          cell.dynamicEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD;
 }
 
-static bool worldOccupied(float worldX, float worldY) {
-  int x;
-  int y;
-  if (!worldToCell(worldX, worldY, x, y)) {
-    return true;
-  }
-  return cellOccupied(x, y);
-}
-
 static void capturePlannerCollisionSnapshot(PlannerCollisionSnapshot &snapshot) {
   snapshot.originX = localMapOriginX;
   snapshot.originY = localMapOriginY;
   memset(snapshot.occupied, 0, sizeof(snapshot.occupied));
+  memset(snapshot.knownClear, 0, sizeof(snapshot.knownClear));
   for (int y = 0; y < LOCAL_MAP_CELLS; y++) {
     for (int x = 0; x < LOCAL_MAP_CELLS; x++) {
+      int bit = y * LOCAL_MAP_CELLS + x;
       if (cellOccupied(x, y)) {
-        int bit = y * LOCAL_MAP_CELLS + x;
         snapshot.occupied[bit >> 3] |= (uint8_t)(1U << (bit & 7));
+      } else if (localMap[y][x].freeEvidence >=
+                   PLANNER_REVERSE_CLEAR_EVIDENCE_THRESHOLD) {
+        snapshot.knownClear[bit >> 3] |= (uint8_t)(1U << (bit & 7));
       }
     }
   }
@@ -732,6 +689,124 @@ static bool snapshotWorldOccupied(const PlannerCollisionSnapshot &snapshot,
   }
   int bit = y * LOCAL_MAP_CELLS + x;
   return (snapshot.occupied[bit >> 3] & (uint8_t)(1U << (bit & 7))) != 0;
+}
+
+static bool snapshotWorldKnownClear(const PlannerCollisionSnapshot &snapshot,
+                                    float worldX, float worldY) {
+  int x = fastFloorToInt((worldX - snapshot.originX) / LOCAL_MAP_CELL_M);
+  int y = fastFloorToInt((worldY - snapshot.originY) / LOCAL_MAP_CELL_M);
+  if (x < 0 || x >= LOCAL_MAP_CELLS || y < 0 || y >= LOCAL_MAP_CELLS) {
+    return false;
+  }
+  int bit = y * LOCAL_MAP_CELLS + x;
+  return (snapshot.knownClear[bit >> 3] &
+          (uint8_t)(1U << (bit & 7))) != 0;
+}
+
+static bool footprintKnownClearOnSnapshot(
+    const PlannerCollisionSnapshot &snapshot,
+    float worldX, float worldY, float headingRad) {
+  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float headingCos = cosf(headingRad);
+  const float headingSin = sinf(headingRad);
+  for (float localX = -rear; localX <= front + 0.001f;
+       localX += LOCAL_MAP_CELL_M) {
+    for (float localY = -right; localY <= left + 0.001f;
+         localY += LOCAL_MAP_CELL_M) {
+      float x = worldX + localX * headingCos - localY * headingSin;
+      float y = worldY + localX * headingSin + localY * headingCos;
+      if (!snapshotWorldKnownClear(snapshot, x, y)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static float poseKnownClearanceM(const PlannerCollisionSnapshot &snapshot,
+                                 float worldX, float worldY,
+                                 float headingRad) {
+  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float headingCos = cosf(headingRad);
+  const float headingSin = sinf(headingRad);
+  float bestSquared = PLANNER_REVERSE_CLEARANCE_CAP_M *
+                      PLANNER_REVERSE_CLEARANCE_CAP_M;
+  for (int cellY = 0; cellY < LOCAL_MAP_CELLS; ++cellY) {
+    for (int cellX = 0; cellX < LOCAL_MAP_CELLS; ++cellX) {
+      int bit = cellY * LOCAL_MAP_CELLS + cellX;
+      if ((snapshot.occupied[bit >> 3] &
+           (uint8_t)(1U << (bit & 7))) == 0) {
+        continue;
+      }
+      float cellWorldX = snapshot.originX +
+        (cellX + 0.5f) * LOCAL_MAP_CELL_M;
+      float cellWorldY = snapshot.originY +
+        (cellY + 0.5f) * LOCAL_MAP_CELL_M;
+      float dx = cellWorldX - worldX;
+      float dy = cellWorldY - worldY;
+      float localX = dx * headingCos + dy * headingSin;
+      float localY = -dx * headingSin + dy * headingCos;
+      float outsideX = localX < -rear ? -rear - localX
+        : (localX > front ? localX - front : 0.0f);
+      float outsideY = localY < -right ? -right - localY
+        : (localY > left ? localY - left : 0.0f);
+      float distanceSquared = outsideX * outsideX + outsideY * outsideY;
+      if (distanceSquared < bestSquared) {
+        bestSquared = distanceSquared;
+      }
+    }
+  }
+  float clearanceM = sqrtf(bestSquared) -
+    LOCAL_MAP_CELL_M * 0.70710678f;
+  return constrain(clearanceM, 0.0f, PLANNER_REVERSE_CLEARANCE_CAP_M);
+}
+
+static float projectedUnexploredScore(
+    const PlannerCollisionSnapshot &snapshot,
+    float worldX, float worldY, float headingRad) {
+  int unknownCount = 0;
+  int sampleCount = 0;
+  for (int sensorIndex = RANGE_RIGHT_OUTER;
+       sensorIndex <= RANGE_LEFT_OUTER; ++sensorIndex) {
+    const FanSensorGeometry &sensor = FAN_SENSOR_GEOMETRY[sensorIndex];
+    float sensorX = worldX +
+      (sensor.xMm / 1000.0f) * cosf(headingRad) -
+      (sensor.yMm / 1000.0f) * sinf(headingRad);
+    float sensorY = worldY +
+      (sensor.xMm / 1000.0f) * sinf(headingRad) +
+      (sensor.yMm / 1000.0f) * cosf(headingRad);
+    float rayHeading = headingRad + sensor.angleDeg * DEG_TO_RAD;
+    for (float distanceM = LOCAL_MAP_CELL_M;
+         distanceM <= PLANNER_HORIZON_S;
+         distanceM += LOCAL_MAP_CELL_M) {
+      float x = sensorX + cosf(rayHeading) * distanceM;
+      float y = sensorY + sinf(rayHeading) * distanceM;
+      if (snapshotWorldOccupied(snapshot, x, y)) {
+        break;
+      }
+      sampleCount++;
+      if (!snapshotWorldKnownClear(snapshot, x, y)) {
+        unknownCount++;
+      }
+    }
+  }
+  return sampleCount > 0
+    ? constrain((float)unknownCount / sampleCount, 0.0f, 1.0f)
+    : 0.0f;
 }
 
 static bool footprintClearOnSnapshot(const PlannerCollisionSnapshot &snapshot,
@@ -808,42 +883,6 @@ static bool isNarrowObservedCorridorOnSnapshot(
     lastCorridorRejectRightM = rightBoundaryM;
   }
   return narrow;
-}
-
-static bool footprintClear(float worldX, float worldY, float headingRad) {
-  // This is the planner's hard collision test. The preferred 50 mm clearance
-  // is deliberately NOT added here; it influences scoring instead so a tight
-  // but physically plausible 400 mm straight passage can remain selectable.
-  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0 +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0 +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0 +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0 +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  // Every point belongs to the same predicted pose. Hoisting this basis out
-  // of the nested sample loops removes thousands of redundant sin/cos calls
-  // per planning cycle without changing a single collision sample.
-  const float headingCos = cosf(headingRad);
-  const float headingSin = sinf(headingRad);
-
-  // Sample every map cell across the inflated rectangle, not merely the
-  // corners.  A narrow panel therefore cannot slip between sparse footprint
-  // sample points during a curved rollout.
-  for (float localX = -rear; localX <= front + 0.001; localX += LOCAL_MAP_CELL_M) {
-    for (float localY = -right; localY <= left + 0.001; localY += LOCAL_MAP_CELL_M) {
-      float pointX = worldX + localX * headingCos - localY * headingSin;
-      float pointY = worldY + localX * headingSin + localY * headingCos;
-      if (worldOccupied(pointX, pointY)) {
-        lastFootprintRejectWorldX = pointX;
-        lastFootprintRejectWorldY = pointY;
-        worldToCell(pointX, pointY, lastFootprintRejectCellX, lastFootprintRejectCellY);
-        return false;
-      }
-    }
-  }
-  return true;
 }
 
 static void resetObstacleContext(const char* reason) {
@@ -1168,6 +1207,7 @@ const char* plannerStopReasonName(PlannerStopReason reason) {
     case PLANNER_STOP_RECOVERY_DISTANCE: return "recovery_distance";
     case PLANNER_STOP_RECOVERY_REPEATED: return "recovery_repeated";
     case PLANNER_STOP_RECOVERY_NO_PROGRESS: return "recovery_no_progress";
+    case PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME: return "recovery_no_useful_outcome";
     case PLANNER_STOP_ABORTED: return "aborted";
   }
   return "unknown";
@@ -1223,6 +1263,10 @@ static void finishNavigationGoal(bool success, PlannerStopReason reason, const c
   }
   resetReversePlannerEpoch();
   reverseRecoveryActive = false;
+  reverseRecoveryState = {};
+  recoveryAttemptResetPending = false;
+  resetRecoveryLivenessState();
+  plannerTelemetry.reverseRecoveryActive = false;
   resetGeometricNoPathEvidence();
   reverseRecoveryRejectsReported = false;
   resetObstacleContext(success ? "goal_complete" : "goal_abort");
@@ -1307,7 +1351,13 @@ void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owne
   plannerTelemetry.recoveryPhaseElapsedS = 0.0;
   plannerTelemetry.cumulativeRecoveryDistanceM = 0.0;
   plannerTelemetry.recoveryBestProgressM = 0.0;
+  plannerTelemetry.recoveryCurrentClearanceM = 0.0f;
+  plannerTelemetry.recoveryEndpointClearanceM = 0.0f;
+  plannerTelemetry.recoveryClearanceGainM = 0.0f;
+  plannerTelemetry.recoveryUnexploredScore = 0.0f;
   plannerTelemetry.recoveryCount = 0;
+  plannerTelemetry.recoveryPlateauCount = 0;
+  plannerTelemetry.reverseRecoveryActive = false;
   plannerTelemetry.candidateCount = 0;
   plannerTelemetry.stopReason = PLANNER_STOP_NONE;
   plannerTelemetry.planReason = "goal_started";
@@ -1315,6 +1365,9 @@ void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owne
   recentBlockedTurnDirection = 0;
   recentBlockedTurnMs = 0;
   reverseRecoveryActive = false;
+  reverseRecoveryState = {};
+  resetRecoveryLivenessState();
+  recoveryAttemptResetPending = false;
   reverseRecoveryStepCount = 0;
   resetGeometricNoPathEvidence();
   candidateRejectsReported = false;
@@ -1376,6 +1429,7 @@ void startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner) {
   turnSideInvalidSinceMs = 0;
   turnSweepInvalidSinceMs = 0;
   reverseRecoveryActive = false;
+  reverseRecoveryState = {};
   resetGeometricNoPathEvidence();
   reverseRecoveryRejectsReported = false;
   motorStopRequested = true;
@@ -1438,48 +1492,6 @@ static float calculateSpeedCapTicksPerSec(float requestedCapTicksPerSec) {
   return min(requestedCapTicksPerSec, speedMps * TICKS_PER_METRE);
 }
 
-#if 0
-static float clearanceEscapeUrgency() {
-  if (!clearanceEscapeLocalGoalActive) {
-    return 0.0f;
-  }
-
-  float urgency = 0.0f;
-  if (isRangeSensorValid(RANGE_FRONT)) {
-    float frontM = getRangeSensorDistance(RANGE_FRONT) / 1000.0f;
-    float spanM = max(0.001f, PLANNER_ESCAPE_SPEED_LIMIT_START_M -
-                                PLANNER_ESCAPE_SPEED_LIMIT_FULL_M);
-    urgency = max(urgency,
-                  constrain((PLANNER_ESCAPE_SPEED_LIMIT_START_M - frontM) / spanM,
-                            0.0f, 1.0f));
-  }
-
-  SideEscapeEvidence evidence;
-  if (readSideEscapeEvidence(evidence) && evidence.closeSideEvidence) {
-    float sideSpanM = max(0.001f, evidence.triggerM - PLANNER_PREFERRED_CLEARANCE_M);
-    urgency = max(urgency,
-                  constrain((evidence.triggerM - evidence.restrictedM) / sideSpanM,
-                            0.0f, 1.0f));
-  }
-
-  if (postReverseEscapeActive) {
-    urgency = max(urgency, 0.85f);
-  }
-
-  return urgency;
-}
-
-static float applyClearanceEscapeSpeedCap(float speedCap) {
-  float urgency = clearanceEscapeUrgency();
-  if (urgency <= 0.0f) {
-    return speedCap;
-  }
-
-  float escapeCap = speedCap -
-    (speedCap - PLANNER_ESCAPE_MIN_SPEED_TPS) * urgency;
-  return max(PLANNER_MIN_DRIVABLE_SPEED_TPS, min(speedCap, escapeCap));
-}
-#endif
 
 static bool epochTurnDirectionObservable(const PlannerEpoch &epoch,
                                          float turnTicks) {
@@ -1827,8 +1839,7 @@ static bool updateRecoveryLiveness(float globalGoalDistanceM,
   plannerTelemetry.routeSignedLateralErrorM = signedLateralM;
 
   bool mustSupervise = obstacleBypassPhase != BYPASS_IDLE ||
-                       clearanceEscapeLocalGoalActive ||
-                       postReverseEscapeActive || reverseRecoveryActive;
+                       reverseRecoveryActive;
   if (!mustSupervise) {
     return false;
   }
@@ -1885,7 +1896,10 @@ static bool updateRecoveryLiveness(float globalGoalDistanceM,
     return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_DIVERGENCE,
                                  "recovery_goal_divergence");
   }
-  if (fabs(signedLateralM) >
+  float recoveryLateralM = routeFrameValid
+    ? -(robotX - recoveryLivenessStartX) * routeUy +
+        (robotY - recoveryLivenessStartY) * routeUx : 0.0f;
+  if (fabs(recoveryLateralM) >
       PLANNER_RECOVERY_MAX_LATERAL_DISPLACEMENT_M) {
     return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_DISPLACEMENT,
                                  "recovery_lateral_displacement");
@@ -1945,37 +1959,6 @@ static bool routeLineClearlyMissed(float routeLengthM, float routeUx, float rout
          lateralErrorM <= PLANNER_LINE_FOLLOW_LATERAL_TOLERANCE_M;
 }
 
-#if 0
-static bool sideEscapeRejoinActive(float routeLengthM, float routeUx, float routeUy) {
-  if (!clearanceEscapeRouteDetourActive || routeLengthM <= 0.0f) {
-    return false;
-  }
-
-  float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
-  if (obstacleBypassSideSign != 0.0f &&
-      obstacleBypassTargetOutwardM >= PLANNER_FRONT_WALL_BYPASS_OUTWARD_M - 0.001f) {
-    float outwardM = obstacleBypassSideSign *
-      routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy);
-    if (outwardM < obstacleBypassTargetOutwardM) {
-      return true;
-    }
-  }
-  float finalApproachM = PLANNER_SIDE_ESCAPE_FINAL_APPROACH_M;
-  if (obstacleBypassTargetOutwardM >= PLANNER_FRONT_WALL_BYPASS_OUTWARD_M - 0.001f) {
-    finalApproachM = min(finalApproachM, 0.10f);
-  }
-  return alongM < routeLengthM - finalApproachM;
-}
-
-static void clearSideEscapeDetourIfActive(const char* reason) {
-  if (!clearanceEscapeRouteDetourActive) {
-    return;
-  }
-  setObstacleBypassPhase(BYPASS_FINAL_APPROACH, reason);
-  clearanceEscapeRouteDetourActive = false;
-  sendBluetoothEvent("side_escape_final_approach", reason);
-}
-#endif
 
 static bool huntPickupCarryThroughActive(float routeLengthM, float routeUx,
                                          float routeUy) {
@@ -1990,14 +1973,6 @@ static bool huntPickupCarryThroughActive(float routeLengthM, float routeUx,
          lateralErrorM <= PLANNER_HUNT_FINISH_LATERAL_M;
 }
 
-#if 0
-static bool obstacleBypassSpeedLimited() {
-  return clearanceEscapeLocalGoalActive ||
-         postReverseEscapeActive ||
-         obstacleBypassPhase == BYPASS_SIDE_ESCAPE ||
-         obstacleBypassPhase == BYPASS_FRONT_WALL_REVERSE;
-}
-#endif
 
 static float requestedPointGoalSpeedCap(bool routeLineActive,
                                         float routeLengthM, float routeUx,
@@ -2023,16 +1998,6 @@ static bool huntPickupZoneReached(float routeLengthM, float routeUx, float route
   return alongM >= routeLengthM - PLANNER_HUNT_FINISH_TARGET_TOLERANCE_M &&
          alongM <= routeLengthM + PLANNER_HUNT_FINISH_OVERSHOOT_M &&
          lateralErrorM <= PLANNER_HUNT_FINISH_LATERAL_M;
-}
-
-static void buildRouteLineLocalGoal(float routeLengthM, float routeUx,
-                                    float routeUy, float &localGoalX,
-                                    float &localGoalY) {
-  float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
-  float lookaheadAlongM = constrain(alongM + WAYPOINT_LOOKAHEAD_M,
-                                    0.0f, routeLengthM);
-  localGoalX = navigationGoal.startX + routeUx * lookaheadAlongM;
-  localGoalY = navigationGoal.startY + routeUy * lookaheadAlongM;
 }
 
 static float pointAlignmentTurnErrorDeg(float headingErrorDeg) {
@@ -2559,529 +2524,69 @@ static void reportPlannerStopIfChanged() {
   sendBluetoothEvent("planner_safe_stop", plannerStopReasonName(plannerTelemetry.stopReason));
 }
 
-#if 0
-// Retained temporarily as a readable comparison with RobotCode - Copy (3).
-// The forward-only obstacle-context planner below does not compile or call
-// reverse recovery, side-memory latching, adaptive escape, route rejoin, or
-// final-approach behavior.
-static bool canStartReverseRecovery() {
-  return navigationGoal.mode == NAV_GOAL_POINT &&
-         escapeBacktrackEnabled &&
-         !reverseRecoveryActive &&
-         geometricNoPathEpochCount >=
-           PLANNER_REVERSE_MIN_GEOMETRIC_NO_PATH_EPOCHS &&
-         (obstacleBypassSideSign != 0.0f ||
-          obstacleObservedPreferredSideSign != 0.0f) &&
-         plannerTelemetry.stopReason != PLANNER_STOP_FRONT_INVALID &&
-         isRangeSensorValid(RANGE_FAKE_REAR);
-}
 
-static void resetReverseSurveyState() {
-  reverseSurveySettling = false;
-  reverseSurveySettleStartedMs = 0;
-  reverseSurveyReadyReported = false;
-  reverseSurveyReadyToTryForward = false;
-  reverseSurveyForcedByMaxRetreat = false;
-  reverseSurveyRequiredRetreatM = PLANNER_REVERSE_SURVEY_MIN_REVERSE_M;
-}
-
-static void startReverseRecovery() {
-  // Enters reverse recovery after repeated geometric no-forward-path evidence.
-  // It preserves the original point goal and uses reverse planner epochs only
-  // until a forward arc becomes available again.
-  resetReversePlannerEpoch();
-  float adaptiveSideSign = postReverseEscapeActive
-    ? postReverseEscapeSideSign
-    : lastClearanceEscapeSideSign;
-  if (adaptiveSideSign != 0.0f &&
-      millis() - lastClearanceEscapeMs <=
-        PLANNER_SIDE_ESCAPE_ADAPT_MEMORY_MS) {
-    bumpSideEscapeAdaptiveExtra(adaptiveSideSign, "reentered_recovery");
+static float forwardContinuationQuality(
+    const PlannerCollisionSnapshot &snapshot,
+    float startX, float startY, float startHeadingRad,
+    float goalX, float goalY) {
+  const float startDistanceM = sqrtf((goalX - startX) * (goalX - startX) +
+                                     (goalY - startY) * (goalY - startY));
+  float bestQuality = 0.0f;
+  const float normalizedTurns[] = {-1.0f, -0.5f, 0.0f, 0.5f, 1.0f};
+  for (unsigned int index = 0;
+       index < sizeof(normalizedTurns) / sizeof(normalizedTurns[0]); ++index) {
+    float forwardTicks = PLANNER_MIN_DRIVABLE_SPEED_TPS;
+    float turnTicks = forwardTicks * normalizedTurns[index] *
+                      PLANNER_MAX_TURN_RATIO;
+    float leftMps = leftWheelTargetFromChassis(forwardTicks, turnTicks) /
+                    TICKS_PER_METRE;
+    float rightMps = rightWheelTargetFromChassis(forwardTicks, turnTicks) /
+                     TICKS_PER_METRE;
+    float linearMps = (leftMps + rightMps) * 0.5f;
+    float angularRadPerSec = navigationOmegaFromWheelSpeeds(
+      leftMps, rightMps, EFFECTIVE_TRACK_WIDTH_M);
+    float x = startX;
+    float y = startY;
+    float heading = startHeadingRad;
+    bool safe = true;
+    for (float elapsed = 0.0f; elapsed < PLANNER_HORIZON_S;
+         elapsed += PLANNER_ROLLOUT_STEP_S) {
+      float midpointHeading = heading +
+        angularRadPerSec * PLANNER_ROLLOUT_STEP_S * 0.5f;
+      x += linearMps * cosf(midpointHeading) * PLANNER_ROLLOUT_STEP_S;
+      y += linearMps * sinf(midpointHeading) * PLANNER_ROLLOUT_STEP_S;
+      heading += angularRadPerSec * PLANNER_ROLLOUT_STEP_S;
+      if (!footprintKnownClearOnSnapshot(snapshot, x, y, heading)) {
+        safe = false;
+        break;
+      }
+    }
+    if (!safe) {
+      continue;
+    }
+    float finalDistanceM = sqrtf((goalX - x) * (goalX - x) +
+                                 (goalY - y) * (goalY - y));
+    float progress = constrain((startDistanceM - finalDistanceM) /
+                               max(PLANNER_MIN_PROGRESS_M, startDistanceM),
+                               0.0f, 1.0f);
+    float desiredHeadingDeg = atan2f(goalY - y, goalX - x) * RAD_TO_DEG;
+    float headingErrorDeg = fabs(wrapAngle(
+      desiredHeadingDeg - heading * RAD_TO_DEG));
+    float headingQuality = 1.0f - min(1.0f, headingErrorDeg / 90.0f);
+    bestQuality = max(bestQuality, 0.7f * progress + 0.3f * headingQuality);
   }
-
-  reverseRecoveryActive = true;
-  if (recoveryAttemptCount < 255) {
-    recoveryAttemptCount++;
-  }
-  plannerTelemetry.recoveryCount = recoveryAttemptCount;
-  reverseRecoveryStartX = robotX;
-  reverseRecoveryStartY = robotY;
-  reverseRecoveryStartedMs = millis();
-  reverseRecoveryStepCount = 0;
-  reverseRecoveryRejectsReported = false;
-  resetReverseSurveyState();
-  resetGeometricNoPathEvidence();
-  if (obstacleBypassSideSign == 0.0f) {
-    obstacleBypassSideSign = obstacleObservedPreferredSideSign;
-    lastClearanceEscapeSideSign = obstacleBypassSideSign;
-    lastClearanceEscapeMs = millis();
-    clearanceEscapeRouteDetourActive = true;
-  }
-  obstacleBypassTargetOutwardM =
-    max(obstacleBypassTargetOutwardM, PLANNER_FRONT_WALL_BYPASS_OUTWARD_M);
-  setObstacleBypassPhase(BYPASS_FRONT_WALL_REVERSE, "reverse_started");
-  resetEncodersAndPID();
-  plannerTelemetry.planReason = "reverse_recovery_start";
-  plannerTelemetry.replanReason = "no_forward_path";
-  plannerTelemetry.safeStopReason = "";
-  sendBluetoothEvent("reverse_recovery_start", "no_forward_path");
-}
-
-static void endReverseRecovery(const char* detail) {
-  if (!reverseRecoveryActive) {
-    return;
-  }
-  reverseRecoveryActive = false;
-  resetReversePlannerEpoch();
-  reverseRecoveryRejectsReported = false;
-  resetReverseSurveyState();
-  sendBluetoothEvent("reverse_recovery_end", detail);
-}
-
-static float sideEscapeTriggerM() {
-  return WAYPOINT_LOOKAHEAD_M +
-         ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
-         PLANNER_PREFERRED_CLEARANCE_M;
-}
-
-static const char* sideEscapeName(float sideSign) {
-  if (sideSign < 0.0f) {
-    return "right";
-  }
-  if (sideSign > 0.0f) {
-    return "left";
-  }
-  return "unknown";
-}
-
-static const char* obstacleBypassPhaseName(ObstacleBypassPhase phase) {
-  switch (phase) {
-    case BYPASS_IDLE: return "idle";
-    case BYPASS_SIDE_ESCAPE: return "side_escape";
-    case BYPASS_FRONT_WALL_REVERSE: return "front_wall_reverse";
-    case BYPASS_POST_REVERSE_ESCAPE: return "post_reverse_escape";
-    case BYPASS_ROUTE_REJOIN: return "route_rejoin";
-    case BYPASS_FINAL_APPROACH: return "final_approach";
-  }
-  return "unknown";
-}
-
-static void setObstacleBypassPhase(ObstacleBypassPhase phase, const char* reason) {
-  if (obstacleBypassPhase == phase) {
-    return;
-  }
-
-  char detail[128];
-  snprintf(detail, sizeof(detail),
-           "from=%s;to=%s;reason=%s;observed=%.0f;latched=%.0f;out=%.2f;target=%.2f",
-           obstacleBypassPhaseName(obstacleBypassPhase),
-           obstacleBypassPhaseName(phase),
-           reason,
-           obstacleObservedPreferredSideSign,
-           obstacleBypassSideSign,
-           obstacleBypassMaxOutwardM,
-           obstacleBypassTargetOutwardM);
-  obstacleBypassPhase = phase;
-  obstacleBypassPhaseStartedMs = millis();
-  sendBluetoothEvent("obstacle_bypass_phase", detail);
-}
-
-static void resetPostReverseEscapeState() {
-  postReverseEscapeActive = false;
-  postReverseEscapeSideSign = 0.0f;
-  postReverseEscapeStartedMs = 0;
-}
-
-static void resetSideEscapeAdaptation() {
-  sideEscapeAdaptiveExtraM = 0.0f;
-  sideEscapeAdaptiveSideSign = 0.0f;
-  sideEscapeAdaptiveFailureCount = 0;
-  sideEscapeAdaptiveLastBumpMs = 0;
-}
-
-static void resetClearanceEscapeMemory(const char* reason) {
-  if (obstacleBypassPhase != BYPASS_IDLE || obstacleBypassSideSign != 0.0f) {
-    char detail[128];
-    snprintf(detail, sizeof(detail),
-             "phase=%s;reason=%s;observed=%.0f;latched=%.0f",
-             obstacleBypassPhaseName(obstacleBypassPhase), reason,
-             obstacleObservedPreferredSideSign, obstacleBypassSideSign);
-    sendBluetoothEvent("obstacle_bypass_reset", detail);
-  }
-  obstacleBypassPhase = BYPASS_IDLE;
-  obstacleObservedPreferredSideSign = 0.0f;
-  obstacleObservedCandidateSideSign = 0.0f;
-  obstacleObservedStableCount = 0;
-  obstacleObservedLastUpdateMs = 0;
-  obstacleBypassSideSign = 0.0f;
-  obstacleBypassMaxOutwardM = 0.0f;
-  obstacleBypassTargetOutwardM = 0.0f;
-  obstacleBypassPhaseStartedMs = 0;
-  lastClearanceEscapeSideSign = 0.0f;
-  lastClearanceEscapeMs = 0;
-  clearanceEscapeRouteDetourActive = false;
-  resetSideEscapeAdaptation();
-}
-
-static void updateObservedPreferredSide(const SideEscapeEvidence &evidence) {
-  unsigned long now = millis();
-  // readSideEscapeEvidence() is used by several decisions in one planner tick;
-  // count at most one observation per millisecond so repeated reads cannot
-  // manufacture stability.
-  if (obstacleObservedLastUpdateMs == now) {
-    return;
-  }
-  obstacleObservedLastUpdateMs = now;
-
-  if (!evidence.sensorsValid || !evidence.closeSideEvidence) {
-    obstacleObservedCandidateSideSign = 0.0f;
-    obstacleObservedStableCount = 0;
-    obstacleObservedPreferredSideSign = 0.0f;
-    return;
-  }
-
-  float observedSideSign = evidence.sidePreferenceValid ? evidence.sideSign : 0.0f;
-  if (observedSideSign == 0.0f && recentBlockedTurnDirection != 0 &&
-      now - recentBlockedTurnMs <= PLANNER_SIDE_ESCAPE_MEMORY_MS) {
-    // A tied front-wall view has no geometric open-side winner.  The current
-    // blocked-turn observation supplies a deterministic fallback, but it is
-    // still required to repeat before it becomes a latch candidate.
-    observedSideSign = -recentBlockedTurnDirection;
-  }
-  if (observedSideSign == 0.0f) {
-    obstacleObservedCandidateSideSign = 0.0f;
-    obstacleObservedStableCount = 0;
-    obstacleObservedPreferredSideSign = 0.0f;
-    return;
-  }
-
-  if (observedSideSign != obstacleObservedCandidateSideSign) {
-    obstacleObservedCandidateSideSign = observedSideSign;
-    obstacleObservedStableCount = 1;
-  } else if (obstacleObservedStableCount < 2) {
-    obstacleObservedStableCount++;
-  }
-  obstacleObservedPreferredSideSign = obstacleObservedStableCount >= 2
-    ? obstacleObservedCandidateSideSign : 0.0f;
-}
-
-static bool readSideEscapeEvidence(SideEscapeEvidence &evidence) {
-  // Reads the four fan rays into a compact side-escape summary. sideSign is
-  // -1 for robot-right and +1 for robot-left in the navigation frame.
-  evidence.sensorsValid =
-    isRangeSensorValid(RANGE_RIGHT_INNER) &&
-    isRangeSensorValid(RANGE_LEFT_INNER) &&
-    isRangeSensorValid(RANGE_RIGHT_OUTER) &&
-    isRangeSensorValid(RANGE_LEFT_OUTER);
-  evidence.rightM = -1.0f;
-  evidence.leftM = -1.0f;
-  evidence.restrictedM = -1.0f;
-  evidence.triggerM = sideEscapeTriggerM();
-  evidence.closeSideEvidence = false;
-  evidence.sidePreferenceValid = false;
-  evidence.sideSign = 0.0f;
-
-  if (!evidence.sensorsValid) {
-    updateObservedPreferredSide(evidence);
-    return false;
-  }
-
-  float rightInnerM = getRangeSensorDistance(RANGE_RIGHT_INNER) / 1000.0f;
-  float leftInnerM = getRangeSensorDistance(RANGE_LEFT_INNER) / 1000.0f;
-  float rightOuterM = getRangeSensorDistance(RANGE_RIGHT_OUTER) / 1000.0f;
-  float leftOuterM = getRangeSensorDistance(RANGE_LEFT_OUTER) / 1000.0f;
-  evidence.rightM = min(rightInnerM, rightOuterM);
-  evidence.leftM = min(leftInnerM, leftOuterM);
-  evidence.restrictedM = min(evidence.rightM, evidence.leftM);
-  evidence.closeSideEvidence = evidence.restrictedM < evidence.triggerM;
-  evidence.sidePreferenceValid =
-    fabs(evidence.rightM - evidence.leftM) >= PLANNER_SIDE_ESCAPE_TIE_M;
-  evidence.sideSign = evidence.rightM > evidence.leftM ? -1.0f : 1.0f;
-  updateObservedPreferredSide(evidence);
-  return true;
-}
-
-static bool chooseSideEscapeSign(const SideEscapeEvidence &evidence,
-                                 bool allowRecentMemory,
-                                 float &sideSign) {
-  sideSign = 0.0f;
-  if (!evidence.closeSideEvidence) {
-    return false;
-  }
-
-  if (obstacleBypassSideSign != 0.0f) {
-    sideSign = obstacleBypassSideSign;
-    return true;
-  }
-
-  if (obstacleObservedPreferredSideSign != 0.0f) {
-    sideSign = obstacleObservedPreferredSideSign;
-    return true;
-  }
-
-  if (allowRecentMemory &&
-      lastClearanceEscapeSideSign != 0.0f &&
-      millis() - lastClearanceEscapeMs <= PLANNER_SIDE_ESCAPE_MEMORY_MS) {
-    sideSign = lastClearanceEscapeSideSign;
-    return true;
-  }
-
-  return false;
-}
-
-static void rememberClearanceEscapeSide(float sideSign) {
-  if (sideSign == 0.0f) {
-    return;
-  }
-
-  if (obstacleBypassSideSign != 0.0f &&
-      sideSign * obstacleBypassSideSign < 0.0f) {
-    char detail[112];
-    snprintf(detail, sizeof(detail),
-             "reason=implicit_flip_rejected;phase=%s;observed=%.0f;latched=%.0f",
-             obstacleBypassPhaseName(obstacleBypassPhase),
-             obstacleObservedPreferredSideSign, obstacleBypassSideSign);
-    sendBluetoothEvent("obstacle_bypass_side_rejected", detail);
-    sideSign = obstacleBypassSideSign;
-  }
-
-  if (sideEscapeAdaptiveSideSign != 0.0f &&
-      sideSign * sideEscapeAdaptiveSideSign < 0.0f) {
-    resetSideEscapeAdaptation();
-  }
-  lastClearanceEscapeSideSign = sideSign;
-  lastClearanceEscapeMs = millis();
-  clearanceEscapeRouteDetourActive = true;
-  if (obstacleBypassSideSign == 0.0f) {
-    obstacleBypassSideSign = sideSign;
-  }
-  obstacleBypassTargetOutwardM =
-    max(obstacleBypassTargetOutwardM, PLANNER_SIDE_ESCAPE_MIN_OUTWARD_M);
-
-  float routeLengthM = 0.0f;
-  float routeUx = 1.0f;
-  float routeUy = 0.0f;
-  float routeHeadingRad = 0.0f;
-  if (routeLineFrame(routeLengthM, routeUx, routeUy, routeHeadingRad)) {
-    float lateralM = routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy);
-    obstacleBypassMaxOutwardM =
-      max(obstacleBypassMaxOutwardM, max(0.0f, sideSign * lateralM));
-  }
-
-  if (postReverseEscapeActive) {
-    setObstacleBypassPhase(BYPASS_POST_REVERSE_ESCAPE, "post_reverse_escape");
-  } else if (obstacleBypassPhase == BYPASS_IDLE ||
-             obstacleBypassPhase == BYPASS_FINAL_APPROACH ||
-             obstacleBypassPhase == BYPASS_ROUTE_REJOIN) {
-    setObstacleBypassPhase(BYPASS_SIDE_ESCAPE, "side_evidence");
-  }
-}
-
-static float sideEscapeAdaptiveExtraFor(float sideSign) {
-  if (sideSign == 0.0f ||
-      sideEscapeAdaptiveSideSign == 0.0f ||
-      sideSign * sideEscapeAdaptiveSideSign <= 0.0f ||
-      sideEscapeAdaptiveExtraM <= 0.0f) {
-    return 0.0f;
-  }
-
-  if (millis() - sideEscapeAdaptiveLastBumpMs >
-      PLANNER_SIDE_ESCAPE_ADAPT_MEMORY_MS) {
-    resetSideEscapeAdaptation();
-    return 0.0f;
-  }
-
-  return sideEscapeAdaptiveExtraM;
-}
-
-static void bumpSideEscapeAdaptiveExtra(float sideSign, const char* reason) {
-  if (sideSign == 0.0f) {
-    return;
-  }
-
-  unsigned long now = millis();
-  if (sideEscapeAdaptiveSideSign != 0.0f &&
-      sideSign * sideEscapeAdaptiveSideSign > 0.0f &&
-      now - sideEscapeAdaptiveLastBumpMs <
-        PLANNER_SIDE_ESCAPE_ADAPT_BUMP_COOLDOWN_MS) {
-    return;
-  }
-
-  if (sideEscapeAdaptiveSideSign == 0.0f ||
-      sideSign * sideEscapeAdaptiveSideSign < 0.0f) {
-    sideEscapeAdaptiveExtraM = 0.0f;
-    sideEscapeAdaptiveFailureCount = 0;
-  }
-
-  sideEscapeAdaptiveSideSign = sideSign;
-  sideEscapeAdaptiveExtraM =
-    min(PLANNER_SIDE_ESCAPE_ADAPT_MAX_EXTRA_M,
-        sideEscapeAdaptiveExtraM + PLANNER_SIDE_ESCAPE_ADAPT_STEP_M);
-  if (sideEscapeAdaptiveFailureCount < 255) {
-    sideEscapeAdaptiveFailureCount++;
-  }
-  sideEscapeAdaptiveLastBumpMs = now;
-  rememberClearanceEscapeSide(sideSign);
-
-  char detail[96];
-  snprintf(detail, sizeof(detail), "reason=%s;side=%s;extra=%.2f;failures=%u",
-           reason, sideEscapeName(sideSign), sideEscapeAdaptiveExtraM,
-           (unsigned int)sideEscapeAdaptiveFailureCount);
-  sendBluetoothEvent("side_escape_widen", detail);
-}
-
-static void sendPostReverseEscapeEvent(const char* eventName,
-                                       const char* reason,
-                                       float sideSign,
-                                       const SideEscapeEvidence &evidence) {
-  char detail[120];
-  snprintf(detail, sizeof(detail), "%s;side=%s;right=%.2f;left=%.2f;extra=%.2f",
-           reason, sideEscapeName(sideSign), evidence.rightM, evidence.leftM,
-           sideEscapeAdaptiveExtraFor(sideSign));
-  sendBluetoothEvent(eventName, detail);
-}
-
-static float reverseRecoveryRetreatDistanceM() {
-  return sqrtf((robotX - reverseRecoveryStartX) *
-               (robotX - reverseRecoveryStartX) +
-               (robotY - reverseRecoveryStartY) *
-               (robotY - reverseRecoveryStartY));
-}
-
-static float reverseSurveyFrontDistanceM() {
-  if (!isRangeSensorValid(RANGE_FRONT)) {
-    return -1.0f;
-  }
-  return getRangeSensorDistance(RANGE_FRONT) / 1000.0f;
-}
-
-static void sendReverseSurveyEvent(const char* eventName,
-                                   const char* reason,
-                                   float retreatM,
-                                   float frontM,
-                                   bool forced,
-                                   const SideEscapeEvidence &evidence) {
-  char detail[144];
-  snprintf(detail, sizeof(detail),
-           "reason=%s;retreat=%.2f;required=%.2f;front=%.2f;side=%.2f;right=%.2f;left=%.2f;forced=%d",
-           reason,
-           retreatM,
-           reverseSurveyRequiredRetreatM,
-           frontM,
-           evidence.restrictedM,
-           evidence.rightM,
-           evidence.leftM,
-           forced ? 1 : 0);
-  sendBluetoothEvent(eventName, detail);
-}
-
-static bool reverseSurveyObservationReady(SideEscapeEvidence &evidence,
-                                          float &retreatM,
-                                          float &frontM,
-                                          bool &forced) {
-  retreatM = reverseRecoveryRetreatDistanceM();
-  frontM = reverseSurveyFrontDistanceM();
-  forced = retreatM >= PLANNER_REVERSE_SURVEY_MAX_REVERSE_M;
-  bool frontReady = frontM >= PLANNER_REVERSE_SURVEY_FRONT_CLEAR_M;
-  bool sideReady = readSideEscapeEvidence(evidence) &&
-                   evidence.restrictedM >= PLANNER_REVERSE_SURVEY_SIDE_CLEAR_M;
-  bool retreatReady = retreatM >= reverseSurveyRequiredRetreatM;
-  return forced || (retreatReady && frontReady && sideReady);
-}
-
-static void holdReverseSurvey(const char* planReason,
-                              const char* replanReason) {
-  plannerTelemetry.selectedForwardTicksPerSec = 0.0;
-  plannerTelemetry.selectedTurnTicksPerSec = 0.0;
-  plannerTelemetry.selectedCurvature = 0.0;
-  plannerTelemetry.minimumSweptClearanceMm = minimumFanSweepClearanceMm();
-  plannerTelemetry.speedCapTicksPerSec = 0.0;
-  plannerTelemetry.candidateCount = 0;
-  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
-  plannerTelemetry.planReason = planReason;
-  plannerTelemetry.replanReason = replanReason;
-  plannerTelemetry.safeStopReason = "";
-  motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
-}
-
-static ReverseSurveyDecision updateReverseSurveyDecision() {
-  reverseSurveyReadyToTryForward = false;
-  reverseSurveyForcedByMaxRetreat = false;
-
-  SideEscapeEvidence evidence = {};
-  float retreatM = 0.0f;
-  float frontM = -1.0f;
-  bool forced = false;
-  if (!reverseSurveyObservationReady(evidence, retreatM, frontM, forced)) {
-    reverseSurveySettling = false;
-    reverseSurveyReadyReported = false;
-    return REVERSE_SURVEY_REVERSE;
-  }
-
-  unsigned long now = millis();
-  if (!reverseSurveySettling) {
-    reverseSurveySettling = true;
-    reverseSurveySettleStartedMs = now;
-    reverseSurveyReadyReported = false;
-    reverseSurveyForcedByMaxRetreat = forced;
-    sendReverseSurveyEvent("reverse_survey_settle",
-                           forced ? "max_retreat" : "observation_pose",
-                           retreatM,
-                           frontM,
-                           forced,
-                           evidence);
-    holdReverseSurvey("reverse_survey_settle",
-                      "waiting_for_fresh_side_fan");
-    return REVERSE_SURVEY_HOLD;
-  }
-
-  if (now - reverseSurveySettleStartedMs < PLANNER_REVERSE_SURVEY_SETTLE_MS) {
-    reverseSurveyForcedByMaxRetreat = forced;
-    holdReverseSurvey("reverse_survey_settle",
-                      "waiting_for_fresh_side_fan");
-    return REVERSE_SURVEY_HOLD;
-  }
-
-  reverseSurveyReadyToTryForward = true;
-  reverseSurveyForcedByMaxRetreat = forced;
-  if (!reverseSurveyReadyReported) {
-    sendReverseSurveyEvent("reverse_survey_ready",
-                           forced ? "max_retreat" : "fresh_observation",
-                           retreatM,
-                           frontM,
-                           forced,
-                           evidence);
-    reverseSurveyReadyReported = true;
-  }
-  return REVERSE_SURVEY_FORWARD;
-}
-
-static void requestReverseSurveyRetry(const char* reason) {
-  float retreatM = reverseRecoveryRetreatDistanceM();
-  reverseSurveyRequiredRetreatM =
-    min(PLANNER_REVERSE_SURVEY_MAX_REVERSE_M,
-        max(reverseSurveyRequiredRetreatM,
-            retreatM + PLANNER_REVERSE_SURVEY_RETRY_REVERSE_M));
-  reverseSurveySettling = false;
-  reverseSurveySettleStartedMs = 0;
-  reverseSurveyReadyReported = false;
-  reverseSurveyReadyToTryForward = false;
-  reverseSurveyForcedByMaxRetreat = false;
-
-  char detail[96];
-  snprintf(detail, sizeof(detail), "reason=%s;retreat=%.2f;required=%.2f",
-           reason, retreatM, reverseSurveyRequiredRetreatM);
-  sendBluetoothEvent("reverse_survey_retry", detail);
+  return bestQuality;
 }
 
 static float calculateReverseRecoverySpeedCapTicksPerSec() {
-  if (!isRangeSensorValid(RANGE_FAKE_REAR) ||
+  if (!hasTrustedRearCoverage() ||
+      !isRangeSensorValid(RANGE_FAKE_REAR) ||
       isRangeSensorBlocked(RANGE_FAKE_REAR)) {
     return 0.0f;
   }
 
   float availableM = getRangeSensorDistance(RANGE_FAKE_REAR) / 1000.0f -
+                     PLANNER_TOTAL_HARD_CLEARANCE_M -
                      PLANNER_REVERSE_RECOVERY_REAR_BUFFER_M;
   availableM = max(0.0f, availableM);
   float a = PLANNER_MAX_DECELERATION_MPS2;
@@ -3096,11 +2601,21 @@ static bool rolloutReverseRecoveryCandidate(const ReversePlannerEpoch &epoch,
                                             float reverseTicks, float turnTicks,
                                             float goalX, float goalY,
                                             float &rearClearanceMm,
-                                            float &finalGoalDistanceM,
-                                            float &finalHeadingErrorDeg,
-                                            float &finalRouteLateralErrorM,
+                                            float &endpointClearanceM,
+                                            float &sweepClearanceM,
+                                            float &forwardQuality,
+                                            float &unexploredScore,
+                                            float &finalX,
+                                            float &finalY,
+                                            float &finalHeadingRad,
                                             CandidateRejectReason &rejectReason) {
   if (reverseTicks >= 0.0f) {
+    rejectReason = CANDIDATE_REJECT_REAR_OBSERVATION;
+    return false;
+  }
+  const float leftTicks = leftWheelTargetFromChassis(reverseTicks, turnTicks);
+  const float rightTicks = rightWheelTargetFromChassis(reverseTicks, turnTicks);
+  if (leftTicks >= 0.0f || rightTicks >= 0.0f) {
     rejectReason = CANDIDATE_REJECT_REAR_OBSERVATION;
     return false;
   }
@@ -3110,8 +2625,7 @@ static bool rolloutReverseRecoveryCandidate(const ReversePlannerEpoch &epoch,
   }
 
   float observedRearM = epoch.observedRearM;
-  float trailingEnvelopeM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
-                            PLANNER_TOTAL_HARD_CLEARANCE_M +
+  float trailingEnvelopeM = PLANNER_TOTAL_HARD_CLEARANCE_M +
                             PLANNER_REVERSE_RECOVERY_REAR_BUFFER_M;
   float heading = epoch.startHeadingRad;
   float x = epoch.startX;
@@ -3123,14 +2637,12 @@ static bool rolloutReverseRecoveryCandidate(const ReversePlannerEpoch &epoch,
   float linearMps = (leftMps + rightMps) * 0.5f;
   float angularRadPerSec = navigationOmegaFromWheelSpeeds(
     leftMps, rightMps, EFFECTIVE_TRACK_WIDTH_M);
+  if (leftMps >= 0.0f || rightMps >= 0.0f) {
+    rejectReason = CANDIDATE_REJECT_REAR_OBSERVATION;
+    return false;
+  }
   float travelledRearM = 0.0f;
-  finalRouteLateralErrorM = 0.0f;
-
-  float routeLengthM = 0.0f;
-  float routeUx = 1.0f;
-  float routeUy = 0.0f;
-  float routeHeadingRad = 0.0f;
-  bool hasRouteFrame = routeLineFrame(routeLengthM, routeUx, routeUy, routeHeadingRad);
+  sweepClearanceM = PLANNER_REVERSE_CLEARANCE_CAP_M;
 
   for (float elapsed = 0.0f; elapsed < PLANNER_HORIZON_S; elapsed += PLANNER_ROLLOUT_STEP_S) {
     float midpointHeading = heading + angularRadPerSec * PLANNER_ROLLOUT_STEP_S * 0.5f;
@@ -3150,58 +2662,51 @@ static bool rolloutReverseRecoveryCandidate(const ReversePlannerEpoch &epoch,
       rejectReason = CANDIDATE_REJECT_FOOTPRINT;
       return false;
     }
+    if (!footprintKnownClearOnSnapshot(epoch.collision, x, y, heading)) {
+      rejectReason = CANDIDATE_REJECT_CLEAR_EVIDENCE;
+      return false;
+    }
+    sweepClearanceM = min(sweepClearanceM,
+      poseKnownClearanceM(epoch.collision, x, y, heading));
   }
 
-  float goalDx = goalX - x;
-  float goalDy = goalY - y;
-  finalGoalDistanceM = sqrtf(goalDx * goalDx + goalDy * goalDy);
-  float desiredHeadingDeg = atan2f(goalDy, goalDx) * RAD_TO_DEG;
-  finalHeadingErrorDeg = fabs(wrapAngle(desiredHeadingDeg - heading * RAD_TO_DEG));
   rearClearanceMm = max(0.0f, (observedRearM - travelledRearM - trailingEnvelopeM) * 1000.0f);
-  if (hasRouteFrame) {
-    finalRouteLateralErrorM = routeLineLateralErrorM(x, y, routeUx, routeUy);
-  }
+  endpointClearanceM = poseKnownClearanceM(epoch.collision, x, y, heading);
+  forwardQuality = forwardContinuationQuality(epoch.collision,
+    x, y, heading, goalX, goalY);
+  unexploredScore = projectedUnexploredScore(epoch.collision, x, y, heading);
+  finalX = x;
+  finalY = y;
+  finalHeadingRad = heading;
   rejectReason = CANDIDATE_REJECT_NONE;
   return true;
 }
 
 static float reverseRecoveryScore(float reverseTicks, float turnTicks,
-                                  float plannerStartX, float plannerStartY,
                                   float previousSelectedTurn,
-                                  float rearClearanceMm,
-                                  float finalGoalDistanceM,
-                                  float finalHeadingErrorDeg,
-                                  float finalRouteLateralErrorM) {
-  float startGoalDistanceM = sqrtf(
-    (navigationGoal.targetX - plannerStartX) *
-      (navigationGoal.targetX - plannerStartX) +
-    (navigationGoal.targetY - plannerStartY) *
-      (navigationGoal.targetY - plannerStartY));
-  float progressScore = constrain((startGoalDistanceM - finalGoalDistanceM) /
-                                  max(PLANNER_MIN_PROGRESS_M, startGoalDistanceM),
-                                  -1.0f, 1.0f);
-  float headingScore = 1.0f - min(1.0f, finalHeadingErrorDeg / 120.0f);
-  float clearanceScore = constrain(rearClearanceMm /
-                                   (PLANNER_PREFERRED_CLEARANCE_M * 1000.0f),
-                                   0.0f, 1.0f);
+                                  float sweepClearanceM,
+                                  float forwardQuality,
+                                  float unexploredScore) {
   float curvature = fabs(turnTicks) / max(1.0f, fabs(reverseTicks));
   float smoothnessScore = 1.0f - min(1.0f, fabs(turnTicks - previousSelectedTurn) /
                                           max(1.0f, baseTargetSpeed));
-  float routeScore = 1.0f - min(1.0f, finalRouteLateralErrorM /
-                                      PLANNER_LINE_FOLLOW_LATERAL_TOLERANCE_M);
-  float reverseProgressWeight = reverseSurveyReadyToTryForward ? 0.5f : 0.15f;
-  float reverseCurvaturePenalty = reverseSurveyReadyToTryForward ? 0.9f : 2.0f;
-  return 1.6f * headingScore + 1.4f * clearanceScore +
-         0.8f * smoothnessScore + 0.8f * routeScore +
-         reverseProgressWeight * progressScore -
-         reverseCurvaturePenalty * curvature;
+  float sweepScore = constrain(sweepClearanceM /
+    PLANNER_REVERSE_CLEARANCE_CAP_M, 0.0f, 1.0f);
+  float efficiencyScore = 0.5f * smoothnessScore +
+    0.5f * (1.0f - min(1.0f, curvature /
+      PLANNER_REVERSE_RECOVERY_MAX_TURN_RATIO));
+  return PLANNER_REVERSE_FORWARD_QUALITY_WEIGHT * forwardQuality +
+         PLANNER_REVERSE_UNEXPLORED_WEIGHT * unexploredScore +
+         PLANNER_REVERSE_SWEEP_CLEARANCE_WEIGHT * sweepScore +
+         PLANNER_REVERSE_EFFICIENCY_WEIGHT * efficiencyScore;
 }
 
 static void captureReversePlannerEpochView(ReversePlannerEpoch &epoch) {
   epoch.startX = robotX;
   epoch.startY = robotY;
   epoch.startHeadingRad = navigationHeadingRad();
-  epoch.rearValid = isRangeSensorValid(RANGE_FAKE_REAR);
+  epoch.rearValid = hasTrustedRearCoverage() &&
+                    isRangeSensorValid(RANGE_FAKE_REAR);
   epoch.rearBlocked = isRangeSensorBlocked(RANGE_FAKE_REAR);
   epoch.observedRearM = epoch.rearValid
     ? getRangeSensorDistance(RANGE_FAKE_REAR) / 1000.0f : 0.0f;
@@ -3242,7 +2747,7 @@ static TrajectoryPlanResult retryReversePlannerEpoch(const char* safeReason,
 
 static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
   // Captures the snapshot used to evaluate reverse recovery arcs. In the
-  // current test build, rear evidence comes from RANGE_FAKE_REAR.
+  // simulator, rear evidence comes from the field-raycast rear channel.
   memset(&reversePlannerEpoch, 0, sizeof(reversePlannerEpoch));
   reversePlannerEpoch.active = true;
   reversePlannerEpoch.startedMs = millis();
@@ -3252,6 +2757,7 @@ static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
   reversePlannerEpoch.goalY = goalY;
   reversePlannerEpoch.bestScore = -1000000.0f;
   reversePlannerEpoch.bestRearClearance = -1.0f;
+  reversePlannerEpoch.bestClearanceBand = -1;
   reversePlannerEpoch.previousSelectedTurn =
     plannerTelemetry.selectedTurnTicksPerSec;
   captureReversePlannerEpochView(reversePlannerEpoch);
@@ -3273,7 +2779,7 @@ static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
       PLANNER_REVERSE_RECOVERY_MIN_SPEED_TPS) {
     plannerTelemetry.stopReason = PLANNER_STOP_NO_SAFE_TRAJECTORY;
     plannerTelemetry.safeStopReason = "rear_path_unavailable";
-    plannerTelemetry.replanReason = "fake_rear_tof_unavailable";
+    plannerTelemetry.replanReason = "trusted_rear_unavailable";
     closeReversePlannerEpoch();
     return TRAJECTORY_PLAN_NO_PATH;
   }
@@ -3355,18 +2861,24 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
       float turnTicks = reverseMagnitude * normalized *
                         PLANNER_REVERSE_RECOVERY_MAX_TURN_RATIO;
       float rearClearanceMm = -1.0f;
-      float finalGoalDistanceM = 0.0f;
-      float finalHeadingErrorDeg = 180.0f;
-      float finalRouteLateralErrorM = 0.0f;
+      float endpointClearanceM = 0.0f;
+      float sweepClearanceM = 0.0f;
+      float forwardQuality = 0.0f;
+      float unexploredScore = 0.0f;
+      float finalX = reversePlannerEpoch.startX;
+      float finalY = reversePlannerEpoch.startY;
+      float finalHeadingRad = reversePlannerEpoch.startHeadingRad;
       CandidateRejectReason rejectReason = CANDIDATE_REJECT_NONE;
       if (!rolloutReverseRecoveryCandidate(
             reversePlannerEpoch, reverseTicks, turnTicks,
             reversePlannerEpoch.goalX, reversePlannerEpoch.goalY,
-            rearClearanceMm, finalGoalDistanceM, finalHeadingErrorDeg,
-            finalRouteLateralErrorM, rejectReason)) {
+            rearClearanceMm, endpointClearanceM, sweepClearanceM,
+            forwardQuality, unexploredScore,
+            finalX, finalY, finalHeadingRad, rejectReason)) {
         if (rejectReason == CANDIDATE_REJECT_REAR_OBSERVATION) {
           reversePlannerEpoch.rejectedRear++;
-        } else if (rejectReason == CANDIDATE_REJECT_FOOTPRINT) {
+        } else if (rejectReason == CANDIDATE_REJECT_FOOTPRINT ||
+                   rejectReason == CANDIDATE_REJECT_CLEAR_EVIDENCE) {
           reversePlannerEpoch.rejectedFootprint++;
         }
         continue;
@@ -3376,15 +2888,26 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
         reversePlannerEpoch.acceptedCount;
       float score = reverseRecoveryScore(
         reverseTicks, turnTicks,
-        reversePlannerEpoch.startX, reversePlannerEpoch.startY,
         reversePlannerEpoch.previousSelectedTurn,
-        rearClearanceMm, finalGoalDistanceM, finalHeadingErrorDeg,
-        finalRouteLateralErrorM);
-      if (score > reversePlannerEpoch.bestScore) {
+        sweepClearanceM, forwardQuality, unexploredScore);
+      int clearanceBand = (int)floorf(
+        min(endpointClearanceM, PLANNER_REVERSE_CLEARANCE_CAP_M) /
+        PLANNER_REVERSE_CLEARANCE_BAND_M + 0.0001f);
+      if (clearanceBand > reversePlannerEpoch.bestClearanceBand ||
+          (clearanceBand == reversePlannerEpoch.bestClearanceBand &&
+           score > reversePlannerEpoch.bestScore)) {
+        reversePlannerEpoch.bestClearanceBand = clearanceBand;
         reversePlannerEpoch.bestScore = score;
         reversePlannerEpoch.bestReverse = reverseTicks;
         reversePlannerEpoch.bestTurn = turnTicks;
         reversePlannerEpoch.bestRearClearance = rearClearanceMm;
+        reversePlannerEpoch.bestEndpointClearanceM = endpointClearanceM;
+        reversePlannerEpoch.bestSweepClearanceM = sweepClearanceM;
+        reversePlannerEpoch.bestForwardQuality = forwardQuality;
+        reversePlannerEpoch.bestUnexploredScore = unexploredScore;
+        reversePlannerEpoch.bestFinalX = finalX;
+        reversePlannerEpoch.bestFinalY = finalY;
+        reversePlannerEpoch.bestFinalHeadingRad = finalHeadingRad;
       }
     }
     recordReversePlannerSlice(sliceStartedUs);
@@ -3435,20 +2958,59 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
     publishTurn *= speedScale;
   }
   float rearClearanceMm = -1.0f;
-  float finalGoalDistanceM = 0.0f;
-  float finalHeadingErrorDeg = 180.0f;
-  float finalRouteLateralErrorM = 0.0f;
+  float endpointClearanceM = 0.0f;
+  float sweepClearanceM = 0.0f;
+  float forwardQuality = 0.0f;
+  float unexploredScore = 0.0f;
+  float finalX = reversePlannerEpoch.startX;
+  float finalY = reversePlannerEpoch.startY;
+  float finalHeadingRad = reversePlannerEpoch.startHeadingRad;
   CandidateRejectReason rejectReason = CANDIDATE_REJECT_NONE;
   bool winnerStillSafe = rolloutReverseRecoveryCandidate(
       reversePlannerEpoch,
       publishReverse, publishTurn,
       reversePlannerEpoch.goalX, reversePlannerEpoch.goalY,
-      rearClearanceMm, finalGoalDistanceM, finalHeadingErrorDeg,
-      finalRouteLateralErrorM, rejectReason);
+      rearClearanceMm, endpointClearanceM, sweepClearanceM,
+      forwardQuality, unexploredScore,
+      finalX, finalY, finalHeadingRad, rejectReason);
   recordReversePlannerSlice(sliceStartedUs);
   if (!winnerStillSafe) {
     return retryReversePlannerEpoch("reverse_winner_revalidation_rejected",
                                     "reverse_winner_revalidation_retry");
+  }
+
+  reverseRecoveryState.currentClearanceM = poseKnownClearanceM(
+    reversePlannerEpoch.collision,
+    reversePlannerEpoch.startX, reversePlannerEpoch.startY,
+    reversePlannerEpoch.startHeadingRad);
+  reverseRecoveryState.endpointClearanceM = endpointClearanceM;
+  reverseRecoveryState.clearanceGainM = endpointClearanceM -
+    reverseRecoveryState.currentClearanceM;
+  reverseRecoveryState.unexploredScore = unexploredScore;
+  if (reverseRecoveryState.clearanceGainM <=
+      PLANNER_REVERSE_CLEARANCE_GAIN_M) {
+    if (reverseRecoveryState.plateauCount < 255) {
+      reverseRecoveryState.plateauCount++;
+    }
+  } else {
+    reverseRecoveryState.plateauCount = 0;
+  }
+  plannerTelemetry.recoveryCurrentClearanceM =
+    reverseRecoveryState.currentClearanceM;
+  plannerTelemetry.recoveryEndpointClearanceM = endpointClearanceM;
+  plannerTelemetry.recoveryClearanceGainM =
+    reverseRecoveryState.clearanceGainM;
+  plannerTelemetry.recoveryUnexploredScore = unexploredScore;
+  plannerTelemetry.recoveryPlateauCount =
+    reverseRecoveryState.plateauCount;
+  if (reverseRecoveryState.plateauCount >=
+      PLANNER_REVERSE_PLATEAU_EPOCHS) {
+    stopMotors();
+    reverseRecoveryState.checkingForward = true;
+    plannerTelemetry.planReason = "reverse_clearance_plateau";
+    plannerTelemetry.replanReason = "forward_takeover_check";
+    closeReversePlannerEpoch();
+    return TRAJECTORY_PLAN_RETRY;
   }
 
   reverseRecoveryStepCount++;
@@ -3457,7 +3019,8 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
   plannerTelemetry.selectedTurnTicksPerSec = publishTurn;
   plannerTelemetry.selectedCurvature = publishTurn /
     max(1.0f, fabs(publishReverse));
-  plannerTelemetry.minimumSweptClearanceMm = rearClearanceMm;
+  plannerTelemetry.minimumSweptClearanceMm =
+    min(rearClearanceMm, sweepClearanceM * 1000.0f);
   plannerTelemetry.stopReason = PLANNER_STOP_NONE;
   plannerTelemetry.planReason = "reverse_recovery_arc_revalidated";
   plannerTelemetry.replanReason = "no_forward_path";
@@ -3481,187 +3044,61 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
   return TRAJECTORY_PLAN_SUCCESS;
 }
 
-static void buildSideEscapeLocalGoal(float sideSign,
-                                     float extraLateralM,
-                                     float &localGoalX,
-                                     float &localGoalY) {
-  // Robot +Y is left. An open right side must therefore create a negative-Y
-  // local target (and vice versa). On routed point goals, express that offset
-  // in the original route frame so the escape remains a forward bypass instead
-  // of rotating with the chassis and walking sideways away from the waypoint.
-  float lateralOffsetM = (sideSign > 0.0f
-    ? ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm
-    : ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
-    PLANNER_PREFERRED_CLEARANCE_M + extraLateralM +
-    sideEscapeAdaptiveExtraFor(sideSign);
-  lateralOffsetM = max(lateralOffsetM, obstacleBypassTargetOutwardM);
 
-  float routeLengthM = 0.0f;
-  float routeUx = 1.0f;
-  float routeUy = 0.0f;
-  float routeHeadingRad = 0.0f;
-  if (routeLineFrame(routeLengthM, routeUx, routeUy, routeHeadingRad)) {
-    float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
-    float lookaheadAlongM = constrain(alongM + WAYPOINT_LOOKAHEAD_M,
-                                      0.0f, routeLengthM);
-    float currentLateralM =
-      routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy);
-    float targetLateralM = sideSign * lateralOffsetM;
-    float currentOutwardM = sideSign * currentLateralM;
-    if (currentOutwardM > lateralOffsetM) {
-      // Already wider than the planned bypass lane. Hold that lateral offset
-      // until the route-rejoin/final-approach phase rather than steering back
-      // inward while the wall edge may still be beside the chassis.
-      targetLateralM = currentLateralM;
-      obstacleBypassMaxOutwardM =
-        max(obstacleBypassMaxOutwardM, max(0.0f, currentOutwardM));
-    }
-    localGoalX = navigationGoal.startX + routeUx * lookaheadAlongM -
-                 routeUy * targetLateralM;
-    localGoalY = navigationGoal.startY + routeUy * lookaheadAlongM +
-                 routeUx * targetLateralM;
-    return;
-  }
-
-  float headingRad = navigationHeadingRad();
-  localGoalX = robotX + WAYPOINT_LOOKAHEAD_M * cosf(headingRad) -
-               sideSign * lateralOffsetM * sinf(headingRad);
-  localGoalY = robotY + WAYPOINT_LOOKAHEAD_M * sinf(headingRad) +
-               sideSign * lateralOffsetM * cosf(headingRad);
+static bool canStartEvidenceDrivenReverse() {
+  return navigationGoal.mode == NAV_GOAL_POINT &&
+         escapeBacktrackEnabled &&
+         hasTrustedRearCoverage() &&
+         isRangeSensorValid(RANGE_FAKE_REAR) &&
+         !isRangeSensorBlocked(RANGE_FAKE_REAR) &&
+         geometricNoPathEpochCount >=
+           PLANNER_REVERSE_MIN_GEOMETRIC_NO_PATH_EPOCHS &&
+         noSafeTrajectorySinceMs != 0 &&
+         millis() - noSafeTrajectorySinceMs >=
+           PLANNER_NO_PATH_BACKTRACK_DELAY_MS;
 }
 
-static bool buildClearanceEscapeLocalGoal(float &localGoalX, float &localGoalY) {
-  // Nearby side evidence on either the inner or outer rays can describe an
-  // observable side exit. Give the arc sampler that exit as its temporary
-  // local goal instead of scoring only progress along the blocked route line.
-  if (obstacleBypassPhase == BYPASS_FINAL_APPROACH) {
-    return false;
+static void startEvidenceDrivenReverse() {
+  resetPlannerEpoch();
+  resetReversePlannerEpoch();
+  if (recoveryAttemptCount == 0) {
+    resetObstacleContext("reverse_recovery_start");
   }
-
-  SideEscapeEvidence evidence;
-  if (!readSideEscapeEvidence(evidence)) {
-    return false;
+  reverseRecoveryState = {};
+  reverseRecoveryState.active = true;
+  reverseRecoveryState.startX = robotX;
+  reverseRecoveryState.startY = robotY;
+  reverseRecoveryState.previousTurn = 0.0f;
+  reverseRecoveryActive = true;
+  reverseRecoveryStartedMs = millis();
+  reverseRecoveryStartX = robotX;
+  reverseRecoveryStartY = robotY;
+  reverseRecoveryStepCount = 0;
+  if (recoveryAttemptCount < 255) {
+    recoveryAttemptCount++;
   }
-
-  float sideSign = 0.0f;
-  if (!chooseSideEscapeSign(evidence, true, sideSign)) {
-    return false;
-  }
-
-  rememberClearanceEscapeSide(sideSign);
-  buildSideEscapeLocalGoal(sideSign, 0.0f, localGoalX, localGoalY);
-  plannerTelemetry.replanReason = "clearance_escape_waypoint";
-  return true;
+  plannerTelemetry.recoveryCount = recoveryAttemptCount;
+  plannerTelemetry.reverseRecoveryActive = true;
+  plannerTelemetry.recoveryPlateauCount = 0;
+  plannerTelemetry.planReason = "reverse_reposition_start";
+  plannerTelemetry.replanReason = "persistent_geometric_no_path";
+  plannerTelemetry.safeStopReason = "";
+  sendBluetoothEvent("reverse_recovery_start", "evidence_driven_reposition");
 }
 
-static bool sideEscapeShouldBypassPointAlignment() {
-  if (postReverseEscapeActive) {
-    return true;
-  }
-
-  if (obstacleBypassPhase == BYPASS_SIDE_ESCAPE ||
-      obstacleBypassPhase == BYPASS_FRONT_WALL_REVERSE ||
-      obstacleBypassPhase == BYPASS_ROUTE_REJOIN) {
-    return true;
-  }
-
-  if (lastClearanceEscapeSideSign != 0.0f &&
-      millis() - lastClearanceEscapeMs <= PLANNER_SIDE_ESCAPE_MEMORY_MS) {
-    return true;
-  }
-
-  SideEscapeEvidence evidence;
-  if (!readSideEscapeEvidence(evidence)) {
-    return false;
-  }
-
-  float sideSign = 0.0f;
-  return chooseSideEscapeSign(evidence, true, sideSign);
+static void completeEvidenceDrivenReverse() {
+  resetReversePlannerEpoch();
+  reverseRecoveryState = {};
+  reverseRecoveryActive = false;
+  recoveryLivenessActive = false;
+  recoveryAttemptResetPending = true;
+  recoveryExitX = robotX;
+  recoveryExitY = robotY;
+  plannerTelemetry.reverseRecoveryActive = false;
+  plannerTelemetry.recoveryPlateauCount = 0;
+  resetGeometricNoPathEvidence();
+  sendBluetoothEvent("reverse_recovery_end", "forward_takeover");
 }
-
-static bool buildPostReverseEscapeLocalGoal(float &localGoalX,
-                                            float &localGoalY,
-                                            bool allowPendingStart,
-                                            bool &pendingStart,
-                                            float &pendingSideSign,
-                                            SideEscapeEvidence &pendingEvidence) {
-  pendingStart = false;
-  SideEscapeEvidence evidence;
-  if (!readSideEscapeEvidence(evidence)) {
-    if (postReverseEscapeActive) {
-      sendPostReverseEscapeEvent("post_reverse_escape_unavailable",
-                                 "side_sensor_invalid",
-                                 postReverseEscapeSideSign,
-                                 evidence);
-    }
-    resetPostReverseEscapeState();
-    return false;
-  }
-
-  unsigned long now = millis();
-  if (!evidence.closeSideEvidence &&
-      (!postReverseEscapeActive ||
-       now - postReverseEscapeStartedMs >= PLANNER_POST_REVERSE_ESCAPE_MIN_MS)) {
-    if (postReverseEscapeActive) {
-      sendPostReverseEscapeEvent("post_reverse_escape_end",
-                                 "side_clear",
-                                 postReverseEscapeSideSign,
-                                 evidence);
-      setObstacleBypassPhase(BYPASS_ROUTE_REJOIN, "side_clear");
-    }
-    resetPostReverseEscapeState();
-    return false;
-  }
-
-  if (postReverseEscapeActive &&
-      now - postReverseEscapeStartedMs > PLANNER_POST_REVERSE_ESCAPE_TIMEOUT_MS) {
-    bumpSideEscapeAdaptiveExtra(postReverseEscapeSideSign, "post_timeout");
-    sendPostReverseEscapeEvent("post_reverse_escape_unavailable",
-                               "timeout",
-                               postReverseEscapeSideSign,
-                               evidence);
-    setObstacleBypassPhase(BYPASS_ROUTE_REJOIN, "post_timeout");
-    resetPostReverseEscapeState();
-    return false;
-  }
-
-  float sideSign = postReverseEscapeActive
-    ? postReverseEscapeSideSign : obstacleBypassSideSign;
-  if (!postReverseEscapeActive &&
-      (sideSign == 0.0f || !evidence.closeSideEvidence)) {
-    return false;
-  }
-
-  if (!postReverseEscapeActive) {
-    if (!allowPendingStart) {
-      return false;
-    }
-    pendingStart = true;
-    pendingSideSign = sideSign;
-    pendingEvidence = evidence;
-  }
-
-  buildSideEscapeLocalGoal(sideSign,
-                           PLANNER_POST_REVERSE_ESCAPE_EXTRA_LATERAL_M,
-                           localGoalX,
-                           localGoalY);
-  rememberClearanceEscapeSide(sideSign);
-  plannerTelemetry.replanReason = "post_reverse_escape_waypoint";
-  return true;
-}
-
-static void startPostReverseEscape(const SideEscapeEvidence &evidence) {
-  postReverseEscapeActive = true;
-  postReverseEscapeSideSign = obstacleBypassSideSign;
-  postReverseEscapeStartedMs = millis();
-  setObstacleBypassPhase(BYPASS_POST_REVERSE_ESCAPE, "post_reverse_start");
-  rememberClearanceEscapeSide(obstacleBypassSideSign);
-  sendPostReverseEscapeEvent("post_reverse_escape_start",
-                             "forward_path_found",
-                             obstacleBypassSideSign,
-                             evidence);
-}
-#endif
 
 static void updatePointGoal() {
   float dx = navigationGoal.targetX - robotX;
@@ -3689,6 +3126,68 @@ static void updatePointGoal() {
   if (routeFrameValid && huntPickupZoneReached(routeLengthM, routeUx, routeUy)) {
     finishNavigationGoal(true, PLANNER_STOP_NONE, "hunt_pickup_zone_reached");
     return;
+  }
+
+  if (reverseRecoveryState.active) {
+    float lookaheadM = min(distanceM, WAYPOINT_LOOKAHEAD_M);
+    float recoveryGoalX = robotX + (dx / distanceM) * lookaheadM;
+    float recoveryGoalY = robotY + (dy / distanceM) * lookaheadM;
+    if (updateRecoveryLiveness(distanceM, lookaheadM,
+                               routeFrameValid, routeUx, routeUy)) {
+      return;
+    }
+
+    if (reverseRecoveryState.checkingForward) {
+      bool takeoverAvoidance = updateObstacleContext(
+        navigationGoal.targetX, navigationGoal.targetY);
+      if (takeoverAvoidance) {
+        buildObstacleLocalGoal(recoveryGoalX, recoveryGoalY);
+      }
+      TrajectoryPlanResult forwardResult =
+        selectTrajectory(recoveryGoalX, recoveryGoalY);
+      if (forwardResult == TRAJECTORY_PLAN_PENDING ||
+          forwardResult == TRAJECTORY_PLAN_ABORTED ||
+          forwardResult == TRAJECTORY_PLAN_RETRY) {
+        return;
+      }
+      if (forwardResult == TRAJECTORY_PLAN_SUCCESS) {
+        completeEvidenceDrivenReverse();
+        return;
+      }
+      finishNavigationGoal(false,
+        PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME,
+        "reverse_plateau_without_forward_path");
+      return;
+    }
+
+    TrajectoryPlanResult reverseResult =
+      selectReverseRecoveryTrajectory(recoveryGoalX, recoveryGoalY);
+    if (reverseResult == TRAJECTORY_PLAN_PENDING ||
+        reverseResult == TRAJECTORY_PLAN_SUCCESS ||
+        reverseResult == TRAJECTORY_PLAN_RETRY ||
+        reverseResult == TRAJECTORY_PLAN_ABORTED) {
+      return;
+    }
+    // Exhausting the remembered reverse corridor may mean the repositioning
+    // succeeded. Stop and give the normal forward planner one fresh,
+    // revalidated takeover attempt before declaring recovery impossible.
+    stopMotors();
+    reverseRecoveryState.checkingForward = true;
+    resetReversePlannerEpoch();
+    plannerTelemetry.planReason = "reverse_corridor_exhausted";
+    plannerTelemetry.replanReason = "forward_takeover_check";
+    return;
+  }
+
+  if (recoveryAttemptResetPending) {
+    float forwardProgressM = sqrtf((robotX - recoveryExitX) *
+                                   (robotX - recoveryExitX) +
+                                   (robotY - recoveryExitY) *
+                                   (robotY - recoveryExitY));
+    if (forwardProgressM >= PLANNER_RECOVERY_PROGRESS_EPSILON_M) {
+      resetRecoveryLivenessState();
+      recoveryAttemptResetPending = false;
+    }
   }
 
   bool huntCarryThroughActive =
@@ -3763,6 +3262,10 @@ static void updatePointGoal() {
     return;
   }
   noteGeometricNoPathEpoch();
+  if (canStartEvidenceDrivenReverse()) {
+    startEvidenceDrivenReverse();
+    return;
+  }
   if (millis() - noSafeTrajectorySinceMs >= PLANNER_NO_PATH_ABORT_MS) {
     finishNavigationGoal(false, PLANNER_STOP_NO_SAFE_TRAJECTORY,
                          avoidanceActive
@@ -3905,7 +3408,7 @@ void updateNavigationController() {
     : PLANNER_UPDATE_INTERVAL_MS;
   bool plannerEpochPending =
     navigationGoal.mode == NAV_GOAL_POINT &&
-    plannerEpoch.active;
+    (plannerEpoch.active || reversePlannerEpoch.active);
   if (!plannerEpochPending && now - lastPlannerUpdateMs < updateIntervalMs) {
     return;
   }

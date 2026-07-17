@@ -64,23 +64,21 @@ Accepted navigation behaviour:
 
 - Four high fan VL53L0X sensors are active and valid in open space.
 - V7 local planner can drive point goals.
-- Fake-rear-ToF reverse recovery is allowed for current obstacle testing by
-  explicit operator decision. It is not proof of rear safety; log the fake-rear
-  assumption and rear clearance on every physical run.
-- Reverse recovery now exits through `post_reverse_escape` when a close
-  inner/outer side fan ray remains after forward space returns.
-- The reverse-survey branch (`rvs1`/`rvs2`) is historical only. `rvs2` reached
-  `waypoint_reached` in serial logs, but physical observation showed multiple
-  retries and scraping, so it is not accepted as the current baseline.
-- The accepted offset wall/gap model is:
-  `SIDE_ESCAPE -> ROUTE_REJOIN -> FINAL_POINT_APPROACH -> waypoint_reached`.
-  Obstacle avoidance should be a temporary overlay that clears the obstacle and
-  then returns control to the actual waypoint, not a sticky replacement route.
-- Current source uses proactive side-escape memory, urgent escape-turn
-  commitment, committed side-sign steering, longer post-reverse latching,
-  corridor-squeeze suppression during active side escape, bounded route
-  rejoin, restored finish/overshoot/missed guards, scoped point-alignment
-  bypass, and a temporary side-escape rejoin speed cap.
+- Physical reverse recovery is disabled: `hasTrustedRearCoverage()` returns
+  false for the current robot, and both the planner and final motor owner require
+  that capability. `RANGE_FAKE_REAR` cannot authorize physical reverse.
+- The WASM simulator provides a field-raycast rear channel so deterministic
+  reverse-recovery behavior can be tested without claiming physical validity.
+- Reverse recovery is a single cooperative repositioning mode. It samples
+  reverse-only-wheel arcs through persistent known-clear cells, prioritizes the
+  best 50 mm clearance band, and then scores forward continuation, unexplored
+  sensor visibility, swept clearance, efficiency, and command continuity.
+- Recovery hands directly back to the forward planner after clearance gain
+  plateaus. There is no fixed retreat, reverse survey, post-reverse escape,
+  adaptive widening, or route-rejoin recovery stage.
+- Separate obstacle contexts reset once the robot rear clears the current
+  obstacle, allowing a later obstacle in the same point goal to choose a fresh
+  bypass side.
 - Accepted evidence after the rework:
   - `arn7`: `TEST AVOID 1.00` passed with `waypoint_reached`, no reverse
     recovery, final pose about `x=1.028 y=0.049 theta=-80.50`.
@@ -89,28 +87,20 @@ Accepted navigation behaviour:
 - Do not reintroduce broad detour-plane completion. The `arn4b`
   route-line-detour finish ended around `x=0.948 y=0.463`, too far from the
   real waypoint.
-- Current watch item: the post-clear movement may be slower than necessary
-  because `PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS` is applied while
-  `sideEscapeRejoinActive(...)` is true. If it feels slow in physical testing,
-  remove that condition from the cap and rerun the narrow offset wall/gap
-  checks described in the handoff before expanding test coverage. Do not tune
-  this with physical autonomous testing while P0-04/P0-05 remain open.
 - P0-07 remediation removed `corridor_squeeze_straight` and the reverse
   front-footprint grace. Zero accepted rollouts now mean zero commanded motion.
-- The simulator keeps contact-free traversal checks for `g0_right`, `g5`, and
-  `wide_panel_bypass`; the front-against-wall case now safe-stops when strict
-  footprint collision rejects reverse. `final_blocked_reached` remains a
-  stop-only result inside the existing `160 mm` gate and requires a clear
-  current inflated footprint. Physical upload/validation remains out of scope.
+- Simulator coverage includes persistent blockage recovery, unknown-space
+  rejection, newly blocked rear sensing, sequential obstacles, mirrored
+  steering, and stopping at a waypoint before an obstacle beyond it. Physical
+  upload/validation remains out of scope.
 - 400 mm competition gap has one accepted physical pass.
 - `TEST HUNT` can use the same point-goal planner path as `TEST GOTO`.
 - `TEST DISARM` cancels test-owned goals and leaves motors neutral.
 
 Current limitations:
 
-- No real rear sensor; `RANGE_FAKE_REAR` is intentionally deferred test
-  scaffolding. Current obstacle testing may use it by explicit operator
-  decision, but it cannot close P0-04/P0-05.
+- No trusted physical rear sensor. Autonomous physical reverse remains disabled
+  until genuine rear coverage closes P0-04/P0-05.
 - Encoder distance scale is probably not final.
 - `TICKS_PER_METRE` is currently `9125.0` in code.
 - Geometry-derived estimate from `H_Motor.pdf` plus the 20T 8M pulley is about

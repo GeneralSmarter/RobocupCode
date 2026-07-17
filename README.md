@@ -108,17 +108,16 @@ Available commands:
 - `FBASE <left_us> <right_us>` - set temporary forward motor base pulses.
 - `FBASE RESET` - restore the default forward motor base pulses.
 - `ESCAPE ON` / `ESCAPE OFF` / `ESCAPE STATUS` - enable, disable, or report
-  the default front-blocked reverse recovery. It boots enabled.
+  reverse-repositioning policy. Physical motion still requires trusted rear
+  coverage, which the current installation does not provide.
 - `TEST ARM` / `TEST DISARM` - enable or disable manual test motion commands.
 - `TEST DRIVE <metres>` - drive a fixed distance at the current heading.
 - `TEST GOTO <x> <y>` - go to one temporary absolute waypoint using normal
   local-planner navigation.
 - `TEST AVOID <metres>` - create one temporary waypoint straight ahead and use
   normal navigation/avoidance to reach it.
-- `TEST ESCAPE <metres>` - front-blocked planner escape/recovery diagnostic.
-  Current obstacle testing may run this by explicit operator decision with
-  generous rear clearance and a fake-rear note in the log/mark; it does not
-  prove rear safety or close P0-04/P0-05.
+- `TEST ESCAPE <metres>` - no-path/recovery diagnostic. It remains neutral on
+  the physical build until trusted rear coverage is installed.
 - `TEST FAN` or `FAN` - print the high forward ToF fan sector table.
 - `TEST OBJECT` or `OBJECT` - print the object/weight ToF table and current
   object-candidate summary. This never moves the motors.
@@ -165,13 +164,10 @@ motion policy; the planner evaluates a family of footprint-safe arcs instead.
 The local planner logs `planner_safe_stop` when it cannot prove a safe arc.
 It evaluates short differential-drive trajectories against the local map and
 the measured footprint, then naturally returns toward the active target as
-soon as the target direction is safe. Front-blocked reverse recovery is enabled
-by default and can be toggled with `ESCAPE ON` / `ESCAPE OFF`. `TEST ESCAPE`
-is the safe diagnostic alternative to an emergency-block override: it never
-drives forward into a blocked virtual front, but it lets persistent
-`front_blocked` evidence enter the reverse-recovery/replan path. There
-are no `adaptive_bypass_plan`,
-`adaptive_rejoin`, fixed reverse, or fixed-angle turn events in V7.
+soon as the target direction is safe. `ESCAPE ON` / `ESCAPE OFF` controls the
+reverse-repositioning policy, but cannot bypass the trusted-rear capability or
+the final motor-safety gate. The installed fake rear channel is diagnostic
+only, so physical reverse remains disabled.
 
 All four forward-facing fan rays form a diagonal footprint guard. A sudden
 close valid endpoint pauses motion for confirmation, while a confirmed close
@@ -185,34 +181,20 @@ straight passage; the planner still prefers 50 mm or more of clearance when it
 has a choice. A 400 mm passage cannot support an in-place turn, so the planner
 rejects sustained steering once it has observed both nearby boundaries.
 
-If forward planning remains impossible for 250 ms, V7 enters reverse recovery
-in software. For this testing build, `RANGE_FAKE_REAR` is temporary test
-scaffolding fixed at 4000 mm clear. Operator decision, 2026-07-14: obstacle
-testing may use this fake rear channel, but the result is not proof of rear
-safety or competition readiness until P0-04/P0-05 are closed. The planner
-samples reverse arcs, commands the best one, and
-tries the normal forward planner first again on every planner tick. If a valid
-forward arc appears while either side still has close inner/outer fan evidence,
-the planner enters a short `post_reverse_escape` side-clearance goal before
-resuming the original waypoint. The escape side now requires a stronger side
-tie or recent side-escape memory, holds briefly before release, and bypasses
-generic point alignment so the robot does not immediately steer back into the
-same offset wall pocket. For point routes, the side-escape target is expressed
-in the original start-to-target route frame, not the current chassis frame, so
-the bypass remains a bounded lane along the waypoint direction. If the same
-lane falls back into recovery, it widens in 80 mm steps up to 240 mm of extra
-offset and emits `side_escape_widen`. Stuck-wheel detection still aborts to
-protect the drivetrain.
+After two coherent geometric no-path results spanning 250 ms, the simulator
+may enter evidence-driven reverse repositioning. Reverse candidates must keep
+their complete inflated swept footprint inside cells with persistent clear
+evidence; unknown, occupied, contradictory, and out-of-map cells are blocked.
+Candidates first maximize endpoint obstacle clearance, then score forward
+continuation, orientation toward unexplored cells, swept clearance, and
+efficiency. There is no fixed retreat, route-rejoin phase, side memory, or
+post-reverse escape. When clearance gain plateaus, the robot stops and gives
+the normal forward planner one freshly revalidated takeover attempt.
 
-P0-07 remediation removed the synthetic `corridor_squeeze_straight` command
-and the reverse-recovery front-footprint grace. A zero-candidate forward or
-reverse search now stops; it cannot turn footprint rejection into motion.
-Front-wall recovery still records its bypass-lane target in
-`obstacle_bypass_phase` telemetry as `target=...`, but a start pose whose
-inflated footprint is already occupied safe-stops instead of reversing through
-that evidence. `final_blocked_reached` remains stop-only: it requires final
-approach, the existing `160 mm` bound, `no_safe_trajectory`, and a clear current
-inflated footprint.
+The WASM simulator supplies a raycast rear channel and exercises this exact
+RobotCode policy. Production `hasTrustedRearCoverage()` remains false until a
+real rear sensor is installed and validated, so fake rear distance cannot
+authorize a physical reverse command or paint map cells free.
 
 Use the smallest test that exercises the feature being changed:
 

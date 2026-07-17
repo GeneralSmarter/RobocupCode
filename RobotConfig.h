@@ -411,14 +411,6 @@ const float PLANNER_HUNT_PICKUP_MAX_SPEED_TPS = 2850.0;
 // chasing the clamped lookahead point indefinitely. Beyond this window, abort
 // the point goal as missed so the robot cannot run away from a passed target.
 const float PLANNER_LINE_FOLLOW_MISSED_STOP_OVERSHOOT_M = 0.45;
-// After a side-escape detour, rejoin the original waypoint slowly instead of
-// treating a broad target-plane crossing as success. The waypoint itself still
-// owns completion; this cap just prevents the post-clear high-speed S-turn loop.
-const float PLANNER_SIDE_ESCAPE_REJOIN_MAX_SPEED_TPS = 1700.0;
-// Side-escape route rejoin is a temporary handoff, not a new mission. Once the
-// robot is this close to the target plane, return to ordinary point approach so
-// the planner cannot keep extending the detour forward past the waypoint.
-const float PLANNER_SIDE_ESCAPE_FINAL_APPROACH_M = 0.30;
 // If final approach is already close to the waypoint but every forward arc is
 // blocked by the obstacle/wall beyond it, accept the safe reachable pose rather
 // than repeatedly reversing into the same pocket. This is deliberately much
@@ -431,11 +423,12 @@ const float PLANNER_FINAL_BLOCKED_ACCEPTANCE_M = 0.16;
 const float PLANNER_POINT_ALIGN_START_DEG = 30.0;
 const float PLANNER_POINT_ALIGN_BEHIND_DEG = 90.0;
 const float PLANNER_POINT_ALIGN_SIDE_TIE_MM = 50.0;
-// Reverse recovery is an explicit no-forward-path recovery. For this testing
-// build, RANGE_FAKE_REAR is trusted as a real rear clearance sensor.
+// Reverse recovery is an explicit no-forward-path recovery. The range-channel
+// identifier is legacy; hasTrustedRearCoverage() is the non-bypassable
+// capability gate for planner publication and final motor output.
 const unsigned long PLANNER_NO_PATH_BACKTRACK_DELAY_MS = 250;
-// Forward-only planner: after repeated coherent geometric failures, remain
-// neutral and end the goal instead of entering rear-sensor recovery.
+// Abort when neither forward planning nor trusted-rear recovery can make
+// useful progress within this interval.
 const unsigned long PLANNER_NO_PATH_ABORT_MS = 1200;
 const float PLANNER_OBSTACLE_MAX_SPEED_TPS = 1600.0;
 const float PLANNER_OBSTACLE_MIN_OUTWARD_TURN_RATIO = 0.50;
@@ -446,34 +439,20 @@ const float PLANNER_REVERSE_RECOVERY_MAX_SPEED_TPS = 1700.0;
 const float PLANNER_REVERSE_RECOVERY_MIN_SPEED_TPS = PLANNER_MIN_DRIVABLE_SPEED_TPS;
 const float PLANNER_REVERSE_RECOVERY_MIN_SPEED_SCALE = 0.75;
 const float PLANNER_REVERSE_RECOVERY_MAX_TURN_RATIO = 0.60;
-const int PLANNER_REVERSE_RECOVERY_CURVATURE_SAMPLES = 9;
+const int PLANNER_REVERSE_RECOVERY_CURVATURE_SAMPLES = PLANNER_CURVATURE_SAMPLES;
 const float PLANNER_REVERSE_RECOVERY_REAR_BUFFER_M = 0.06;
-const float PLANNER_FRONT_WALL_BYPASS_OUTWARD_M = 0.50;
-const float PLANNER_REVERSE_SURVEY_MIN_REVERSE_M = 0.16;
-const float PLANNER_REVERSE_SURVEY_RETRY_REVERSE_M = 0.10;
-const float PLANNER_REVERSE_SURVEY_MAX_REVERSE_M = 0.48;
-const float PLANNER_REVERSE_SURVEY_FRONT_CLEAR_M = 0.34;
-const float PLANNER_REVERSE_SURVEY_SIDE_CLEAR_M = 0.28;
-const unsigned long PLANNER_REVERSE_SURVEY_SETTLE_MS = 220;
-const float PLANNER_POST_REVERSE_ESCAPE_EXTRA_LATERAL_M = 0.08;
-const float PLANNER_SIDE_ESCAPE_TIE_M = 0.10;
-const float PLANNER_SIDE_ESCAPE_MIN_OUTWARD_M = 0.12;
-const unsigned long PLANNER_SIDE_ESCAPE_MEMORY_MS = 2500;
-const float PLANNER_SIDE_ESCAPE_ADAPT_STEP_M = 0.08;
-const float PLANNER_SIDE_ESCAPE_ADAPT_MAX_EXTRA_M = 0.24;
-const unsigned long PLANNER_SIDE_ESCAPE_ADAPT_MEMORY_MS = 5000;
-const unsigned long PLANNER_SIDE_ESCAPE_ADAPT_BUMP_COOLDOWN_MS = 300;
-// Keep the post-reverse lane long enough to actually pass the obstacle edge.
-// A 900 ms latch could look clean for a moment, then hand control back to the
-// waypoint and turn the robot straight back toward the wall.
-const unsigned long PLANNER_POST_REVERSE_ESCAPE_MIN_MS = 1800;
-const unsigned long PLANNER_POST_REVERSE_ESCAPE_TIMEOUT_MS = 5000;
+const int PLANNER_REVERSE_CLEAR_EVIDENCE_THRESHOLD = 20;
+const float PLANNER_REVERSE_CLEARANCE_CAP_M = 0.50;
+const float PLANNER_REVERSE_CLEARANCE_BAND_M = LOCAL_MAP_CELL_M;
+const float PLANNER_REVERSE_CLEARANCE_GAIN_M = LOCAL_MAP_CELL_M;
+const uint8_t PLANNER_REVERSE_PLATEAU_EPOCHS = 3;
+const float PLANNER_REVERSE_FORWARD_QUALITY_WEIGHT = 0.50;
+const float PLANNER_REVERSE_UNEXPLORED_WEIGHT = 0.30;
+const float PLANNER_REVERSE_SWEEP_CLEARANCE_WEIGHT = 0.15;
+const float PLANNER_REVERSE_EFFICIENCY_WEIGHT = 0.05;
 
-// Task-03 fail-closed envelope for the small (about 1.2 m) obstacle tests.
-// These bounds supervise the original mission goal even when a temporary
-// clearance/post-reverse goal is active.  0.45 m goal growth matches the
-// existing missed-route overshoot window; 0.75 m lateral displacement allows
-// the 0.50 m front-wall bypass plus one chassis width/clearance margin.
+// Fail-closed envelope for reverse repositioning while preserving the
+// original point goal.
 const float PLANNER_RECOVERY_MAX_GOAL_DIVERGENCE_M = 0.45;
 const float PLANNER_RECOVERY_MAX_LATERAL_DISPLACEMENT_M = 0.75;
 // A single phase must settle/reverse/rejoin within 12 s.  At the capped

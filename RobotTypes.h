@@ -225,6 +225,7 @@ enum PlannerStopReason {
   PLANNER_STOP_RECOVERY_DISTANCE,
   PLANNER_STOP_RECOVERY_REPEATED,
   PLANNER_STOP_RECOVERY_NO_PROGRESS,
+  PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME,
   PLANNER_STOP_ABORTED
 };
 
@@ -263,7 +264,13 @@ struct PlannerTelemetry {
   float recoveryPhaseElapsedS;
   float cumulativeRecoveryDistanceM;
   float recoveryBestProgressM;
+  float recoveryCurrentClearanceM;
+  float recoveryEndpointClearanceM;
+  float recoveryClearanceGainM;
+  float recoveryUnexploredScore;
   uint8_t recoveryCount;
+  uint8_t recoveryPlateauCount;
+  bool reverseRecoveryActive;
   int candidateCount;
   PlannerStopReason stopReason;
   const char* planReason;

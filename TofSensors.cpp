@@ -397,6 +397,12 @@ static void updateFakeRearTofSensor() {
   syncLegacyTofGlobals();
 }
 
+bool hasTrustedRearCoverage() {
+  // The installed build still exposes RANGE_FAKE_REAR for diagnostics only.
+  // It must never satisfy reverse motion safety or planner evidence.
+  return false;
+}
+
 static bool isL0XFanSampleReady(VL53L0X &sensor) {
   return (sensor.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) != 0;
 }

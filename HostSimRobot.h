@@ -101,6 +101,7 @@ const char* motionSafetyReasonName(MotionSafetyReason reason);
 void recordMainLoopPhaseDuration(const char* phase, unsigned long startedUs);
 bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
+bool hasTrustedRearCoverage();
 uint16_t getRangeSensorDistance(RangeSensorId id);
 bool isTofCloseReadingRevalidating();
 float getFanSweepClearanceMm(RangeSensorId id);

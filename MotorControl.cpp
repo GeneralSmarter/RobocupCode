@@ -211,8 +211,8 @@ static MotionSafetyReason evaluateMotionSafety(MotionAuthority claimant,
     // P0-03 assumption: the legacy RANGE_FAKE_REAR channel represents a
     // working real rear ToF. P0-04 must replace the legacy name/scaffolding;
     // this supervisor deliberately preserves the current rear-safety API.
-    isRangeSensorCurrent(RANGE_FAKE_REAR),
-    !isRangeSensorBlocked(RANGE_FAKE_REAR),
+    hasTrustedRearCoverage() && isRangeSensorCurrent(RANGE_FAKE_REAR),
+    hasTrustedRearCoverage() && !isRangeSensorBlocked(RANGE_FAKE_REAR),
     turnSideCurrent(turnSpeed) && isTurnDirectionObservable(turnSpeed),
     allFanSensorsCurrent() && isTurnSweepSafe()
   };
