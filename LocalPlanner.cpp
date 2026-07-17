@@ -3198,6 +3198,7 @@ static void updatePointGoal() {
   float targetHeadingErrorDeg = wrapAngle(targetHeadingDeg - navigationHeadingDeg());
   if (!plannerEpoch.active && !avoidanceActive &&
       !huntCarryThroughActive &&
+      distanceM > PLANNER_FINAL_BLOCKED_ACCEPTANCE_M &&
       fabs(targetHeadingErrorDeg) > PLANNER_POINT_ALIGN_START_DEG) {
     commandPointAlignmentTurn(targetHeadingErrorDeg);
     return;
