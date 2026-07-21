@@ -461,11 +461,28 @@ void updateMotorController() {
   lastRequestedLeftWheelSpeed = leftTarget;
   lastRequestedRightWheelSpeed = rightTarget;
 
+  // Keep the encoder baseline current even while output is neutral. Otherwise
+  // counts accumulated during a planner-age stop are divided by only the next
+  // 20 ms control interval, creating a false wheel-speed spike on resume.
+  long leftCount;
+  long rightCount;
+  readEncoderCounts(leftCount, rightCount);
+
+  float leftSpeed = (leftCount - lastLeftCount) / dt;
+  float rightSpeed = (rightCount - lastRightCount) / dt;
+  lastMeasuredLeftWheelSpeed = leftSpeed;
+  lastMeasuredRightWheelSpeed = rightSpeed;
+  lastLeftCount = leftCount;
+  lastRightCount = rightCount;
+
   if (!motionAuthorityAllows(motionAuthority, motionCommandAuthority) ||
       motorStopRequested ||
       (fabs(leftTarget) < 1.0 && fabs(rightTarget) < 1.0)) {
     // Neutral is written every control period while stopped. This is safer than
     // relying on a previous servo value after a planner/sensor state change.
+    // Deliberate neutral time is not drivetrain-stall evidence. Reset only the
+    // drive/mismatch monitor; turn progress retains its separate yaw monitor.
+    updateStuckDriving(0.0f, 0.0f, leftSpeed, rightSpeed);
     lastMotorOutputMode = "neutral";
     writeMotorUS(STOP_US, STOP_US);
     return;
@@ -475,6 +492,7 @@ void updateMotorController() {
     true, motorSafetyWatchdogReady,
     motorCommandLeaseArmed && !motorCommandLeaseTripPending);
   if (leaseReason != MOTION_SAFETY_CLEAR) {
+    updateStuckDriving(0.0f, 0.0f, leftSpeed, rightSpeed);
     rejectUnsafeMotion(leaseReason);
     writeMotorUS(STOP_US, STOP_US);
     return;
@@ -486,22 +504,12 @@ void updateMotorController() {
   MotionSafetyReason safetyReason = evaluateMotionSafety(
     motionCommandAuthority, desiredForwardSpeed, desiredTurnSpeed);
   if (safetyReason != MOTION_SAFETY_CLEAR) {
+    updateStuckDriving(0.0f, 0.0f, leftSpeed, rightSpeed);
     rejectUnsafeMotion(safetyReason);
     writeMotorUS(STOP_US, STOP_US);
     return;
   }
   noteSafeMotion();
-
-  long leftCount;
-  long rightCount;
-  readEncoderCounts(leftCount, rightCount);
-
-  float leftSpeed = (leftCount - lastLeftCount) / dt;
-  float rightSpeed = (rightCount - lastRightCount) / dt;
-  lastMeasuredLeftWheelSpeed = leftSpeed;
-  lastMeasuredRightWheelSpeed = rightSpeed;
-  lastLeftCount = leftCount;
-  lastRightCount = rightCount;
 
   // Pivot turns use yaw-based progress monitoring in LocalPlanner.  Feeding
   // their opposing wheel targets into straight-drive monitoring can leave a

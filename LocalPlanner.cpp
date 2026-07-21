@@ -4,7 +4,8 @@
 // Local confidence map and receding-horizon navigation
 // =====================================================
 // Responsibility:
-//   Owns local perception-to-motion planning: short-lived occupancy evidence,
+//   Owns local perception-to-motion planning: rolling occupancy evidence,
+//   persistent arena memory,
 //   footprint collision checks, differential-drive arc rollout/scoring, point
 //   and turn navigation goals, obstacle-local forward bypass, planner telemetry,
 //   and the scheduled controller pipeline.
@@ -22,9 +23,9 @@
 //   Modifies localMap, navigationGoal, plannerTelemetry, one obstacle-scoped
 //   context, planner epochs, motorStopRequested/desired motion through safe
 //   command APIs, and controller timing stamps.
-// The map is intentionally local.  It gives the planner enough memory to
-// avoid immediately re-entering a wall after a turn without pretending that
-// odometry alone can support a permanent arena map.
+// The rolling map preserves fresh dynamic evidence. A compact fixed-world
+// layer remembers thresholded occupied and clear cells for the match while
+// still allowing repeated contradictory observations to correct them.
 
 struct LocalMapCell {
   // Evidence is deliberately separate from a simple occupied/free boolean.
@@ -51,6 +52,14 @@ static LocalMapCell shiftedMap[LOCAL_MAP_CELLS][LOCAL_MAP_CELLS];
 static bool localMapInitialized = false;
 static float localMapOriginX = 0.0;
 static float localMapOriginY = 0.0;
+const int ARENA_MEMORY_BITS = ARENA_MEMORY_CELLS * ARENA_MEMORY_CELLS;
+const int ARENA_MEMORY_BYTES = (ARENA_MEMORY_BITS + 7) / 8;
+static int8_t arenaMemoryChallenge[ARENA_MEMORY_BITS];
+static uint8_t arenaMemoryOccupied[ARENA_MEMORY_BYTES];
+static uint8_t arenaMemoryKnownClear[ARENA_MEMORY_BYTES];
+static bool arenaMemoryInitialized = false;
+static float arenaMemoryOriginX = 0.0f;
+static float arenaMemoryOriginY = 0.0f;
 static PlannerStopReason lastReportedStopReason = PLANNER_STOP_NONE;
 static int recentBlockedTurnDirection = 0;
 static unsigned long recentBlockedTurnMs = 0;
@@ -346,6 +355,115 @@ static float clampEvidence(float value) {
   return constrain(value, -120.0, 120.0);
 }
 
+enum ArenaMemoryState {
+  ARENA_MEMORY_UNKNOWN,
+  ARENA_MEMORY_CLEAR,
+  ARENA_MEMORY_OCCUPIED
+};
+
+static void initialiseArenaMemoryAtRobot() {
+  arenaMemoryOriginX = robotX - ARENA_MEMORY_SIZE_M * 0.5f;
+  arenaMemoryOriginY = robotY - ARENA_MEMORY_SIZE_M * 0.5f;
+  memset(arenaMemoryChallenge, 0, sizeof(arenaMemoryChallenge));
+  memset(arenaMemoryOccupied, 0, sizeof(arenaMemoryOccupied));
+  memset(arenaMemoryKnownClear, 0, sizeof(arenaMemoryKnownClear));
+  arenaMemoryInitialized = true;
+}
+
+static bool arenaWorldToCell(float worldX, float worldY,
+                             int &cellX, int &cellY) {
+  if (!arenaMemoryInitialized) {
+    return false;
+  }
+  cellX = (int)floorf((worldX - arenaMemoryOriginX) / LOCAL_MAP_CELL_M);
+  cellY = (int)floorf((worldY - arenaMemoryOriginY) / LOCAL_MAP_CELL_M);
+  return cellX >= 0 && cellX < ARENA_MEMORY_CELLS &&
+         cellY >= 0 && cellY < ARENA_MEMORY_CELLS;
+}
+
+static ArenaMemoryState arenaMemoryStateAtCell(int cellX, int cellY) {
+  if (cellX < 0 || cellX >= ARENA_MEMORY_CELLS ||
+      cellY < 0 || cellY >= ARENA_MEMORY_CELLS) {
+    return ARENA_MEMORY_UNKNOWN;
+  }
+  int bit = cellY * ARENA_MEMORY_CELLS + cellX;
+  uint8_t mask = (uint8_t)(1U << (bit & 7));
+  if ((arenaMemoryOccupied[bit >> 3] & mask) != 0) {
+    return ARENA_MEMORY_OCCUPIED;
+  }
+  return (arenaMemoryKnownClear[bit >> 3] & mask) != 0
+    ? ARENA_MEMORY_CLEAR : ARENA_MEMORY_UNKNOWN;
+}
+
+static ArenaMemoryState arenaMemoryStateAtWorld(float worldX, float worldY) {
+  int cellX;
+  int cellY;
+  return arenaWorldToCell(worldX, worldY, cellX, cellY)
+    ? arenaMemoryStateAtCell(cellX, cellY) : ARENA_MEMORY_UNKNOWN;
+}
+
+static void setArenaMemoryState(int cellX, int cellY,
+                                ArenaMemoryState state) {
+  int bit = cellY * ARENA_MEMORY_CELLS + cellX;
+  uint8_t mask = (uint8_t)(1U << (bit & 7));
+  arenaMemoryOccupied[bit >> 3] &= (uint8_t)~mask;
+  arenaMemoryKnownClear[bit >> 3] &= (uint8_t)~mask;
+  if (state == ARENA_MEMORY_OCCUPIED) {
+    arenaMemoryOccupied[bit >> 3] |= mask;
+  } else if (state == ARENA_MEMORY_CLEAR) {
+    arenaMemoryKnownClear[bit >> 3] |= mask;
+  }
+  arenaMemoryChallenge[bit] = 0;
+}
+
+static void addArenaMemoryEvidence(float worldX, float worldY, int amount) {
+  int cellX;
+  int cellY;
+  if (amount == 0 || !arenaWorldToCell(worldX, worldY, cellX, cellY)) {
+    return;
+  }
+  if ((unsigned int)cellX >= (unsigned int)ARENA_MEMORY_CELLS ||
+      (unsigned int)cellY >= (unsigned int)ARENA_MEMORY_CELLS) {
+    return;
+  }
+
+  ArenaMemoryState state = arenaMemoryStateAtCell(cellX, cellY);
+  int bit = cellY * ARENA_MEMORY_CELLS + cellX;
+  int challenge = arenaMemoryChallenge[bit];
+  if (amount > 0) {
+    if (state == ARENA_MEMORY_OCCUPIED) {
+      arenaMemoryChallenge[bit] = (int8_t)min(0, challenge + amount);
+      return;
+    }
+    challenge = challenge < 0 ? 0 : challenge;
+    challenge = min(120, challenge + amount);
+    if (challenge >= ARENA_MEMORY_EVIDENCE_THRESHOLD) {
+      setArenaMemoryState(cellX, cellY, ARENA_MEMORY_OCCUPIED);
+      return;
+    }
+  } else {
+    if (state == ARENA_MEMORY_CLEAR) {
+      arenaMemoryChallenge[bit] = (int8_t)max(0, challenge + amount);
+      return;
+    }
+    challenge = challenge > 0 ? 0 : challenge;
+    challenge = max(-120, challenge + amount);
+    if (challenge <= -ARENA_MEMORY_EVIDENCE_THRESHOLD) {
+      setArenaMemoryState(cellX, cellY, ARENA_MEMORY_CLEAR);
+      return;
+    }
+  }
+  arenaMemoryChallenge[bit] = (int8_t)challenge;
+}
+
+static void markArenaMemoryClear(float worldX, float worldY) {
+  int cellX;
+  int cellY;
+  if (arenaWorldToCell(worldX, worldY, cellX, cellY)) {
+    setArenaMemoryState(cellX, cellY, ARENA_MEMORY_CLEAR);
+  }
+}
+
 static void initialiseMapAtRobot() {
   // Put the robot at the centre of the map. The map origin is its lower-left
   // world coordinate, not the robot pose.
@@ -444,6 +562,7 @@ static void addFreeEvidence(float worldX, float worldY, int amount) {
   cell.dynamicEvidence = (int8_t)clampEvidence(cell.dynamicEvidence - amount);
   cell.staticEvidence = (int8_t)clampEvidence(cell.staticEvidence - amount / 3);
   cell.lastObservedMs = millis();
+  addArenaMemoryEvidence(worldX, worldY, -max(1, amount / 3));
 }
 
 static bool isOuterFanSensor(RangeSensorId id) {
@@ -518,6 +637,9 @@ static void markEndpointEvidence(RangeSensorId id, float worldX, float worldY,
           cell.freeEvidence = 0;
         }
         cell.lastObservedMs = millis();
+        float cellWorldX = localMapOriginX + (x + 0.5f) * LOCAL_MAP_CELL_M;
+        float cellWorldY = localMapOriginY + (y + 0.5f) * LOCAL_MAP_CELL_M;
+        addArenaMemoryEvidence(cellWorldX, cellWorldY, staticEvidence);
       }
     }
   }
@@ -536,9 +658,10 @@ static float navigationHeadingRad() {
 }
 
 void clearLocalMap() {
-  // Used by ZERO and initialisation. It intentionally does not reset pose;
-  // callers decide whether the robot's coordinate system should also reset.
+  // Used by ZERO and mission initialisation. It clears both map layers but
+  // intentionally leaves pose ownership to the caller.
   initialiseMapAtRobot();
+  initialiseArenaMemoryAtRobot();
   plannerTelemetry.replanReason = "map_cleared";
 }
 
@@ -631,6 +754,7 @@ void markTraversedFreeSpace() {
         cell.freeEvidence = 100;
         if (insideActualFootprint) {
           cell.dynamicEvidence = 0;
+          markArenaMemoryClear(worldX, worldY);
         }
         cell.lastTraversedMs = millis();
       }
@@ -646,8 +770,16 @@ static bool cellOccupied(int cellX, int cellY) {
   const LocalMapCell &cell = localMap[cellY][cellX];
   // Free evidence is intentionally not a hard permission. A cell is safe only
   // because no sufficiently strong obstacle evidence currently contradicts it.
-  return cell.staticEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD ||
-         cell.dynamicEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD;
+  float worldX = localMapOriginX + (cellX + 0.5f) * LOCAL_MAP_CELL_M;
+  float worldY = localMapOriginY + (cellY + 0.5f) * LOCAL_MAP_CELL_M;
+  bool locallyOccupied =
+    cell.staticEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD ||
+    cell.dynamicEvidence >= PLANNER_OBSTACLE_SCORE_THRESHOLD;
+  bool freshlyClear = !locallyOccupied &&
+    cell.freeEvidence >= PLANNER_REVERSE_CLEAR_EVIDENCE_THRESHOLD;
+  return locallyOccupied ||
+         (!freshlyClear &&
+          arenaMemoryStateAtWorld(worldX, worldY) == ARENA_MEMORY_OCCUPIED);
 }
 
 static void capturePlannerCollisionSnapshot(PlannerCollisionSnapshot &snapshot) {
@@ -660,9 +792,14 @@ static void capturePlannerCollisionSnapshot(PlannerCollisionSnapshot &snapshot) 
       int bit = y * LOCAL_MAP_CELLS + x;
       if (cellOccupied(x, y)) {
         snapshot.occupied[bit >> 3] |= (uint8_t)(1U << (bit & 7));
-      } else if (localMap[y][x].freeEvidence >=
-                   PLANNER_REVERSE_CLEAR_EVIDENCE_THRESHOLD) {
-        snapshot.knownClear[bit >> 3] |= (uint8_t)(1U << (bit & 7));
+      } else {
+        float worldX = localMapOriginX + (x + 0.5f) * LOCAL_MAP_CELL_M;
+        float worldY = localMapOriginY + (y + 0.5f) * LOCAL_MAP_CELL_M;
+        if (localMap[y][x].freeEvidence >=
+              PLANNER_REVERSE_CLEAR_EVIDENCE_THRESHOLD ||
+            arenaMemoryStateAtWorld(worldX, worldY) == ARENA_MEMORY_CLEAR) {
+          snapshot.knownClear[bit >> 3] |= (uint8_t)(1U << (bit & 7));
+        }
       }
     }
   }
@@ -1019,6 +1156,18 @@ static float chooseObstacleSide(const ObstacleEnvelope &envelope,
   return leftRangeM >= rightRangeM ? 1.0f : -1.0f;
 }
 
+static bool directWaypointCorridorClear(float targetX, float targetY) {
+  float dx = targetX - robotX;
+  float dy = targetY - robotY;
+  float distanceM = sqrtf(dx * dx + dy * dy);
+  if (distanceM <= WAYPOINT_TOLERANCE_M) {
+    return true;
+  }
+  ObstacleEnvelope directObstacle;
+  return !scanRouteObstacle(robotX, robotY, dx / distanceM, dy / distanceM,
+                            distanceM, directObstacle);
+}
+
 static bool updateObstacleContext(float targetX, float targetY) {
   if (!obstacleContext.active) {
     float dx = targetX - robotX;
@@ -1083,15 +1232,32 @@ static bool updateObstacleContext(float targetX, float targetY) {
   float poseDy = robotY - obstacleContext.originY;
   float alongM = poseDx * obstacleContext.routeUx +
                  poseDy * obstacleContext.routeUy;
+  float currentLateralM = -poseDx * obstacleContext.routeUy +
+                          poseDy * obstacleContext.routeUx;
+  float lateralClearanceM =
+    max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
+        ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
+    PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
+  float releaseLateralM = obstacleContext.sideSign > 0.0f
+    ? obstacleContext.maxLateralM + lateralClearanceM
+    : obstacleContext.minLateralM - lateralClearanceM;
+  bool outsideObstacleSide =
+    obstacleContext.sideSign * currentLateralM >=
+    obstacleContext.sideSign * releaseLateralM;
+  bool directRelease = outsideObstacleSide &&
+                       directWaypointCorridorClear(targetX, targetY);
   float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
                      PLANNER_TOTAL_HARD_CLEARANCE_M +
                      LOCAL_MAP_CELL_M * 0.5f;
-  if (alongM >= obstacleContext.farAlongM + rearClearM) {
+  bool rearPassedObstacle =
+    alongM >= obstacleContext.farAlongM + rearClearM;
+  if (directRelease || rearPassedObstacle) {
     if (obstacleContext.clearSinceMs == 0) {
       obstacleContext.clearSinceMs = millis();
     }
     if (millis() - obstacleContext.clearSinceMs >= 80) {
-      resetObstacleContext("obstacle_cleared");
+      resetObstacleContext(directRelease
+        ? "direct_waypoint_corridor_clear" : "obstacle_cleared");
       resetPlannerEpoch();
       // The completed envelope owns only this obstacle. Reacquire immediately
       // so a later blocker gets a fresh envelope and independent side choice.
@@ -1128,6 +1294,21 @@ static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
   bool laterallyClear = obstacleContext.sideSign * currentLateralM >=
     obstacleContext.sideSign * targetLateralM -
       PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
+  float inflatedRobotLengthM =
+    (ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
+     ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm) / 1000.0f +
+    2.0f * PLANNER_TOTAL_HARD_CLEARANCE_M;
+  bool longTransverseEdge =
+    obstacleContext.maxLateralM - obstacleContext.minLateralM >=
+      inflatedRobotLengthM + LOCAL_MAP_CELL_M;
+  if (laterallyClear && longTransverseEdge) {
+    // Do not spend clearance by aiming back across a remembered corner. Hold
+    // the best lateral offset until the direct waypoint corridor is confirmed
+    // clear, at which point updateObstacleContext() releases this local goal.
+    targetLateralM = obstacleContext.sideSign > 0.0f
+      ? max(targetLateralM, currentLateralM)
+      : min(targetLateralM, currentLateralM);
+  }
   float targetAlongM;
   if (laterallyClear || currentAlongM >= obstacleContext.nearAlongM) {
     targetAlongM = obstacleContext.farAlongM + rearClearM;
@@ -3261,6 +3442,18 @@ static void updatePointGoal() {
   if (!currentPlannerFailureIsGeometricNoPath()) {
     resetGeometricNoPathEvidence();
     return;
+  }
+  if (!avoidanceActive &&
+      distanceM <= PLANNER_FINAL_BLOCKED_ACCEPTANCE_M) {
+    PlannerCollisionSnapshot currentCollision;
+    capturePlannerCollisionSnapshot(currentCollision);
+    if (footprintClearOnSnapshot(currentCollision, robotX, robotY,
+                                 navigationHeadingRad())) {
+      // The rejected rollout may extend toward an obstacle beyond the point,
+      // but no motion is needed from this already-safe bounded final pose.
+      finishNavigationGoal(true, PLANNER_STOP_NONE, "final_blocked_reached");
+      return;
+    }
   }
   noteGeometricNoPathEpoch();
   if (canStartEvidenceDrivenReverse()) {

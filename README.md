@@ -5,8 +5,9 @@ Current RoboCup robot firmware for Teensy 4.0.
 V7 uses a scheduled, safety-supervised local planner. Runtime sensor polling is
 phase-1 nonblocking, with a motor command lease and loop-deadline telemetry;
 coherent sensor snapshots and physical watchdog timing remain follow-ups. The
-four forward navigation ToFs are VL53L0X sensors and build a short-lived local
-confidence map; a footprint-aware receding-horizon controller selects a safe
+four forward navigation ToFs are VL53L0X sensors and build a rolling local
+confidence map plus thresholded persistent arena memory; a footprint-aware
+receding-horizon controller selects a safe
 differential-drive arc toward the active waypoint.  There is no fixed
 reverse/turn/bypass/rejoin script and no
 outer-fan wall-follow fallback.  The present fan has no rear or true side
@@ -219,14 +220,13 @@ installed BNO055's zero-relative raw yaw is clockwise/right-positive, so only
 `navigationHeadingDeg()` converts it to the canonical sign; navigation code
 must not consume raw IMU yaw directly.
 
-When `CSV ON` is active, rows start with `row_type,event,detail`. Regular
-once-per-second samples use `row_type=telemetry`. Event rows use
-`row_type=event` for front blocked/clear transitions, ToF timeout/stale
-transitions, planner safe stops, log marks, and manual test motion starts/ends.
-CSV rows include the aggregate legacy `front/left/right` readings plus raw fan
-fields `fan0_mm` through `fan3_mm`, `fan0_valid` through `fan3_valid`,
-`front_virtual_mm`, raw fan ages, and planner candidate/command/clearance/
-reason fields.
+When `CSV ON` is active, firmware emits the frozen schema-v3 header and
+metadata followed by sequence-numbered 61-field `telemetry` and `event` rows.
+The 10 Hz telemetry includes raw fan ranges/validity/ages, motor outputs,
+wheel targets and rates, IMU/navigation yaw, planner command/clearance/stop
+state, loop timing, queue depth, and dropped-row diagnostics. All rows are
+assembled in bounded RAM buffers and drained cooperatively so logging cannot
+block the motor-control loop.
 
 At startup the sketch prints the current calibration summary: motor pulse
 widths, encoder signs, ticks per metre, PID gains, waypoint tolerance, and ToF

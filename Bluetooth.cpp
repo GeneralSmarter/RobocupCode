@@ -67,6 +67,7 @@ static size_t telemetryQueueBytes = 0;
 static unsigned long telemetryQueuedRows = 0;
 static unsigned long telemetryDroppedRows = 0;
 static unsigned long telemetryRateLimitedEvents = 0;
+static unsigned long telemetrySequence = 0;
 static char lastTelemetryEventName[40] = "";
 static char lastTelemetryEventDetail[64] = "";
 static unsigned long lastTelemetryEventMs = 0;
@@ -130,7 +131,7 @@ static void commitTelemetryRow(
 }
 
 static void commitTelemetryEventRow() {
-  telemetryStage.commit();
+  telemetryStage.commit(TELEMETRY_EVENT_ROW_BUDGET_BYTES);
   telemetryRowAssemblyActive = false;
 }
 
@@ -685,261 +686,58 @@ void sendBluetoothStatus() {
 }
 
 static void sendBluetoothCsvHeader() {
-  // Machine-readable schema for saved navigation regressions. Keep field order
-  // stable unless the desktop parser/tests are updated with the same schema.
   beginTelemetryRow();
-  Serial2.println("row_type,event,detail,ms,state,run,test_armed,waypoint,x_m,y_m,theta_deg,front_mm,left_mm,right_mm,front_valid,left_valid,right_valid,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,front_virtual_mm,front_virtual_valid,fake_rear_mm,fake_rear_valid,fake_rear_blocked,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,enc_l,enc_r,blocked,drive_stuck,wheel_mismatch,turn_stuck,home_requested,motor_l_us,motor_r_us,base_speed,cmd_forward,cmd_turn,planner_candidates,planner_v_tps,planner_w_tps,planner_curvature,planner_min_clearance_mm,planner_speed_cap_tps,planner_goal_distance_m,planner_global_goal_distance_m,planner_route_progress_m,planner_signed_lateral_error_m,planner_recovery_phase_time_s,planner_recovery_distance_m,planner_recovery_count,planner_best_progress_m,planner_stop,planner_reason,planner_replan,planner_safe_stop,object_candidate,object_confirmed,object_direction,object_range_mm,object0_mm,object1_mm,object2_mm,object3_mm,object0_valid,object1_valid,object2_valid,object3_valid,object0_range_status,object1_range_status,object2_range_status,object3_range_status,object_reason,object_target_valid,object_target_fresh,object_target_world_x_m,object_target_world_y_m,object_target_robot_x_mm,object_target_robot_y_mm,object_target_sources,object_target_reason,wheel_target_l_tps,wheel_target_r_tps,wheel_rate_l_tps,wheel_rate_r_tps,imu_raw_cw_deg,nav_yaw_deg,motor_mode,motion_authority,lease_trips,loop_gap_ms,loop_max_ms,loop_misses,loop_worst_phase,loop_worst_phase_us,telemetry_queued_rows,telemetry_queued_bytes,telemetry_dropped_rows,telemetry_rate_limited_events,planner_slice_us,planner_slice_max_us,planner_epoch_work_us,planner_epoch_max_work_us,planner_epoch_age_ms,planner_command_age_ms,planner_candidates_processed,planner_yields,planner_epoch_active");
-  commitTelemetryRow();
+  Serial2.println("row_type,schema_version,seq,event,detail,ms,build,state,run,test_armed,x_m,y_m,theta_deg,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,blocked,motor_l_us,motor_r_us,wall_phase,wall_bypass_side,wall_nearest_mm,wall_phase_elapsed_s,wall_end_reads,wall_distance_past_end_m,route_lateral_error_m,planner_v_tps,planner_w_tps,planner_min_clearance_mm,planner_speed_cap_tps,planner_arc_result,planner_stop,wheel_target_l_tps,wheel_target_r_tps,wheel_rate_l_tps,wheel_rate_r_tps,imu_raw_cw_deg,nav_yaw_deg,motor_mode,motion_authority,lease_trips,loop_max_ms,loop_misses,loop_worst_phase,loop_worst_phase_us,telemetry_queued_rows,telemetry_queued_bytes,telemetry_dropped_rows,telemetry_rate_limited_events,planner_slice_max_us,planner_command_age_ms,planner_global_goal_distance_m");
+  commitTelemetryRow(TELEMETRY_HEADER_BUDGET_BYTES);
 }
 
-static void sendBluetoothCsvSnapshot(const char* rowType, const char* eventName, const char* eventDetail) {
-  // Full once-per-second CSV row. Units are encoded in column names:
-  // x/y metres, theta degrees, ranges millimetres, wheel speeds ticks/s,
-  // motor commands microseconds, and timing fields ms/us.
+static void padSparseTelemetryRow(size_t populatedFields) {
+  for (size_t field = populatedFields; field < NAV_TELEMETRY_FIELD_COUNT; field++) {
+    telemetryStage.print(",");
+  }
+  telemetryStage.println();
+}
+
+static void finishSparseTelemetryRow(size_t populatedFields) {
+  padSparseTelemetryRow(populatedFields);
+  commitTelemetryRow(TELEMETRY_EVENT_ROW_BUDGET_BYTES);
+}
+
+static void finishSparseTelemetryEventRow(size_t populatedFields) {
+  padSparseTelemetryRow(populatedFields);
+  commitTelemetryEventRow();
+}
+
+static void sendBluetoothSchemaMetadata() {
   beginTelemetryRow();
-  long leftCount;
-  long rightCount;
-  readEncoderCounts(leftCount, rightCount);
-
-  Serial2.print(rowType);
-  Serial2.print(",");
-  Serial2.print(eventName);
-  Serial2.print(",");
-  Serial2.print(eventDetail);
-  Serial2.print(",");
-  Serial2.print(millis());
-  Serial2.print(",");
-  Serial2.print(robotStateName(currentState));
-  Serial2.print(",");
-  Serial2.print(robotRunEnabled ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(bluetoothTestArmed ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(displayWaypointIndex());
-  Serial2.print(",");
-  Serial2.print(robotX, 3);
-  Serial2.print(",");
-  Serial2.print(robotY, 3);
-  Serial2.print(",");
-  Serial2.print(robotTheta, 2);
-  Serial2.print(",");
-  Serial2.print(frontDistance);
-  Serial2.print(",");
-  Serial2.print(leftDistance);
-  Serial2.print(",");
-  Serial2.print(rightDistance);
-  Serial2.print(",");
-  Serial2.print(frontTofValid ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(leftTofValid ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(rightTofValid ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_OUTER));
-  Serial2.print(",");
-  Serial2.print(getRangeSensorDistance(RANGE_RIGHT_INNER));
-  Serial2.print(",");
-  Serial2.print(getRangeSensorDistance(RANGE_LEFT_INNER));
-  Serial2.print(",");
-  Serial2.print(getRangeSensorDistance(RANGE_LEFT_OUTER));
-  Serial2.print(",");
-  Serial2.print(isRangeSensorValid(RANGE_RIGHT_OUTER) ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(isRangeSensorValid(RANGE_RIGHT_INNER) ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(isRangeSensorValid(RANGE_LEFT_INNER) ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(getRangeSensorDistance(RANGE_FRONT));
-  Serial2.print(",");
-  Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(getRangeSensorDistance(RANGE_FAKE_REAR));
-  Serial2.print(",");
-  Serial2.print(isRangeSensorValid(RANGE_FAKE_REAR) ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(isRangeSensorBlocked(RANGE_FAKE_REAR) ? 1 : 0);
-  Serial2.print(",");
-  unsigned long now = millis();
-  Serial2.print(now - rangeSensors[RANGE_RIGHT_OUTER].lastReadMs);
-  Serial2.print(",");
-  Serial2.print(now - rangeSensors[RANGE_RIGHT_INNER].lastReadMs);
-  Serial2.print(",");
-  Serial2.print(now - rangeSensors[RANGE_LEFT_INNER].lastReadMs);
-  Serial2.print(",");
-  Serial2.print(now - rangeSensors[RANGE_LEFT_OUTER].lastReadMs);
-  Serial2.print(",");
-  Serial2.print(leftCount);
-  Serial2.print(",");
-  Serial2.print(rightCount);
-  Serial2.print(",");
-  Serial2.print(frontBlocked ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(driveStuck ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(wheelMismatchStuck ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(turnStuck ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(returnHomeRequested ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(lastLeftMotorUs);
-  Serial2.print(",");
-  Serial2.print(lastRightMotorUs);
-  Serial2.print(",");
-  Serial2.print(baseTargetSpeed, 1);
-  Serial2.print(",");
-  Serial2.print(desiredForwardSpeed, 1);
-  Serial2.print(",");
-  Serial2.print(desiredTurnSpeed, 1);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.candidateCount);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.selectedForwardTicksPerSec, 1);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.selectedTurnTicksPerSec, 1);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.selectedCurvature, 3);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.minimumSweptClearanceMm, 1);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.speedCapTicksPerSec, 1);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.localGoalDistanceM, 3);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.globalGoalDistanceM, 3);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.routeAlongProgressM, 3);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 3);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 2);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 3);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.recoveryCount);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.recoveryBestProgressM, 3);
-  Serial2.print(",");
-  Serial2.print(plannerStopReasonName(plannerTelemetry.stopReason));
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.planReason);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.replanReason);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.safeStopReason);
-  Serial2.print(",");
-  Serial2.print(objectCandidateKindName(objectCandidate.kind));
-  Serial2.print(",");
-  Serial2.print(objectCandidate.confirmed ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(objectCandidate.directionHint);
-  Serial2.print(",");
-  Serial2.print(objectCandidate.rangeMm);
-  for (int i = 0; i < OBJECT_TOF_COUNT; i++) {
-    Serial2.print(",");
-    Serial2.print(objectSensors[i].distanceMm);
-  }
-  for (int i = 0; i < OBJECT_TOF_COUNT; i++) {
-    Serial2.print(",");
-    Serial2.print(objectSensors[i].valid ? 1 : 0);
-  }
-  for (int i = 0; i < OBJECT_TOF_COUNT; i++) {
-    Serial2.print(",");
-    Serial2.print(objectSensors[i].rangeStatus);
-  }
-  Serial2.print(",");
-  Serial2.print(objectCandidate.reason);
-  Serial2.print(",");
-  Serial2.print(objectTargetEstimate.valid ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(isObjectTargetFresh() ? 1 : 0);
-  Serial2.print(",");
-  Serial2.print(objectTargetEstimate.worldX, 3);
-  Serial2.print(",");
-  Serial2.print(objectTargetEstimate.worldY, 3);
-  Serial2.print(",");
-  Serial2.print(objectTargetEstimate.robotXmm, 1);
-  Serial2.print(",");
-  Serial2.print(objectTargetEstimate.robotYmm, 1);
-  Serial2.print(",");
-  Serial2.print(objectTargetEstimate.sourceMask);
-  Serial2.print(",");
-  Serial2.print(objectTargetEstimate.reason);
-  Serial2.print(",");
-  Serial2.print(lastRequestedLeftWheelSpeed, 1);
-  Serial2.print(",");
-  Serial2.print(lastRequestedRightWheelSpeed, 1);
-  Serial2.print(",");
-  Serial2.print(lastMeasuredLeftWheelSpeed, 1);
-  Serial2.print(",");
-  Serial2.print(lastMeasuredRightWheelSpeed, 1);
-  Serial2.print(",");
-  Serial2.print(lastImuClockwiseYawDeg, 2);
-  Serial2.print(",");
-  Serial2.print(lastNavigationHeadingDeg, 2);
-  Serial2.print(",");
-  Serial2.print(lastMotorOutputMode);
-  Serial2.print(",");
-  Serial2.print(motionAuthorityName(motionAuthority));
-  Serial2.print(",");
-  Serial2.print(motorCommandLeaseTripCount());
-  Serial2.print(",");
-  Serial2.print(currentMainLoopGapMs());
-  Serial2.print(",");
-  Serial2.print(maximumMainLoopGapMs());
-  Serial2.print(",");
-  Serial2.print(mainLoopDeadlineMissCount());
-  Serial2.print(",");
-  Serial2.print(maximumMainLoopPhaseName());
-  Serial2.print(",");
-  Serial2.print(maximumMainLoopPhaseUs());
-  Serial2.print(",");
-  Serial2.print(telemetryQueuedRows);
-  Serial2.print(",");
-  Serial2.print(telemetryQueueBytes);
-  Serial2.print(",");
-  Serial2.print(telemetryDroppedRows);
-  Serial2.print(",");
-  Serial2.print(telemetryRateLimitedEvents);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerSliceUs);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerSliceMaxUs);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerEpochWorkUs);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerEpochMaxWorkUs);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerEpochAgeMs);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerCommandAgeMs);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerCandidatesProcessed);
-  Serial2.print(",");
-  Serial2.print(plannerTelemetry.plannerYieldCount);
-  Serial2.print(",");
-  Serial2.println(plannerTelemetry.plannerEpochActive ? 1 : 0);
-  commitTelemetryRow();
-}
-static void sendBluetoothCsvRow() {
-  sendBluetoothCsvSnapshot("telemetry", "", "");
+  telemetryStage.print("meta,");
+  telemetryStage.print(NAV_TELEMETRY_SCHEMA_VERSION);
+  telemetryStage.print(","); telemetryStage.print(telemetrySequence++);
+  telemetryStage.print(",schema,"); telemetryStage.print(ROBOT_BUILD_LABEL);
+  telemetryStage.print(","); telemetryStage.print(millis());
+  telemetryStage.print(","); telemetryStage.print(ROBOT_BUILD_LABEL);
+  finishSparseTelemetryRow(7);
 }
 
-// Compact 10 Hz safety/sign/liveness schema consumed by desktop tools as a
-// normal telemetry row. Distances, object detail, and verbose planner strings
-// remain in the slower full snapshot.
+// Compact, versioned 10 Hz navigation evidence row. The frozen schema retains
+// historical wall-oriented column names; the current receding-horizon planner
+// maps its closest typed state into those compatibility fields.
 static void sendBluetoothMotionRow() {
   beginTelemetryRow();
-  Serial2.print("motion,");
-  Serial2.print(millis());
+  Serial2.print("telemetry,");
+  Serial2.print(NAV_TELEMETRY_SCHEMA_VERSION);
+  Serial2.print(","); Serial2.print(telemetrySequence++);
+  Serial2.print(",,,"); Serial2.print(millis());
+  Serial2.print(","); Serial2.print(ROBOT_BUILD_LABEL);
   Serial2.print(","); Serial2.print(robotStateName(currentState));
   Serial2.print(","); Serial2.print(robotRunEnabled ? 1 : 0);
   Serial2.print(","); Serial2.print(bluetoothTestArmed ? 1 : 0);
   Serial2.print(","); Serial2.print(robotX, 3);
   Serial2.print(","); Serial2.print(robotY, 3);
   Serial2.print(","); Serial2.print(robotTheta, 2);
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
+    Serial2.print(","); Serial2.print(getRangeSensorDistance((RangeSensorId)i));
+  }
   for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
     Serial2.print(","); Serial2.print(isRangeSensorValid((RangeSensorId)i) ? 1 : 0);
   }
@@ -950,18 +748,18 @@ static void sendBluetoothMotionRow() {
   Serial2.print(","); Serial2.print(frontBlocked ? 1 : 0);
   Serial2.print(","); Serial2.print(lastLeftMotorUs);
   Serial2.print(","); Serial2.print(lastRightMotorUs);
-  Serial2.print(","); Serial2.print(plannerTelemetry.candidateCount);
+  Serial2.print(","); Serial2.print(plannerTelemetry.planReason);
+  Serial2.print(","); Serial2.print(0);
+  Serial2.print(","); Serial2.print(plannerTelemetry.minimumSweptClearanceMm, 1);
+  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 2);
+  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryPlateauCount);
+  Serial2.print(","); Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 3);
+  Serial2.print(","); Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 3);
   Serial2.print(","); Serial2.print(plannerTelemetry.selectedForwardTicksPerSec, 1);
   Serial2.print(","); Serial2.print(plannerTelemetry.selectedTurnTicksPerSec, 1);
   Serial2.print(","); Serial2.print(plannerTelemetry.minimumSweptClearanceMm, 1);
   Serial2.print(","); Serial2.print(plannerTelemetry.speedCapTicksPerSec, 1);
-  Serial2.print(","); Serial2.print(plannerTelemetry.globalGoalDistanceM, 3);
-  Serial2.print(","); Serial2.print(plannerTelemetry.routeAlongProgressM, 3);
-  Serial2.print(","); Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 3);
-  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 2);
-  Serial2.print(","); Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 3);
-  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryCount);
-  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryBestProgressM, 3);
+  Serial2.print(","); Serial2.print(plannerTelemetry.replanReason);
   Serial2.print(","); Serial2.print(plannerStopReasonName(plannerTelemetry.stopReason));
   Serial2.print(","); Serial2.print(lastRequestedLeftWheelSpeed, 1);
   Serial2.print(","); Serial2.print(lastRequestedRightWheelSpeed, 1);
@@ -976,10 +774,13 @@ static void sendBluetoothMotionRow() {
   Serial2.print(","); Serial2.print(mainLoopDeadlineMissCount());
   Serial2.print(","); Serial2.print(maximumMainLoopPhaseName());
   Serial2.print(","); Serial2.print(maximumMainLoopPhaseUs());
+  Serial2.print(","); Serial2.print(telemetryQueuedRows);
+  Serial2.print(","); Serial2.print(telemetryQueueBytes);
   Serial2.print(","); Serial2.print(telemetryDroppedRows);
+  Serial2.print(","); Serial2.print(telemetryRateLimitedEvents);
   Serial2.print(","); Serial2.print(plannerTelemetry.plannerSliceMaxUs);
-  Serial2.print(","); Serial2.print(plannerTelemetry.plannerEpochMaxWorkUs);
-  Serial2.print(","); Serial2.print(plannerTelemetry.plannerEpochAgeMs);
+  Serial2.print(","); Serial2.print(plannerTelemetry.plannerCommandAgeMs);
+  Serial2.print(","); Serial2.print(plannerTelemetry.globalGoalDistanceM, 3);
   Serial2.println();
   commitTelemetryRow(TELEMETRY_MOTION_ROW_BUDGET_BYTES);
 }
@@ -1003,16 +804,17 @@ void sendBluetoothEvent(const char* eventName, const char* eventDetail) {
   lastTelemetryEventDetail[sizeof(lastTelemetryEventDetail) - 1] = '\0';
   lastTelemetryEventMs = now;
 
-  // Events intentionally carry only their identity and timestamp. Repeating a
-  // full telemetry snapshot for every burst was the failed run's worst case.
+  // Events share the versioned header and sequence. Sparse fields are padded,
+  // so a partial or malformed record is detectable by width and sequence.
   beginTelemetryRow();
   telemetryStage.print("event,");
-  telemetryStage.print(eventName);
-  telemetryStage.print(",");
-  telemetryStage.print(eventDetail);
-  telemetryStage.print(",");
-  telemetryStage.println(now);
-  commitTelemetryEventRow();
+  telemetryStage.print(NAV_TELEMETRY_SCHEMA_VERSION);
+  telemetryStage.print(","); telemetryStage.print(telemetrySequence++);
+  telemetryStage.print(","); telemetryStage.print(eventName);
+  telemetryStage.print(","); telemetryStage.print(eventDetail);
+  telemetryStage.print(","); telemetryStage.print(now);
+  telemetryStage.print(","); telemetryStage.print(ROBOT_BUILD_LABEL);
+  finishSparseTelemetryEventRow(7);
 }
 
 void sendBluetoothTelemetry() {
@@ -1030,17 +832,11 @@ void sendBluetoothTelemetry() {
     sendBluetoothMotionRow();
   }
 
-  if (now - lastBluetoothFullTelemetryMs < TELEMETRY_FULL_INTERVAL_MS) {
-    return;
-  }
-  lastBluetoothFullTelemetryMs = now;
-
   if (bluetoothStreamEnabled && !bluetoothCsvStreamEnabled) {
-    sendBluetoothStatus();
-  }
-
-  if (bluetoothCsvStreamEnabled) {
-    sendBluetoothCsvRow();
+    if (now - lastBluetoothFullTelemetryMs >= TELEMETRY_FULL_INTERVAL_MS) {
+      lastBluetoothFullTelemetryMs = now;
+      sendBluetoothStatus();
+    }
   }
 }
 
@@ -2045,9 +1841,13 @@ static bool handleStreamAndLogBluetoothCommand(const char* command) {
       return true;
     }
     bluetoothCsvStreamEnabled = true;
+    telemetrySequence = 0;
+    telemetryDroppedRows = 0;
+    telemetryRateLimitedEvents = 0;
     lastBluetoothMotionTelemetryMs = millis();
     lastBluetoothFullTelemetryMs = millis();
     sendBluetoothCsvHeader();
+    sendBluetoothSchemaMetadata();
     Serial2.println("OK csv on.");
     Serial2.println("CSV READY");
     return true;

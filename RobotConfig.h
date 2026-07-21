@@ -36,7 +36,7 @@
 const bool DEBUG_DRIVE = true;
 const bool DEBUG_TURN  = false;
 
-const char ROBOT_BUILD_LABEL[] = "V7-p0-obstacle-t06e";
+const char ROBOT_BUILD_LABEL[] = "V7-permanent-obstacles-0720a";
 
 // =====================================================
 // Bluetooth serial debug link
@@ -53,16 +53,18 @@ const size_t TELEMETRY_EVENT_QUEUE_RESERVE_BYTES = 768;
 const unsigned long TELEMETRY_DUPLICATE_EVENT_LIMIT_MS = 250;
 const unsigned long TELEMETRY_MOTION_INTERVAL_MS = 100;
 const unsigned long TELEMETRY_FULL_INTERVAL_MS = 1000;
+const char NAV_TELEMETRY_SCHEMA_VERSION[] = "3";
+const size_t NAV_TELEMETRY_FIELD_COUNT = 61;
 
 // 115200 baud with 8N1 framing carries at most 11,520 bytes/s. Keep normal
-// logging below 60% so motion rows, one full snapshot, and event bursts cannot
+// logging below 60% so navigation rows and event bursts cannot
 // saturate the transport used by the control loop.
-const size_t TELEMETRY_MOTION_ROW_BUDGET_BYTES = 480;
-const size_t TELEMETRY_FULL_ROW_BUDGET_BYTES = 1792;
+const size_t TELEMETRY_HEADER_BUDGET_BYTES = 1536;
+const size_t TELEMETRY_MOTION_ROW_BUDGET_BYTES = 660;
+const size_t TELEMETRY_EVENT_ROW_BUDGET_BYTES = 320;
 const size_t TELEMETRY_EVENT_RESERVE_BYTES_PER_SECOND = 300;
 const size_t TELEMETRY_DESIGNED_BYTES_PER_SECOND =
   TELEMETRY_MOTION_ROW_BUDGET_BYTES * (1000 / TELEMETRY_MOTION_INTERVAL_MS) +
-  TELEMETRY_FULL_ROW_BUDGET_BYTES * (1000 / TELEMETRY_FULL_INTERVAL_MS) +
   TELEMETRY_EVENT_RESERVE_BYTES_PER_SECOND;
 static_assert(
   TELEMETRY_DESIGNED_BYTES_PER_SECOND * 100 <=
@@ -283,8 +285,14 @@ const unsigned long MOTOR_COMMAND_WATCHDOG_TICK_MS = 10;
 // A point-plan epoch is serviced cooperatively. No one slice may consume the
 // whole main-loop deadline, and an old complete command is neutralized before
 // the independent 150 ms motor lease can expire.
-const unsigned long PLANNER_SLICE_BUDGET_US = 10000;
-const uint8_t PLANNER_MAX_CANDIDATES_PER_SLICE = 2;
+// The forward planner evaluates 26 candidates. Physical traces showed that
+// two candidates per slice stretched an epoch beyond the 120 ms command-age
+// guard, producing repeated drive/neutral pulses before the wheels could build
+// useful speed. Process one complete curvature band per slice; the measured
+// worst two-candidate slice was about 3 ms, so the 25 ms budget remains below
+// the 60 ms main-loop deadline while allowing a full band to finish.
+const unsigned long PLANNER_SLICE_BUDGET_US = 25000;
+const uint8_t PLANNER_MAX_CANDIDATES_PER_SLICE = 13;
 const unsigned long PLANNER_COMMAND_MAX_AGE_MS = 120;
 const unsigned long PLANNER_EPOCH_MAX_AGE_MS = 300;
 
@@ -299,6 +307,12 @@ const int LOCAL_MAP_CELLS = 60;
 const float LOCAL_MAP_CELL_M = 0.05;
 const float LOCAL_MAP_SIZE_M = LOCAL_MAP_CELLS * LOCAL_MAP_CELL_M;
 const float LOCAL_MAP_RECENTER_MARGIN_M = 0.60;
+// Persistent arena memory uses the same 50 mm cells as the rolling planner
+// map. A 12 m square centred on the pose at map reset contains every point in
+// the 4.9 m x 2.4 m arena regardless of the robot's starting orientation.
+const int ARENA_MEMORY_CELLS = 240;
+const float ARENA_MEMORY_SIZE_M = ARENA_MEMORY_CELLS * LOCAL_MAP_CELL_M;
+const int ARENA_MEMORY_EVIDENCE_THRESHOLD = 20;
 const float MAP_FREE_RAY_HALF_WIDTH_M = 0.035;
 // Endpoint evidence is directional: a range return is uncertain along the
 // beam and across its cone, not uniformly in a 100 mm circle. Outer beams are
@@ -320,6 +334,8 @@ const unsigned long MAP_TRAVERSED_EXPIRY_MS = 5000;
 
 const int PLANNER_CURVATURE_SAMPLES = 13;
 const int PLANNER_SPEED_SAMPLES = 2;
+static_assert(PLANNER_MAX_CANDIDATES_PER_SLICE >= PLANNER_CURVATURE_SAMPLES,
+              "Planner must finish at least one curvature band per slice");
 const float PLANNER_HORIZON_S = 0.80;
 const float PLANNER_ROLLOUT_STEP_S = 0.10;
 const float PLANNER_MAX_TURN_RATIO = 0.65;
