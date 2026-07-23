@@ -104,8 +104,6 @@ struct ReverseRecoveryState {
 };
 static ReverseRecoveryState reverseRecoveryState = {};
 static bool recoveryAttemptResetPending = false;
-static float recoveryExitX = 0.0f;
-static float recoveryExitY = 0.0f;
 static ObstacleBypassPhase obstacleBypassPhase = BYPASS_IDLE;
 static float obstacleBypassSideSign = 0.0f;
 static unsigned long obstacleBypassPhaseStartedMs = 0;
@@ -138,6 +136,7 @@ struct ObstacleContext {
   float routeUx;
   float routeUy;
   float routeLengthM;
+  float approachNearAlongM;
   float nearAlongM;
   float farAlongM;
   float minLateralM;
@@ -1160,6 +1159,60 @@ static void obstacleCellRoutePosition(int cellX, int cellY,
   lateralM = -dx * routeUy + dy * routeUx;
 }
 
+static void growObstacleEnvelopeFromNearbyEvidence(
+    float originX, float originY,
+    float routeUx, float routeUy,
+    float routeLengthM,
+    ObstacleEnvelope &envelope) {
+  if (!envelope.found) {
+    return;
+  }
+
+  // Side-facing rays observe a long wall in separate endpoint patches. Grow
+  // from the retained envelope so a newly observed patch can extend the same
+  // obstacle even when one 50 mm map row between them has no endpoint return.
+  const float joinM = LOCAL_MAP_CELL_M * 2.5f;
+  const float endpointReachM = routeLengthM +
+                               ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                               PLANNER_TOTAL_HARD_CLEARANCE_M;
+  for (int pass = 0; pass < 12; pass++) {
+    bool expanded = false;
+    for (int y = 0; y < LOCAL_MAP_CELLS; y++) {
+      for (int x = 0; x < LOCAL_MAP_CELLS; x++) {
+        if (!cellOccupied(x, y)) {
+          continue;
+        }
+        float alongM;
+        float lateralM;
+        obstacleCellRoutePosition(x, y, originX, originY,
+                                  routeUx, routeUy, alongM, lateralM);
+        if (alongM < -joinM || alongM > endpointReachM + joinM ||
+            alongM < envelope.nearAlongM - joinM ||
+            alongM > envelope.farAlongM + joinM ||
+            lateralM < envelope.minLateralM - joinM ||
+            lateralM > envelope.maxLateralM + joinM) {
+          continue;
+        }
+        float oldNear = envelope.nearAlongM;
+        float oldFar = envelope.farAlongM;
+        float oldMin = envelope.minLateralM;
+        float oldMax = envelope.maxLateralM;
+        envelope.nearAlongM = min(envelope.nearAlongM, alongM);
+        envelope.farAlongM = max(envelope.farAlongM, alongM);
+        envelope.minLateralM = min(envelope.minLateralM, lateralM);
+        envelope.maxLateralM = max(envelope.maxLateralM, lateralM);
+        expanded = expanded || oldNear != envelope.nearAlongM ||
+                   oldFar != envelope.farAlongM ||
+                   oldMin != envelope.minLateralM ||
+                   oldMax != envelope.maxLateralM;
+      }
+    }
+    if (!expanded) {
+      break;
+    }
+  }
+}
+
 static bool scanRouteObstacle(float originX, float originY,
                               float routeUx, float routeUy,
                               float routeLengthM,
@@ -1204,46 +1257,8 @@ static bool scanRouteObstacle(float originX, float originY,
   envelope.farAlongM = nearestAlongM;
   envelope.minLateralM = seedLateralM;
   envelope.maxLateralM = seedLateralM;
-
-  // Grow the connected observed envelope in route coordinates. This derives
-  // the bypass from the obstacle evidence itself instead of a fixed travel
-  // distance, while tolerating the small gaps produced by separate ToF rays.
-  const float joinM = LOCAL_MAP_CELL_M * 1.75f;
-  for (int pass = 0; pass < 12; pass++) {
-    bool expanded = false;
-    for (int y = 0; y < LOCAL_MAP_CELLS; y++) {
-      for (int x = 0; x < LOCAL_MAP_CELLS; x++) {
-        if (!cellOccupied(x, y)) {
-          continue;
-        }
-        float alongM;
-        float lateralM;
-        obstacleCellRoutePosition(x, y, originX, originY,
-                                  routeUx, routeUy, alongM, lateralM);
-        if (alongM < envelope.nearAlongM - joinM ||
-            alongM > envelope.farAlongM + joinM ||
-            lateralM < envelope.minLateralM - joinM ||
-            lateralM > envelope.maxLateralM + joinM) {
-          continue;
-        }
-        float oldNear = envelope.nearAlongM;
-        float oldFar = envelope.farAlongM;
-        float oldMin = envelope.minLateralM;
-        float oldMax = envelope.maxLateralM;
-        envelope.nearAlongM = min(envelope.nearAlongM, alongM);
-        envelope.farAlongM = max(envelope.farAlongM, alongM);
-        envelope.minLateralM = min(envelope.minLateralM, lateralM);
-        envelope.maxLateralM = max(envelope.maxLateralM, lateralM);
-        expanded = expanded || oldNear != envelope.nearAlongM ||
-                   oldFar != envelope.farAlongM ||
-                   oldMin != envelope.minLateralM ||
-                   oldMax != envelope.maxLateralM;
-      }
-    }
-    if (!expanded) {
-      break;
-    }
-  }
+  growObstacleEnvelopeFromNearbyEvidence(
+    originX, originY, routeUx, routeUy, routeLengthM, envelope);
   return true;
 }
 
@@ -1258,6 +1273,26 @@ static float chooseObstacleSide(const ObstacleEnvelope &envelope,
   float dx = robotX - obstacleContext.originX;
   float dy = robotY - obstacleContext.originY;
   float currentLateralM = -dx * routeUy + dy * routeUx;
+  float frontClearM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M +
+                      LOCAL_MAP_CELL_M * 0.5f;
+  float targetAlongM = max(0.05f, envelope.nearAlongM - frontClearM -
+                                  PLANNER_OBSTACLE_TURN_ROOM_M);
+  float robotHeadingRad = robotTheta * PI / 180.0f;
+  float headingX = cosf(robotHeadingRad);
+  float headingY = sinf(robotHeadingRad);
+  float leftForwardM =
+    (routeUx * targetAlongM - routeUy * leftTargetM) * headingX +
+    (routeUy * targetAlongM + routeUx * leftTargetM) * headingY;
+  float rightForwardM =
+    (routeUx * targetAlongM - routeUy * rightTargetM) * headingX +
+    (routeUy * targetAlongM + routeUx * rightTargetM) * headingY;
+  if (leftForwardM > 0.0f && rightForwardM <= 0.0f) {
+    return 1.0f;
+  }
+  if (rightForwardM > 0.0f && leftForwardM <= 0.0f) {
+    return -1.0f;
+  }
   float leftCostM = fabs(leftTargetM - currentLateralM);
   float rightCostM = fabs(rightTargetM - currentLateralM);
   if (fabs(leftCostM - rightCostM) > LOCAL_MAP_CELL_M) {
@@ -1282,6 +1317,60 @@ static bool directWaypointCorridorClear(float targetX, float targetY) {
                             distanceM, directObstacle);
 }
 
+static bool clipDirectSegmentToEnvelopeAxis(float start, float delta,
+                                            float minimum, float maximum,
+                                            float &entry, float &exit) {
+  if (fabs(delta) < 0.000001f) {
+    return start >= minimum && start <= maximum;
+  }
+  float first = (minimum - start) / delta;
+  float second = (maximum - start) / delta;
+  if (first > second) {
+    float swap = first;
+    first = second;
+    second = swap;
+  }
+  entry = max(entry, first);
+  exit = min(exit, second);
+  return entry <= exit;
+}
+
+static bool directSegmentClearsRetainedObstacle(float targetX, float targetY) {
+  float currentDx = robotX - obstacleContext.originX;
+  float currentDy = robotY - obstacleContext.originY;
+  float currentAlongM = currentDx * obstacleContext.routeUx +
+                        currentDy * obstacleContext.routeUy;
+  float currentLateralM = -currentDx * obstacleContext.routeUy +
+                          currentDy * obstacleContext.routeUx;
+  float targetDx = targetX - obstacleContext.originX;
+  float targetDy = targetY - obstacleContext.originY;
+  float targetAlongM = targetDx * obstacleContext.routeUx +
+                       targetDy * obstacleContext.routeUy;
+  float targetLateralM = -targetDx * obstacleContext.routeUy +
+                         targetDy * obstacleContext.routeUx;
+  float alongClearanceM =
+    max(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm,
+        ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm) / 1000.0f +
+    PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
+  float lateralClearanceM =
+    max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
+        ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
+    PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
+  float entry = 0.0f;
+  float exit = 1.0f;
+  bool crossesAlong = clipDirectSegmentToEnvelopeAxis(
+    currentAlongM, targetAlongM - currentAlongM,
+    obstacleContext.nearAlongM - alongClearanceM,
+    obstacleContext.farAlongM + alongClearanceM,
+    entry, exit);
+  bool crossesLateral = crossesAlong && clipDirectSegmentToEnvelopeAxis(
+    currentLateralM, targetLateralM - currentLateralM,
+    obstacleContext.minLateralM - lateralClearanceM,
+    obstacleContext.maxLateralM + lateralClearanceM,
+    entry, exit);
+  return !crossesLateral;
+}
+
 static bool updateObstacleContext(float targetX, float targetY) {
   if (!obstacleContext.active) {
     float dx = targetX - robotX;
@@ -1303,6 +1392,9 @@ static bool updateObstacleContext(float targetX, float targetY) {
     obstacleContext.routeUx = routeUx;
     obstacleContext.routeUy = routeUy;
     obstacleContext.routeLengthM = distanceM;
+    // Envelope growth may join a perpendicular arena boundary behind us.
+    // Keep the originally observed front face as the forward-phase gate.
+    obstacleContext.approachNearAlongM = envelope.nearAlongM;
     obstacleContext.nearAlongM = envelope.nearAlongM;
     obstacleContext.farAlongM = envelope.farAlongM;
     obstacleContext.minLateralM = envelope.minLateralM;
@@ -1320,27 +1412,24 @@ static bool updateObstacleContext(float targetX, float targetY) {
     return true;
   }
 
-  ObstacleEnvelope observed;
-  if (scanRouteObstacle(obstacleContext.originX,
-                        obstacleContext.originY,
-                        obstacleContext.routeUx,
-                        obstacleContext.routeUy,
-                        obstacleContext.routeLengthM,
-                        observed)) {
-    const float joinM = LOCAL_MAP_CELL_M * 2.0f;
-    bool sameObstacle = observed.nearAlongM <= obstacleContext.farAlongM + joinM &&
-                        observed.farAlongM >= obstacleContext.nearAlongM - joinM;
-    if (sameObstacle) {
-      obstacleContext.nearAlongM = min(obstacleContext.nearAlongM,
-                                       observed.nearAlongM);
-      obstacleContext.farAlongM = max(obstacleContext.farAlongM,
-                                      observed.farAlongM);
-      obstacleContext.minLateralM = min(obstacleContext.minLateralM,
-                                        observed.minLateralM);
-      obstacleContext.maxLateralM = max(obstacleContext.maxLateralM,
-                                        observed.maxLateralM);
-    }
-  }
+  ObstacleEnvelope observed = {
+    true,
+    obstacleContext.nearAlongM,
+    obstacleContext.farAlongM,
+    obstacleContext.minLateralM,
+    obstacleContext.maxLateralM
+  };
+  growObstacleEnvelopeFromNearbyEvidence(
+    obstacleContext.originX,
+    obstacleContext.originY,
+    obstacleContext.routeUx,
+    obstacleContext.routeUy,
+    obstacleContext.routeLengthM,
+    observed);
+  obstacleContext.nearAlongM = observed.nearAlongM;
+  obstacleContext.farAlongM = observed.farAlongM;
+  obstacleContext.minLateralM = observed.minLateralM;
+  obstacleContext.maxLateralM = observed.maxLateralM;
 
   float poseDx = robotX - obstacleContext.originX;
   float poseDy = robotY - obstacleContext.originY;
@@ -1359,6 +1448,7 @@ static bool updateObstacleContext(float targetX, float targetY) {
     obstacleContext.sideSign * currentLateralM >=
     obstacleContext.sideSign * releaseLateralM;
   bool directRelease = outsideObstacleSide &&
+                       directSegmentClearsRetainedObstacle(targetX, targetY) &&
                        directWaypointCorridorClear(targetX, targetY);
   float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
                      PLANNER_TOTAL_HARD_CLEARANCE_M +
@@ -1424,7 +1514,8 @@ static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
       : min(targetLateralM, currentLateralM);
   }
   float targetAlongM;
-  if (laterallyClear || currentAlongM >= obstacleContext.nearAlongM) {
+  if (laterallyClear ||
+      currentAlongM >= obstacleContext.approachNearAlongM) {
     targetAlongM = obstacleContext.farAlongM + rearClearM;
   } else {
     float frontClearM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
@@ -2134,7 +2225,8 @@ static bool updateRecoveryLiveness(float globalGoalDistanceM,
   plannerTelemetry.routeSignedLateralErrorM = signedLateralM;
 
   bool mustSupervise = obstacleBypassPhase != BYPASS_IDLE ||
-                       reverseRecoveryActive;
+                       reverseRecoveryActive ||
+                       recoveryAttemptResetPending;
   if (!mustSupervise) {
     return false;
   }
@@ -3359,9 +3451,6 @@ static bool canStartEvidenceDrivenReverse() {
 static void startEvidenceDrivenReverse() {
   resetPlannerEpoch();
   resetReversePlannerEpoch();
-  if (recoveryAttemptCount == 0) {
-    resetObstacleContext("reverse_recovery_start");
-  }
   reverseRecoveryState = {};
   reverseRecoveryState.active = true;
   reverseRecoveryState.startX = robotX;
@@ -3388,10 +3477,11 @@ static void completeEvidenceDrivenReverse() {
   resetReversePlannerEpoch();
   reverseRecoveryState = {};
   reverseRecoveryActive = false;
-  recoveryLivenessActive = false;
   recoveryAttemptResetPending = true;
-  recoveryExitX = robotX;
-  recoveryExitY = robotY;
+  // Repositioning deliberately spends route progress. Give the resulting
+  // forward path its own proof window without clearing cumulative distance,
+  // attempt count, or the original recovery progress baselines.
+  recoveryLastProgressMs = millis();
   plannerTelemetry.reverseRecoveryActive = false;
   plannerTelemetry.recoveryPlateauCount = 0;
   resetGeometricNoPathEvidence();
@@ -3508,17 +3598,6 @@ static void updatePointGoal() {
     return;
   }
 
-  if (recoveryAttemptResetPending) {
-    float forwardProgressM = sqrtf((robotX - recoveryExitX) *
-                                   (robotX - recoveryExitX) +
-                                   (robotY - recoveryExitY) *
-                                   (robotY - recoveryExitY));
-    if (forwardProgressM >= PLANNER_RECOVERY_PROGRESS_EPSILON_M) {
-      resetRecoveryLivenessState();
-      recoveryAttemptResetPending = false;
-    }
-  }
-
   bool huntCarryThroughActive =
     routeLineEligible && huntPickupCarryThroughActive(routeLengthM, routeUx, routeUy);
   bool avoidanceActive = updateObstacleContext(navigationGoal.targetX,
@@ -3545,6 +3624,27 @@ static void updatePointGoal() {
     localGoalX = robotX + (dx / distanceM) * lookaheadM;
     localGoalY = robotY + (dy / distanceM) * lookaheadM;
     plannerTelemetry.planReason = "direct_waypoint";
+  }
+
+  float localGoalDistanceM = sqrtf(
+    (localGoalX - robotX) * (localGoalX - robotX) +
+    (localGoalY - robotY) * (localGoalY - robotY));
+  float routeAlongM = routeFrameValid
+    ? routeLineAlongM(robotX, robotY, routeUx, routeUy) : 0.0f;
+  bool madeNetRecoveryProgress =
+    distanceM <= recoveryInitialGoalDistanceM -
+                   PLANNER_RECOVERY_PROGRESS_EPSILON_M ||
+    (routeFrameValid &&
+     routeAlongM >= recoveryStartRouteAlongM +
+                      PLANNER_RECOVERY_PROGRESS_EPSILON_M);
+  if (recoveryAttemptResetPending && !avoidanceActive &&
+      madeNetRecoveryProgress) {
+    resetRecoveryLivenessState();
+    recoveryAttemptResetPending = false;
+  } else if (recoveryLivenessActive &&
+             updateRecoveryLiveness(distanceM, localGoalDistanceM,
+                                    routeFrameValid, routeUx, routeUy)) {
+    return;
   }
 
   if (!avoidanceActive && routeLineEligible &&

@@ -521,7 +521,10 @@ const float PLANNER_RECOVERY_MAX_LATERAL_DISPLACEMENT_M = 0.75;
 // recovery speed, 2.4 m is already twice the nominal test route length.
 const unsigned long PLANNER_RECOVERY_MAX_PHASE_TIME_MS = 12000;
 const float PLANNER_RECOVERY_MAX_CUMULATIVE_DISTANCE_M = 2.40;
-const uint8_t PLANNER_RECOVERY_MAX_COUNT = 2;
+// The 120 mm forward recheck can require several short repositioning arcs to
+// build lateral clearance around a close obstacle. Cumulative distance, phase
+// time and net-progress gates remain active across every handoff.
+const uint8_t PLANNER_RECOVERY_MAX_COUNT = 6;
 // Require at least 50 mm improvement in either global distance or route
 // along-progress during each rolling 6 s window.
 const unsigned long PLANNER_RECOVERY_NO_PROGRESS_TIMEOUT_MS = 6000;
