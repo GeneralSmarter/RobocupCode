@@ -103,6 +103,19 @@ static_assert(motionSafetyPolicy(false, true, false, false,
                                   false, true, true, true}) ==
                 MOTION_SAFETY_REAR_INVALID,
               "Unknown rear space must block reverse motion");
+static_assert(motionSafetyPolicy(false, true, false, false,
+                                 {true, true, true, true,
+                                  true, false, true, true}) ==
+                MOTION_SAFETY_REAR_BLOCKED,
+              "A fresh blocked rear frame must block reverse motion");
+static_assert(motionSafetyPolicy(false, true, false, false,
+                                 MOTION_SAFETY_ALL_CLEAR) ==
+                MOTION_SAFETY_CLEAR,
+              "Fresh clear rear evidence must permit straight reverse");
+static_assert(motionSafetyPolicy(false, true, true, true,
+                                 MOTION_SAFETY_ALL_CLEAR) ==
+                MOTION_SAFETY_CLEAR,
+              "Fresh clear rear evidence must permit curved reverse");
 static_assert(motionSafetyPolicy(false, false, true, true,
                                  {true, true, true, true,
                                   true, true, false, true}) ==

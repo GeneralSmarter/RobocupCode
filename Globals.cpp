@@ -89,7 +89,7 @@ RangeSensorState rangeSensors[RANGE_SENSOR_COUNT] = {
   {"front_virtual", 0, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
   {"right_fan", -30, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
   {"left_fan", 30, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
-  {"fake_rear_tof", (int)FAKE_REAR_TOF_GEOMETRY.angleDeg, RANGE_NO_READING_MM, false, false, false, 0, 0, 0}
+  {"rear_matrix_tof", (int)REAR_MATRIX_TOF_GEOMETRY.angleDeg, RANGE_NO_READING_MM, false, true, true, 0, 0, 0}
 };
 
 const ObjectSensorGeometry OBJECT_SENSOR_GEOMETRY[OBJECT_TOF_COUNT] = {

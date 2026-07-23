@@ -275,6 +275,12 @@ void connectLeftInnerTOF();
 void connectLeftOuterTOF();
 void updateTOFSensors();
 void updateFanTOFSensors();
+void connectRearObstacleSensor();
+void updateRearObstacleSensor();
+void printRearObstacleStatus();
+bool getRearObstacleRay(uint8_t column, uint16_t &distanceMm,
+                        float &robotAngleDeg);
+uint32_t getRearObstacleFrameSequence();
 void prepareObjectTOFPinsForStartup();
 void connectObjectTOFSensors();
 void updateObjectTOFSensors();

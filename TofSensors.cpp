@@ -5,8 +5,8 @@
 // =====================================================
 // Responsibility:
 //   Owns the high forward VL53L0X navigation fan, derived legacy aggregate
-//   readings, front-block debounce, stale/timeout handling, and the temporary
-//   fake rear ToF scaffold.
+//   readings, front-block debounce, and stale/timeout handling. The physical
+//   rear matrix sensor is owned by RearObstacleSensor.cpp.
 // Interacts with:
 //   RobotCode.ino calls connectTOFSensors() during setup. LocalPlanner.cpp and
 //   MotorControl.cpp read rangeSensors through the accessor functions.
@@ -18,8 +18,8 @@
 //   so the control loop does not block behind four long ranging waits.
 // Global state:
 //   Modifies rangeSensors, legacy front/left/right globals, frontBlocked,
-//   front debounce counters, pending-close revalidation state, and fake rear
-//   validity/blocked fields.
+//   front debounce counters and pending-close revalidation state for the
+//   forward fan and derived aggregates.
 const uint16_t TOF_NO_READING_MM = RANGE_NO_READING_MM;
 const uint16_t L0X_VALID_MAX_MM = 8191;
 static uint16_t pendingCloseDistanceMm[RANGE_SENSOR_COUNT] = {0};
@@ -27,7 +27,6 @@ static uint8_t pendingCloseReadCount[RANGE_SENSOR_COUNT] = {0};
 static bool tofCloseReadingRevalidating = false;
 
 static void updateFrontBlockState();
-static void updateFakeRearTofSensor();
 
 static bool isPhysicalFanSensor(RangeSensorId id) {
   return id == RANGE_RIGHT_OUTER ||
@@ -72,11 +71,6 @@ static uint8_t fanI2cAddress(RangeSensorId id) {
 
 static bool isValidL0XDistance(uint16_t distanceMm) {
   return distanceMm >= FRONT_VALID_MIN_MM && distanceMm <= L0X_VALID_MAX_MM;
-}
-
-static bool isValidFakeRearTofDistance(uint16_t distanceMm) {
-  return distanceMm >= FAKE_REAR_TOF_VALID_MIN_MM &&
-         distanceMm <= FAKE_REAR_TOF_VALID_MAX_MM;
 }
 
 static unsigned long maxReadTime(unsigned long a, unsigned long b) {
@@ -313,7 +307,7 @@ void connectTOFSensors() {
   connectLeftInnerTOF();
   connectLeftOuterTOF();
   connectObjectTOFSensors();
-  updateFakeRearTofSensor();
+  connectRearObstacleSensor();
 }
 
 void connectRightOuterTOF() {
@@ -380,29 +374,6 @@ static void updateFrontBlockState() {
   }
 }
 
-static void updateFakeRearTofSensor() {
-  // SAFETY: This is explicit unsafe test scaffolding, not real rear sensing.
-  // It keeps the current recovery API wired during software tests but cannot
-  // prove physical rear clearance.
-  setRangeSensorReading(RANGE_FAKE_REAR,
-                        FAKE_REAR_TOF_DISTANCE_MM,
-                        isValidFakeRearTofDistance(FAKE_REAR_TOF_DISTANCE_MM));
-  RangeSensorState &sensor = rangeSensors[RANGE_FAKE_REAR];
-  sensor.blocked = sensor.valid &&
-                   sensor.distanceMm < FAKE_REAR_TOF_STOP_DISTANCE_MM;
-  if (sensor.valid && sensor.distanceMm > FAKE_REAR_TOF_CLEAR_DISTANCE_MM) {
-    sensor.blocked = false;
-  }
-  sensor.stale = false;
-  syncLegacyTofGlobals();
-}
-
-bool hasTrustedRearCoverage() {
-  // The installed build still exposes RANGE_FAKE_REAR for diagnostics only.
-  // It must never satisfy reverse motion safety or planner evidence.
-  return false;
-}
-
 static bool isL0XFanSampleReady(VL53L0X &sensor) {
   return (sensor.readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) != 0;
 }
@@ -436,7 +407,7 @@ void updateTOFSensors() {
 }
 
 void updateFanTOFSensors() {
-  // Updates the four navigation fan rays and the derived fake rear/front
+  // Updates the four navigation fan rays and the derived rear/front
   // state. The pending-close flag is reset each cycle and set only if a sudden
   // close sample is waiting for confirmation.
   tofCloseReadingRevalidating = false;
@@ -444,7 +415,7 @@ void updateFanTOFSensors() {
   updateL0XFanSensor(RANGE_RIGHT_INNER, rightInnerTOF);
   updateL0XFanSensor(RANGE_LEFT_INNER, leftInnerTOF);
   updateL0XFanSensor(RANGE_LEFT_OUTER, leftOuterTOF);
-  updateFakeRearTofSensor();
+  updateRearObstacleSensor();
   updateFrontBlockState();
 }
 
@@ -623,10 +594,11 @@ void printFanTelemetry() {
   Serial2.print(getRangeSensorDistance(RANGE_LEFT));
   Serial2.print(",left_valid=");
   Serial2.print(isRangeSensorValid(RANGE_LEFT) ? 1 : 0);
-  Serial2.print(",fake_rear_mm=");
+  Serial2.print(",rear_matrix_mm=");
   Serial2.print(getRangeSensorDistance(RANGE_FAKE_REAR));
-  Serial2.print(",fake_rear_valid=");
+  Serial2.print(",rear_matrix_valid=");
   Serial2.print(isRangeSensorValid(RANGE_FAKE_REAR) ? 1 : 0);
-  Serial2.print(",fake_rear_blocked=");
+  Serial2.print(",rear_matrix_blocked=");
   Serial2.println(isRangeSensorBlocked(RANGE_FAKE_REAR) ? 1 : 0);
+  printRearObstacleStatus();
 }

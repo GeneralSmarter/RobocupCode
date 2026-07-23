@@ -103,6 +103,9 @@ bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 bool hasTrustedRearCoverage();
 uint16_t getRangeSensorDistance(RangeSensorId id);
+bool getRearObstacleRay(uint8_t column, uint16_t &distanceMm,
+                        float &robotAngleDeg);
+uint32_t getRearObstacleFrameSequence();
 bool isTofCloseReadingRevalidating();
 float getFanSweepClearanceMm(RangeSensorId id);
 bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm);

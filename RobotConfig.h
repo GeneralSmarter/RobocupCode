@@ -191,11 +191,36 @@ const int FRONT_BLOCK_CONFIRM_READS = 2;
 const int FRONT_CLEAR_CONFIRM_READS = 3;
 const unsigned long FRONT_CLEAR_SETTLE_TIMEOUT_MS = 500;
 
+// Retained only for the host simulator while RANGE_FAKE_REAR remains the
+// compatibility slot name. Production firmware does not publish this value.
 const uint16_t FAKE_REAR_TOF_DISTANCE_MM = 4000;
-const int FAKE_REAR_TOF_VALID_MIN_MM = 20;
-const int FAKE_REAR_TOF_VALID_MAX_MM = 4000;
-const int FAKE_REAR_TOF_STOP_DISTANCE_MM = 180;
-const int FAKE_REAR_TOF_CLEAR_DISTANCE_MM = 230;
+
+// SEN0628 8x8 rear obstacle sensor. RANGE_FAKE_REAR remains the temporary
+// range-slot identifier, but its runtime value now comes from this sensor.
+const uint8_t REAR_MATRIX_TOF_I2C_ADDRESS = 0x33;
+const uint16_t REAR_MATRIX_TOF_VALID_MIN_MM = 20;
+const uint16_t REAR_MATRIX_TOF_VALID_MAX_MM = 3999;
+const uint16_t REAR_MATRIX_TOF_STOP_DISTANCE_MM = 250;
+const uint16_t REAR_MATRIX_TOF_CLEAR_DISTANCE_MM = 300;
+const uint8_t REAR_MATRIX_TOF_CLEAR_CONFIRM_FRAMES = 3;
+// Rows are logical after the 180-degree mounting correction. Rows 0-3 are the
+// visible top half of the displayed matrix; rows 4-7 do not affect clearance.
+const uint8_t REAR_MATRIX_TOF_ACTIVE_FIRST_ROW = 0;
+const uint8_t REAR_MATRIX_TOF_ACTIVE_ROW_COUNT = 4;
+const uint8_t REAR_MATRIX_TOF_COLUMN_COUNT = 8;
+const float REAR_MATRIX_TOF_HORIZONTAL_FOV_DEG = 60.0f;
+const float REAR_MATRIX_TOF_VERTICAL_FOV_DEG = 60.0f;
+const unsigned long REAR_MATRIX_TOF_FRAME_INTERVAL_MS = 100;
+const unsigned long REAR_MATRIX_TOF_STALE_TIMEOUT_MS = 250;
+const unsigned long REAR_MATRIX_TOF_RESPONSE_TIMEOUT_MS = 200;
+const unsigned long REAR_MATRIX_TOF_MODE_TIMEOUT_MS = 1000;
+const unsigned long REAR_MATRIX_TOF_MODE_SETTLE_MS = 5000;
+const unsigned long REAR_MATRIX_TOF_RECONNECT_INTERVAL_MS = 1000;
+static_assert(REAR_MATRIX_TOF_ACTIVE_FIRST_ROW +
+                REAR_MATRIX_TOF_ACTIVE_ROW_COUNT <= 8,
+              "Rear matrix active rows must fit inside the 8x8 frame");
+static_assert(REAR_MATRIX_TOF_COLUMN_COUNT == 8,
+              "Rear matrix ray policy expects eight columns");
 
 // Robot-centred geometry in millimetres. The origin is the midpoint between
 // the drive wheels: +X forward, +Y left. Keep future physical measurements in
@@ -214,7 +239,7 @@ const FanSensorGeometry FAN_SENSOR_GEOMETRY[4] = {
   {95.0,   67.0,  60.0}   // left outer
 };
 
-const FanSensorGeometry FAKE_REAR_TOF_GEOMETRY = {
+const FanSensorGeometry REAR_MATRIX_TOF_GEOMETRY = {
   -ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm,
   0.0,
   180.0
@@ -328,6 +353,16 @@ const float MAP_OUTER_ENDPOINT_FORWARD_UNCERTAINTY_M = 0.045;
 const float MAP_OUTER_ENDPOINT_LATERAL_UNCERTAINTY_M = 0.050;
 const int MAP_OUTER_ENDPOINT_DYNAMIC_EVIDENCE = 8;
 const int MAP_OUTER_ENDPOINT_STATIC_EVIDENCE = 1;
+// Rear matrix cells are collapsed into one ray per column. Their evidence is
+// deliberately comparable to an outer fan ray: useful after repetition, but
+// not enough for one noisy frame to create a hard obstacle by itself.
+const float MAP_REAR_FREE_RAY_HALF_WIDTH_M = 0.020;
+const int MAP_REAR_FREE_EVIDENCE = 4;
+const float MAP_REAR_ENDPOINT_MIN_RANGE_UNCERTAINTY_M = 0.025;
+const float MAP_REAR_ENDPOINT_RANGE_UNCERTAINTY_RATIO = 0.06;
+const float MAP_REAR_ENDPOINT_MIN_LATERAL_UNCERTAINTY_M = 0.025;
+const int MAP_REAR_ENDPOINT_DYNAMIC_EVIDENCE = 8;
+const int MAP_REAR_ENDPOINT_STATIC_EVIDENCE = 1;
 const unsigned long MAP_DYNAMIC_EXPIRY_MS = 1800;
 const unsigned long MAP_STATIC_EXPIRY_MS = 10000;
 const unsigned long MAP_TRAVERSED_EXPIRY_MS = 5000;
@@ -458,6 +493,17 @@ const float PLANNER_REVERSE_RECOVERY_MAX_TURN_RATIO = 0.60;
 const int PLANNER_REVERSE_RECOVERY_CURVATURE_SAMPLES = PLANNER_CURVATURE_SAMPLES;
 const float PLANNER_REVERSE_RECOVERY_REAR_BUFFER_M = 0.06;
 const int PLANNER_REVERSE_CLEAR_EVIDENCE_THRESHOLD = 20;
+// Reverse recovery may gradually tolerate small gaps between otherwise clear
+// rear rays. Occupied cells, stale/blocked rear coverage and the hard
+// footprint margin remain non-bypassable.
+const unsigned long PLANNER_REVERSE_UNKNOWN_RAMP_MS = 3000;
+constexpr float PLANNER_REVERSE_MAX_UNKNOWN_FRACTION = 0.20;
+const float PLANNER_REVERSE_FORWARD_RECHECK_DISTANCE_M = 0.12;
+static_assert(PLANNER_REVERSE_UNKNOWN_RAMP_MS > 0,
+              "Reverse unknown allowance ramp must be nonzero");
+static_assert(PLANNER_REVERSE_MAX_UNKNOWN_FRACTION >= 0.0 &&
+                PLANNER_REVERSE_MAX_UNKNOWN_FRACTION <= 1.0,
+              "Reverse unknown allowance must be a fraction");
 const float PLANNER_REVERSE_CLEARANCE_CAP_M = 0.50;
 const float PLANNER_REVERSE_CLEARANCE_BAND_M = LOCAL_MAP_CELL_M;
 const float PLANNER_REVERSE_CLEARANCE_GAIN_M = LOCAL_MAP_CELL_M;

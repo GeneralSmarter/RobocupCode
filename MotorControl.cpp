@@ -208,9 +208,9 @@ static MotionSafetyReason evaluateMotionSafety(MotionAuthority claimant,
     !isRangeSensorBlocked(RANGE_FRONT),
     !isTofCloseReadingRevalidating(),
     diagonalClear,
-    // P0-03 assumption: the legacy RANGE_FAKE_REAR channel represents a
-    // working real rear ToF. P0-04 must replace the legacy name/scaffolding;
-    // this supervisor deliberately preserves the current rear-safety API.
+    // RANGE_FAKE_REAR is the compatibility slot published by the physical
+    // rear obstacle module. Its capability gate applies the tighter 250 ms
+    // freshness contract before either straight or curved reverse is allowed.
     hasTrustedRearCoverage() && isRangeSensorCurrent(RANGE_FAKE_REAR),
     hasTrustedRearCoverage() && !isRangeSensorBlocked(RANGE_FAKE_REAR),
     turnSideCurrent(turnSpeed) && isTurnDirectionObservable(turnSpeed),

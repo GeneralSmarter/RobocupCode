@@ -24,8 +24,8 @@
 
 // Physical fan sensors come first and match FAN_SENSOR_GEOMETRY indices.
 // RANGE_FRONT/RANGE_LEFT/RANGE_RIGHT are derived aggregate views; there is no
-// physical front-centre ToF in this layout. RANGE_FAKE_REAR is temporary test
-// scaffolding and must not be treated as competition-ready rear coverage.
+// physical front-centre ToF in this layout. RANGE_FAKE_REAR is a temporary
+// compatibility name for the physical rear matrix ToF range slot.
 enum RangeSensorId {
   RANGE_RIGHT_OUTER,
   RANGE_RIGHT_INNER,
