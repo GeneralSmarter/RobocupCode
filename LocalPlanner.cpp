@@ -142,6 +142,7 @@ struct ObstacleContext {
   float minLateralM;
   float maxLateralM;
   float sideSign;
+  bool sideReconsidered;
   unsigned long startedMs;
   unsigned long clearSinceMs;
 };
@@ -1262,14 +1263,82 @@ static bool scanRouteObstacle(float originX, float originY,
   return true;
 }
 
-static float chooseObstacleSide(const ObstacleEnvelope &envelope,
-                                float routeUx, float routeUy) {
+static float obstacleTargetLateralM(float sideSign,
+                                    float minimumLateralM,
+                                    float maximumLateralM) {
   float lateralClearanceM =
     max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
         ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
     PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
-  float leftTargetM = envelope.maxLateralM + lateralClearanceM;
-  float rightTargetM = envelope.minLateralM - lateralClearanceM;
+  float targetLateralM = sideSign > 0.0f
+    ? maximumLateralM + lateralClearanceM
+    : minimumLateralM - lateralClearanceM;
+  return sideSign > 0.0f
+    ? max(targetLateralM, lateralClearanceM)
+    : min(targetLateralM, -lateralClearanceM);
+}
+
+static void obstacleSideEscapeTarget(const ObstacleEnvelope &envelope,
+                                     float routeUx, float routeUy,
+                                     float sideSign,
+                                     float &targetX, float &targetY) {
+  float frontClearM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M +
+                      LOCAL_MAP_CELL_M * 0.5f;
+  float targetAlongM = max(0.05f, envelope.nearAlongM - frontClearM -
+                                  PLANNER_OBSTACLE_TURN_ROOM_M);
+  float targetLateralM = obstacleTargetLateralM(
+    sideSign, envelope.minLateralM, envelope.maxLateralM);
+  targetX = obstacleContext.originX +
+            routeUx * targetAlongM - routeUy * targetLateralM;
+  targetY = obstacleContext.originY +
+            routeUy * targetAlongM + routeUx * targetLateralM;
+}
+
+static bool obstacleSideEscapeCorridorBlocked(
+    const PlannerCollisionSnapshot &snapshot,
+    const ObstacleEnvelope &envelope,
+    float routeUx, float routeUy, float sideSign) {
+  float targetX;
+  float targetY;
+  obstacleSideEscapeTarget(
+    envelope, routeUx, routeUy, sideSign, targetX, targetY);
+  float dx = targetX - robotX;
+  float dy = targetY - robotY;
+  float distanceM = sqrtf(dx * dx + dy * dy);
+  if (distanceM <= LOCAL_MAP_CELL_M) {
+    return false;
+  }
+  float stepM = LOCAL_MAP_CELL_M * 0.5f;
+  for (float travelledM = stepM;
+       travelledM <= distanceM + 0.001f;
+       travelledM += stepM) {
+    float progress = min(1.0f, travelledM / distanceM);
+    if (snapshotWorldOccupied(
+          snapshot,
+          robotX + dx * progress,
+          robotY + dy * progress)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static float chooseObstacleSide(const ObstacleEnvelope &envelope,
+                                float routeUx, float routeUy) {
+  float leftTargetM = obstacleTargetLateralM(
+    1.0f, envelope.minLateralM, envelope.maxLateralM);
+  float rightTargetM = obstacleTargetLateralM(
+    -1.0f, envelope.minLateralM, envelope.maxLateralM);
+  PlannerCollisionSnapshot collision;
+  capturePlannerCollisionSnapshot(collision);
+  bool leftCorridorBlocked = obstacleSideEscapeCorridorBlocked(
+    collision, envelope, routeUx, routeUy, 1.0f);
+  bool rightCorridorBlocked = obstacleSideEscapeCorridorBlocked(
+    collision, envelope, routeUx, routeUy, -1.0f);
+  if (leftCorridorBlocked != rightCorridorBlocked) {
+    return leftCorridorBlocked ? -1.0f : 1.0f;
+  }
   float dx = robotX - obstacleContext.originX;
   float dy = robotY - obstacleContext.originY;
   float currentLateralM = -dx * routeUy + dy * routeUx;
@@ -1400,6 +1469,7 @@ static bool updateObstacleContext(float targetX, float targetY) {
     obstacleContext.minLateralM = envelope.minLateralM;
     obstacleContext.maxLateralM = envelope.maxLateralM;
     obstacleContext.sideSign = chooseObstacleSide(envelope, routeUx, routeUy);
+    obstacleContext.sideReconsidered = false;
     obstacleContext.startedMs = millis();
     obstacleContext.clearSinceMs = 0;
     obstacleBypassSideSign = obstacleContext.sideSign;
@@ -1419,6 +1489,10 @@ static bool updateObstacleContext(float targetX, float targetY) {
     obstacleContext.minLateralM,
     obstacleContext.maxLateralM
   };
+  float previousNearAlongM = observed.nearAlongM;
+  float previousFarAlongM = observed.farAlongM;
+  float previousMinLateralM = observed.minLateralM;
+  float previousMaxLateralM = observed.maxLateralM;
   growObstacleEnvelopeFromNearbyEvidence(
     obstacleContext.originX,
     obstacleContext.originY,
@@ -1430,6 +1504,36 @@ static bool updateObstacleContext(float targetX, float targetY) {
   obstacleContext.farAlongM = observed.farAlongM;
   obstacleContext.minLateralM = observed.minLateralM;
   obstacleContext.maxLateralM = observed.maxLateralM;
+  bool envelopeExpanded =
+    observed.nearAlongM != previousNearAlongM ||
+    observed.farAlongM != previousFarAlongM ||
+    observed.minLateralM != previousMinLateralM ||
+    observed.maxLateralM != previousMaxLateralM;
+  if (envelopeExpanded && !obstacleContext.sideReconsidered) {
+    PlannerCollisionSnapshot collision;
+    capturePlannerCollisionSnapshot(collision);
+    bool currentSideBlocked = obstacleSideEscapeCorridorBlocked(
+      collision, observed,
+      obstacleContext.routeUx, obstacleContext.routeUy,
+      obstacleContext.sideSign);
+    bool oppositeSideBlocked = obstacleSideEscapeCorridorBlocked(
+      collision, observed,
+      obstacleContext.routeUx, obstacleContext.routeUy,
+      -obstacleContext.sideSign);
+    if (currentSideBlocked && !oppositeSideBlocked) {
+      obstacleContext.sideSign = -obstacleContext.sideSign;
+      obstacleContext.sideReconsidered = true;
+      obstacleContext.clearSinceMs = 0;
+      obstacleBypassSideSign = obstacleContext.sideSign;
+      obstacleBypassPhase = BYPASS_SIDE_ESCAPE;
+      obstacleBypassPhaseStartedMs = millis();
+      plannerTelemetry.replanReason = "obstacle_side_infeasible";
+      sendBluetoothEvent(
+        "obstacle_side_switch",
+        obstacleContext.sideSign > 0.0f ? "left" : "right");
+      resetPlannerEpoch();
+    }
+  }
 
   float poseDx = robotX - obstacleContext.originX;
   float poseDy = robotY - obstacleContext.originY;
@@ -1447,7 +1551,11 @@ static bool updateObstacleContext(float targetX, float targetY) {
   bool outsideObstacleSide =
     obstacleContext.sideSign * currentLateralM >=
     obstacleContext.sideSign * releaseLateralM;
-  bool directRelease = outsideObstacleSide &&
+  bool reachedObstacleApproach =
+    alongM >= obstacleContext.approachNearAlongM -
+                LOCAL_MAP_CELL_M * 0.5f;
+  bool directRelease = reachedObstacleApproach &&
+                       outsideObstacleSide &&
                        directSegmentClearsRetainedObstacle(targetX, targetY) &&
                        directWaypointCorridorClear(targetX, targetY);
   float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
@@ -1474,21 +1582,13 @@ static bool updateObstacleContext(float targetX, float targetY) {
 }
 
 static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
-  float lateralClearanceM =
-    max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
-        ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
-    PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
   float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
                      PLANNER_TOTAL_HARD_CLEARANCE_M +
                      LOCAL_MAP_CELL_M * 0.5f;
-  float targetLateralM = obstacleContext.sideSign > 0.0f
-    ? obstacleContext.maxLateralM + lateralClearanceM
-    : obstacleContext.minLateralM - lateralClearanceM;
-  if (obstacleContext.sideSign > 0.0f) {
-    targetLateralM = max(targetLateralM, lateralClearanceM);
-  } else {
-    targetLateralM = min(targetLateralM, -lateralClearanceM);
-  }
+  float targetLateralM = obstacleTargetLateralM(
+    obstacleContext.sideSign,
+    obstacleContext.minLateralM,
+    obstacleContext.maxLateralM);
   float poseDx = robotX - obstacleContext.originX;
   float poseDy = robotY - obstacleContext.originY;
   float currentAlongM = poseDx * obstacleContext.routeUx +
@@ -2063,6 +2163,45 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
   finalY = y;
   finalHeadingRad = heading;
   return true;
+}
+
+static bool obstacleRolloutMakesRequiredLateralProgress(
+    float startX, float startY, float finalX, float finalY,
+    float &lateralProgressScore) {
+  lateralProgressScore = 0.0f;
+  if (!obstacleContext.active) {
+    return true;
+  }
+  float startDx = startX - obstacleContext.originX;
+  float startDy = startY - obstacleContext.originY;
+  float currentAlongM = startDx * obstacleContext.routeUx +
+                        startDy * obstacleContext.routeUy;
+  float currentLateralM = -startDx * obstacleContext.routeUy +
+                           startDy * obstacleContext.routeUx;
+  float targetLateralM = obstacleTargetLateralM(
+    obstacleContext.sideSign,
+    obstacleContext.minLateralM,
+    obstacleContext.maxLateralM);
+  bool needsLateralClearance =
+    currentAlongM < obstacleContext.nearAlongM &&
+    obstacleContext.sideSign * currentLateralM <
+      obstacleContext.sideSign * targetLateralM -
+        PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
+  if (!needsLateralClearance) {
+    return true;
+  }
+  float finalDx = finalX - obstacleContext.originX;
+  float finalDy = finalY - obstacleContext.originY;
+  float finalLateralM = -finalDx * obstacleContext.routeUy +
+                         finalDy * obstacleContext.routeUx;
+  float signedProgressM =
+    obstacleContext.sideSign * (finalLateralM - currentLateralM);
+  float remainingClearanceM =
+    obstacleContext.sideSign * (targetLateralM - currentLateralM);
+  lateralProgressScore = constrain(
+    signedProgressM / max(LOCAL_MAP_CELL_M, remainingClearanceM),
+    0.0f, 1.0f);
+  return signedProgressM > 0.0f;
 }
 
 static float candidateScore(float forwardTicks, float turnTicks,
@@ -2686,37 +2825,6 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
 
       if (obstacleContext.active) {
         float signedTurnRatio = turn / max(1.0f, forward);
-        float poseDx = plannerEpoch.startX - obstacleContext.originX;
-        float poseDy = plannerEpoch.startY - obstacleContext.originY;
-        float currentAlongM = poseDx * obstacleContext.routeUx +
-                              poseDy * obstacleContext.routeUy;
-        float currentLateralM = -poseDx * obstacleContext.routeUy +
-                                poseDy * obstacleContext.routeUx;
-        float lateralClearanceM =
-          max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
-              ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
-          PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
-        float targetLateralM = obstacleContext.sideSign > 0.0f
-          ? obstacleContext.maxLateralM + lateralClearanceM
-          : obstacleContext.minLateralM - lateralClearanceM;
-        if (obstacleContext.sideSign > 0.0f) {
-          targetLateralM = max(targetLateralM, lateralClearanceM);
-        } else {
-          targetLateralM = min(targetLateralM, -lateralClearanceM);
-        }
-        float routeHeadingDeg = atan2f(obstacleContext.routeUy,
-                                       obstacleContext.routeUx) * RAD_TO_DEG;
-        float outwardHeadingDeg = obstacleContext.sideSign * wrapAngle(
-          plannerEpoch.startHeadingRad * RAD_TO_DEG - routeHeadingDeg);
-        bool needsLateralClearance = currentAlongM < obstacleContext.nearAlongM &&
-          obstacleContext.sideSign * currentLateralM <
-            obstacleContext.sideSign * targetLateralM -
-              PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
-        if (needsLateralClearance && outwardHeadingDeg < 35.0f &&
-            obstacleContext.sideSign * signedTurnRatio <
-              PLANNER_OBSTACLE_MIN_OUTWARD_TURN_RATIO) {
-          continue;
-        }
         float desiredHeadingDeg = atan2f(plannerEpoch.goalY - plannerEpoch.startY,
                                          plannerEpoch.goalX - plannerEpoch.startX) *
                                   RAD_TO_DEG;
@@ -2767,6 +2875,12 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         }
         continue;
       }
+      float obstacleLateralProgressScore = 0.0f;
+      if (!obstacleRolloutMakesRequiredLateralProgress(
+            plannerEpoch.startX, plannerEpoch.startY, finalX, finalY,
+            obstacleLateralProgressScore)) {
+        continue;
+      }
 
       plannerEpoch.acceptedCount++;
       plannerTelemetry.candidateCount = plannerEpoch.acceptedCount;
@@ -2779,6 +2893,11 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         plannerEpoch.lineFollowActive,
         navigationGoal.startX, navigationGoal.startY,
         plannerEpoch.routeHeadingRad, plannerEpoch.finalGoalDistanceM);
+      if (recoveryAttemptResetPending) {
+        // After reverse has deliberately spent route progress, prefer a
+        // decisive clearance gain before resuming ordinary goal scoring.
+        score += 3.0f * obstacleLateralProgressScore;
+      }
       bool reachesGoal = arrivalTimeS >= 0.0f;
       bool betterArrival =
         plannerEpoch.finalWaypointIsLocalGoal &&
@@ -2871,6 +2990,14 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
   if (!winnerStillSafe) {
     return retryPlannerEpoch(PLANNER_STOP_NO_SAFE_TRAJECTORY,
                              "winner_revalidation_rejected",
+                             "winner_revalidation_retry");
+  }
+  float obstacleLateralProgressScore = 0.0f;
+  if (!obstacleRolloutMakesRequiredLateralProgress(
+        plannerEpoch.startX, plannerEpoch.startY, finalX, finalY,
+        obstacleLateralProgressScore)) {
+    return retryPlannerEpoch(PLANNER_STOP_NO_SAFE_TRAJECTORY,
+                             "winner_obstacle_progress_rejected",
                              "winner_revalidation_retry");
   }
 
