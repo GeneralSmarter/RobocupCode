@@ -484,6 +484,12 @@ const unsigned long PLANNER_NO_PATH_ABORT_MS = 1200;
 const float PLANNER_OBSTACLE_MAX_SPEED_TPS = 1600.0;
 const float PLANNER_OBSTACLE_TURN_ROOM_M = 0.12;
 const float PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M = 0.10;
+const float PLANNER_OBSTACLE_RECONSIDERED_COUNTERSTEER_LEAD_M = 0.20;
+// The normal local-goal turn policy remains the first planner pass. Only when
+// it finds no trajectory may a gentle opposite-sign rollout qualify by making
+// a measured fraction of the remaining outward clearance.
+const float PLANNER_OBSTACLE_COUNTERSTEER_PROGRESS_FRACTION = 0.05;
+const float PLANNER_OBSTACLE_COUNTERSTEER_MAX_RATIO = 0.15;
 const uint8_t PLANNER_REVERSE_MIN_GEOMETRIC_NO_PATH_EPOCHS = 2;
 const float PLANNER_REVERSE_RECOVERY_MAX_SPEED_TPS = 1700.0;
 const float PLANNER_REVERSE_RECOVERY_MIN_SPEED_TPS = PLANNER_MIN_DRIVABLE_SPEED_TPS;

@@ -142,6 +142,7 @@ struct ObstacleContext {
   float minLateralM;
   float maxLateralM;
   float sideSign;
+  float sideEscapeAlongM;
   bool sideReconsidered;
   unsigned long startedMs;
   unsigned long clearSinceMs;
@@ -202,6 +203,7 @@ struct PlannerEpoch {
   bool active;
   bool awaitingRevalidation;
   bool commandStoppedForAge;
+  bool countersteerFallbackPass;
   unsigned long startedMs;
   unsigned long goalStartedMs;
   MotionAuthority authority;
@@ -912,26 +914,69 @@ static bool snapshotWorldKnownClear(const PlannerCollisionSnapshot &snapshot,
           (uint8_t)(1U << (bit & 7))) != 0;
 }
 
+struct InflatedFootprintSampleGrid {
+  float minimumLocalX;
+  float maximumLocalX;
+  float minimumLocalY;
+  float maximumLocalY;
+  float headingCos;
+  float headingSin;
+  int xIntervals;
+  int yIntervals;
+};
+
+static void buildInflatedFootprintSampleGrid(
+    float headingRad, InflatedFootprintSampleGrid &grid) {
+  const float frontM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                       PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float rearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float leftM = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float rightM = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f +
+                       PLANNER_TOTAL_HARD_CLEARANCE_M;
+  grid.minimumLocalX = -rearM;
+  grid.maximumLocalX = frontM;
+  grid.minimumLocalY = -rightM;
+  grid.maximumLocalY = leftM;
+  grid.headingCos = cosf(headingRad);
+  grid.headingSin = sinf(headingRad);
+  grid.xIntervals = max(1, (int)ceilf(
+    (frontM + rearM) / LOCAL_MAP_CELL_M));
+  grid.yIntervals = max(1, (int)ceilf(
+    (leftM + rightM) / LOCAL_MAP_CELL_M));
+}
+
+static void inflatedFootprintSampleWorld(
+    const InflatedFootprintSampleGrid &grid,
+    float worldX, float worldY, int xIndex, int yIndex,
+    float &sampleWorldX, float &sampleWorldY) {
+  const float localX = grid.minimumLocalX +
+    (grid.maximumLocalX - grid.minimumLocalX) *
+      ((float)xIndex / grid.xIntervals);
+  const float localY = grid.minimumLocalY +
+    (grid.maximumLocalY - grid.minimumLocalY) *
+      ((float)yIndex / grid.yIntervals);
+  sampleWorldX = worldX + localX * grid.headingCos -
+                 localY * grid.headingSin;
+  sampleWorldY = worldY + localX * grid.headingSin +
+                 localY * grid.headingCos;
+}
+
 static bool footprintKnownClearOnSnapshot(
     const PlannerCollisionSnapshot &snapshot,
     float worldX, float worldY, float headingRad) {
-  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float headingCos = cosf(headingRad);
-  const float headingSin = sinf(headingRad);
-  for (float localX = -rear; localX <= front + 0.001f;
-       localX += LOCAL_MAP_CELL_M) {
-    for (float localY = -right; localY <= left + 0.001f;
-         localY += LOCAL_MAP_CELL_M) {
-      float x = worldX + localX * headingCos - localY * headingSin;
-      float y = worldY + localX * headingSin + localY * headingCos;
-      if (!snapshotWorldKnownClear(snapshot, x, y)) {
+  InflatedFootprintSampleGrid grid;
+  buildInflatedFootprintSampleGrid(headingRad, grid);
+  for (int xIndex = 0; xIndex <= grid.xIntervals; ++xIndex) {
+    for (int yIndex = 0; yIndex <= grid.yIntervals; ++yIndex) {
+      float sampleWorldX;
+      float sampleWorldY;
+      inflatedFootprintSampleWorld(
+        grid, worldX, worldY, xIndex, yIndex,
+        sampleWorldX, sampleWorldY);
+      if (!snapshotWorldKnownClear(
+            snapshot, sampleWorldX, sampleWorldY)) {
         return false;
       }
     }
@@ -942,26 +987,20 @@ static bool footprintKnownClearOnSnapshot(
 static float footprintUnknownFractionOnSnapshot(
     const PlannerCollisionSnapshot &snapshot,
     float worldX, float worldY, float headingRad) {
-  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float headingCos = cosf(headingRad);
-  const float headingSin = sinf(headingRad);
+  InflatedFootprintSampleGrid grid;
+  buildInflatedFootprintSampleGrid(headingRad, grid);
   int sampleCount = 0;
   int unknownCount = 0;
-  for (float localX = -rear; localX <= front + 0.001f;
-       localX += LOCAL_MAP_CELL_M) {
-    for (float localY = -right; localY <= left + 0.001f;
-         localY += LOCAL_MAP_CELL_M) {
-      float x = worldX + localX * headingCos - localY * headingSin;
-      float y = worldY + localX * headingSin + localY * headingCos;
+  for (int xIndex = 0; xIndex <= grid.xIntervals; ++xIndex) {
+    for (int yIndex = 0; yIndex <= grid.yIntervals; ++yIndex) {
+      float sampleWorldX;
+      float sampleWorldY;
+      inflatedFootprintSampleWorld(
+        grid, worldX, worldY, xIndex, yIndex,
+        sampleWorldX, sampleWorldY);
       sampleCount++;
-      if (!snapshotWorldKnownClear(snapshot, x, y)) {
+      if (!snapshotWorldKnownClear(
+            snapshot, sampleWorldX, sampleWorldY)) {
         unknownCount++;
       }
     }
@@ -1063,41 +1102,71 @@ static float projectedUnexploredScore(
 static bool footprintClearOnSnapshot(const PlannerCollisionSnapshot &snapshot,
                                      float worldX, float worldY,
                                      float headingRad) {
-  // Tests one predicted robot pose against an immutable occupancy snapshot.
-  // This lets a planner epoch evaluate many candidates without the map
-  // changing halfway through the comparison.
-  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f +
-                     PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f +
-                      PLANNER_TOTAL_HARD_CLEARANCE_M;
-  const float headingCos = cosf(headingRad);
-  const float headingSin = sinf(headingRad);
-
-  // Preserve the original complete 50 mm lattice while replacing repeated
-  // map-object lookups with one immutable occupancy bitset lookup.
-  for (float localX = -rear; localX <= front + 0.001f;
-       localX += LOCAL_MAP_CELL_M) {
-    float pointX = worldX + localX * headingCos + right * headingSin;
-    float pointY = worldY + localX * headingSin - right * headingCos;
-    const float stepX = -LOCAL_MAP_CELL_M * headingSin;
-    const float stepY = LOCAL_MAP_CELL_M * headingCos;
-    for (float localY = -right; localY <= left + 0.001f;
-         localY += LOCAL_MAP_CELL_M) {
-      int cellX;
-      int cellY;
-      if (snapshotWorldOccupied(snapshot, pointX, pointY, &cellX, &cellY)) {
-        lastFootprintRejectWorldX = pointX;
-        lastFootprintRejectWorldY = pointY;
+  // Occupancy evidence is represented at map-cell centres; obstacle envelope
+  // targets add the separate half-cell uncertainty allowance. Test every
+  // occupied centre inside the complete inflated oriented rectangle so no
+  // asymmetric edge is skipped and map-cell width is not counted twice.
+  InflatedFootprintSampleGrid grid;
+  buildInflatedFootprintSampleGrid(headingRad, grid);
+  const float localCentreX =
+    (grid.minimumLocalX + grid.maximumLocalX) * 0.5f;
+  const float localCentreY =
+    (grid.minimumLocalY + grid.maximumLocalY) * 0.5f;
+  const float centreX = worldX + localCentreX * grid.headingCos -
+                        localCentreY * grid.headingSin;
+  const float centreY = worldY + localCentreX * grid.headingSin +
+                        localCentreY * grid.headingCos;
+  const float halfLengthM =
+    (grid.maximumLocalX - grid.minimumLocalX) * 0.5f;
+  const float halfWidthM =
+    (grid.maximumLocalY - grid.minimumLocalY) * 0.5f;
+  const float worldHalfWidthM =
+    halfLengthM * fabsf(grid.headingCos) +
+    halfWidthM * fabsf(grid.headingSin);
+  const float worldHalfHeightM =
+    halfLengthM * fabsf(grid.headingSin) +
+    halfWidthM * fabsf(grid.headingCos);
+  const float mapMaxX = snapshot.originX + LOCAL_MAP_SIZE_M;
+  const float mapMaxY = snapshot.originY + LOCAL_MAP_SIZE_M;
+  if (centreX - worldHalfWidthM < snapshot.originX ||
+      centreX + worldHalfWidthM > mapMaxX ||
+      centreY - worldHalfHeightM < snapshot.originY ||
+      centreY + worldHalfHeightM > mapMaxY) {
+    return false;
+  }
+  int minCellX = max(0, fastFloorToInt(
+    (centreX - worldHalfWidthM - snapshot.originX) / LOCAL_MAP_CELL_M));
+  int maxCellX = min(LOCAL_MAP_CELLS - 1, fastFloorToInt(
+    (centreX + worldHalfWidthM - snapshot.originX) / LOCAL_MAP_CELL_M));
+  int minCellY = max(0, fastFloorToInt(
+    (centreY - worldHalfHeightM - snapshot.originY) / LOCAL_MAP_CELL_M));
+  int maxCellY = min(LOCAL_MAP_CELLS - 1, fastFloorToInt(
+    (centreY + worldHalfHeightM - snapshot.originY) / LOCAL_MAP_CELL_M));
+  for (int cellY = minCellY; cellY <= maxCellY; ++cellY) {
+    for (int cellX = minCellX; cellX <= maxCellX; ++cellX) {
+      int bit = cellY * LOCAL_MAP_CELLS + cellX;
+      if ((snapshot.occupied[bit >> 3] &
+           (uint8_t)(1U << (bit & 7))) == 0) {
+        continue;
+      }
+      float cellWorldX =
+        snapshot.originX + (cellX + 0.5f) * LOCAL_MAP_CELL_M;
+      float cellWorldY =
+        snapshot.originY + (cellY + 0.5f) * LOCAL_MAP_CELL_M;
+      float dx = cellWorldX - worldX;
+      float dy = cellWorldY - worldY;
+      float localX = dx * grid.headingCos + dy * grid.headingSin;
+      float localY = -dx * grid.headingSin + dy * grid.headingCos;
+      if (localX >= grid.minimumLocalX &&
+          localX <= grid.maximumLocalX &&
+          localY >= grid.minimumLocalY &&
+          localY <= grid.maximumLocalY) {
+        lastFootprintRejectWorldX = cellWorldX;
+        lastFootprintRejectWorldY = cellWorldY;
         lastFootprintRejectCellX = cellX;
         lastFootprintRejectCellY = cellY;
         return false;
       }
-      pointX += stepX;
-      pointY += stepY;
     }
   }
   return true;
@@ -1172,7 +1241,7 @@ static void growObstacleEnvelopeFromNearbyEvidence(
   // Side-facing rays observe a long wall in separate endpoint patches. Grow
   // from the retained envelope so a newly observed patch can extend the same
   // obstacle even when one 50 mm map row between them has no endpoint return.
-  const float joinM = LOCAL_MAP_CELL_M * 2.5f;
+  const float joinM = LOCAL_MAP_CELL_M * 2.75f;
   const float endpointReachM = routeLengthM +
                                ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
                                PLANNER_TOTAL_HARD_CLEARANCE_M;
@@ -1469,6 +1538,7 @@ static bool updateObstacleContext(float targetX, float targetY) {
     obstacleContext.minLateralM = envelope.minLateralM;
     obstacleContext.maxLateralM = envelope.maxLateralM;
     obstacleContext.sideSign = chooseObstacleSide(envelope, routeUx, routeUy);
+    obstacleContext.sideEscapeAlongM = 0.0f;
     obstacleContext.sideReconsidered = false;
     obstacleContext.startedMs = millis();
     obstacleContext.clearSinceMs = 0;
@@ -1522,6 +1592,11 @@ static bool updateObstacleContext(float targetX, float targetY) {
       -obstacleContext.sideSign);
     if (currentSideBlocked && !oppositeSideBlocked) {
       obstacleContext.sideSign = -obstacleContext.sideSign;
+      float switchDx = robotX - obstacleContext.originX;
+      float switchDy = robotY - obstacleContext.originY;
+      obstacleContext.sideEscapeAlongM =
+        switchDx * obstacleContext.routeUx +
+        switchDy * obstacleContext.routeUy;
       obstacleContext.sideReconsidered = true;
       obstacleContext.clearSinceMs = 0;
       obstacleBypassSideSign = obstacleContext.sideSign;
@@ -1595,24 +1670,12 @@ static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
                         poseDy * obstacleContext.routeUy;
   float currentLateralM = -poseDx * obstacleContext.routeUy +
                           poseDy * obstacleContext.routeUx;
+  float countersteerLeadM = obstacleContext.sideReconsidered
+    ? PLANNER_OBSTACLE_RECONSIDERED_COUNTERSTEER_LEAD_M
+    : PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
   bool laterallyClear = obstacleContext.sideSign * currentLateralM >=
     obstacleContext.sideSign * targetLateralM -
-      PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
-  float inflatedRobotLengthM =
-    (ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm +
-     ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm) / 1000.0f +
-    2.0f * PLANNER_TOTAL_HARD_CLEARANCE_M;
-  bool longTransverseEdge =
-    obstacleContext.maxLateralM - obstacleContext.minLateralM >=
-      inflatedRobotLengthM + LOCAL_MAP_CELL_M;
-  if (laterallyClear && longTransverseEdge) {
-    // Do not spend clearance by aiming back across a remembered corner. Hold
-    // the best lateral offset until the direct waypoint corridor is confirmed
-    // clear, at which point updateObstacleContext() releases this local goal.
-    targetLateralM = obstacleContext.sideSign > 0.0f
-      ? max(targetLateralM, currentLateralM)
-      : min(targetLateralM, currentLateralM);
-  }
+      countersteerLeadM;
   float targetAlongM;
   if (laterallyClear ||
       currentAlongM >= obstacleContext.approachNearAlongM) {
@@ -1621,8 +1684,12 @@ static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
     float frontClearM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
                         PLANNER_TOTAL_HARD_CLEARANCE_M +
                         LOCAL_MAP_CELL_M * 0.5f;
-    targetAlongM = max(0.05f, obstacleContext.nearAlongM - frontClearM -
-                              PLANNER_OBSTACLE_TURN_ROOM_M);
+    float approachAlongM =
+      max(0.05f, obstacleContext.nearAlongM - frontClearM -
+                 PLANNER_OBSTACLE_TURN_ROOM_M);
+    targetAlongM = obstacleContext.sideReconsidered
+      ? min(obstacleContext.sideEscapeAlongM, approachAlongM)
+      : approachAlongM;
   }
   localGoalX = obstacleContext.originX +
                obstacleContext.routeUx * targetAlongM -
@@ -2182,11 +2249,14 @@ static bool obstacleRolloutMakesRequiredLateralProgress(
     obstacleContext.sideSign,
     obstacleContext.minLateralM,
     obstacleContext.maxLateralM);
+  float countersteerLeadM = obstacleContext.sideReconsidered
+    ? PLANNER_OBSTACLE_RECONSIDERED_COUNTERSTEER_LEAD_M
+    : PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
   bool needsLateralClearance =
     currentAlongM < obstacleContext.nearAlongM &&
     obstacleContext.sideSign * currentLateralM <
       obstacleContext.sideSign * targetLateralM -
-        PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
+        countersteerLeadM;
   if (!needsLateralClearance) {
     return true;
   }
@@ -2823,18 +2893,32 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         (1.0f + fabs(normalized * PLANNER_MAX_TURN_RATIO)));
       float turn = forward * normalized * PLANNER_MAX_TURN_RATIO;
 
+      bool turnPointsToObstacleGoal = true;
+      bool turnIsGentleObstacleCountersteer = true;
       if (obstacleContext.active) {
         float signedTurnRatio = turn / max(1.0f, forward);
-        float desiredHeadingDeg = atan2f(plannerEpoch.goalY - plannerEpoch.startY,
-                                         plannerEpoch.goalX - plannerEpoch.startX) *
-                                  RAD_TO_DEG;
+        float desiredHeadingDeg = atan2f(
+          plannerEpoch.goalY - plannerEpoch.startY,
+          plannerEpoch.goalX - plannerEpoch.startX) * RAD_TO_DEG;
         float localHeadingErrorDeg = wrapAngle(
-          desiredHeadingDeg - plannerEpoch.startHeadingRad * RAD_TO_DEG);
-        if (fabs(localHeadingErrorDeg) > 10.0f &&
-            (localHeadingErrorDeg > 0.0f ? 1.0f : -1.0f) * signedTurnRatio <
-              0.15f) {
-          continue;
-        }
+          desiredHeadingDeg -
+          plannerEpoch.startHeadingRad * RAD_TO_DEG);
+        float turnTowardGoalRatio =
+          (localHeadingErrorDeg > 0.0f ? 1.0f : -1.0f) *
+          signedTurnRatio;
+        turnPointsToObstacleGoal =
+          fabs(localHeadingErrorDeg) <= 10.0f ||
+          turnTowardGoalRatio >= 0.15f;
+        turnIsGentleObstacleCountersteer =
+          turnTowardGoalRatio >=
+            -PLANNER_OBSTACLE_COUNTERSTEER_MAX_RATIO;
+      }
+      if ((!plannerEpoch.countersteerFallbackPass &&
+           !turnPointsToObstacleGoal) ||
+          (plannerEpoch.countersteerFallbackPass &&
+           (turnPointsToObstacleGoal ||
+            !turnIsGentleObstacleCountersteer))) {
+        continue;
       }
 
       if (plannerEpoch.lineFollowActive &&
@@ -2881,6 +2965,11 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
             obstacleLateralProgressScore)) {
         continue;
       }
+      if (plannerEpoch.countersteerFallbackPass &&
+          obstacleLateralProgressScore <
+            PLANNER_OBSTACLE_COUNTERSTEER_PROGRESS_FRACTION) {
+        continue;
+      }
 
       plannerEpoch.acceptedCount++;
       plannerTelemetry.candidateCount = plannerEpoch.acceptedCount;
@@ -2910,7 +2999,8 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         (reachesGoal == plannerEpoch.bestReachesGoal &&
          (!reachesGoal ||
           fabs(arrivalTimeS - plannerEpoch.bestArrivalTimeS) <= 0.0001f));
-      if (betterArrival || (equalArrivalClass && score > plannerEpoch.bestScore)) {
+      if (betterArrival ||
+          (equalArrivalClass && score > plannerEpoch.bestScore)) {
         plannerEpoch.bestScore = score;
         plannerEpoch.bestForward = forward;
         plannerEpoch.bestTurn = turn;
@@ -2921,6 +3011,16 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
     }
     recordPlannerSlice(sliceStartedUs);
     if (plannerEpoch.candidateIndex < totalCandidates) {
+      notePlannerPending();
+      return TRAJECTORY_PLAN_PENDING;
+    }
+    if (plannerEpoch.acceptedCount == 0 &&
+        obstacleContext.active &&
+        !plannerEpoch.countersteerFallbackPass) {
+      plannerEpoch.countersteerFallbackPass = true;
+      plannerEpoch.candidateIndex = 0;
+      plannerTelemetry.replanReason =
+        "obstacle_countersteer_fallback";
       notePlannerPending();
       return TRAJECTORY_PLAN_PENDING;
     }
