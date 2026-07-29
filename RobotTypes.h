@@ -250,6 +250,34 @@ struct NavigationGoal {
   unsigned long startedMs;
 };
 
+struct NavigationStatus {
+  bool active;
+  bool completed;
+  bool failed;
+  NavigationGoalMode mode;
+  NavigationGoalOwner owner;
+  MotionAuthority authority;
+  PlannerStopReason stopReason;
+  const char* detail;
+};
+
+struct PlannerDebugSnapshot {
+  int emergencyPhase;
+  bool emergencyConsumed;
+  uint8_t emergencySector;
+  float emergencyScanYawDeg;
+  float emergencyRelocationDistanceM;
+  float emergencyRotationalClearanceM;
+  int obstacleBypassPhase;
+  float obstacleBypassSideSign;
+  float obstacleNearAlongM;
+  float obstacleFarAlongM;
+  float obstacleMinLateralM;
+  float obstacleMaxLateralM;
+  float obstacleGoalX;
+  float obstacleGoalY;
+};
+
 struct PlannerTelemetry {
   // Public planner state for STATUS/CSV. Speeds are ticks/s, distances are
   // metres unless suffixed with Mm, and timings are milliseconds/microseconds

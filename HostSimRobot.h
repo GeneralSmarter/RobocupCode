@@ -88,10 +88,14 @@ void updateOdometry();
 void updateTOFSensors();
 void updateMotorController();
 void stopMotors();
+NavigationStatus getNavigationStatus();
+PlannerDebugSnapshot getPlannerDebugSnapshot();
+int plannerDebugMapState(float worldX, float worldY);
+int plannerDebugSeedMapOccupied(float worldX, float worldY);
 void sendBluetoothTelemetry();
 void sendBluetoothEvent(const char* eventName, const char* eventDetail);
 void setRobotState(RobotState newState);
-void setMotionCommand(float forwardSpeed, float turnSpeed);
+void requestMotionStop();
 bool setAuthorizedMotionCommand(MotionAuthority authority,
                                 float forwardSpeed,
                                 float turnSpeed);

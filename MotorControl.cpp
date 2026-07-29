@@ -10,7 +10,7 @@
 //   converts wheel-speed errors into servo microsecond pulses.
 // Interacts with:
 //   StateMachine.cpp/LocalPlanner.cpp/Bluetooth.cpp request motion through
-//   setMotionCommand() or setAuthorizedMotionCommand(). TofSensors.cpp and
+//   requestMotionStop() or setAuthorizedMotionCommand(). TofSensors.cpp and
 //   LocalPlanner.cpp provide safety predicates. Encoders feed PID speed
 //   feedback. RobotCode.ino calls serviceMotorSafetyWatchdog() and
 //   updateMotorController() every loop.
@@ -435,7 +435,8 @@ static int wheelFeedForwardBase(float targetTicksPerSec, int forwardBaseUs,
 }
 
 // The only periodic writer of motor pulse widths.  Behaviours request a
-// chassis velocity through setMotionCommand(); they never own a servo output.
+// chassis velocity through setAuthorizedMotionCommand(); they never own a servo
+// output.
 void updateMotorController() {
   // This function is intentionally the final authority on physical motor
   // pulses. Planner/state/safety code only changes desiredForwardSpeed and

@@ -38,6 +38,7 @@ explicit confirmation flow are not yet implemented.
 
 - [Current state and next steps](docs/CURRENT_STATE_AND_NEXT_STEPS.md)
 - [Robot codebase audit](docs/ROBOT_CODEBASE_AUDIT.md)
+- [Code cleanup record and LocalPlanner split plan](docs/CODE_CLEANUP_AND_LOCAL_PLANNER_SPLIT.md)
 
 ## Files
 
@@ -79,8 +80,8 @@ RobotCode.ino loop()
 ```
 
 Keep `MotorControl.cpp` as the only periodic motor-output owner. New behaviours
-should request motion through navigation goals or `setMotionCommand()`, not by
-writing motor pulses from another module. `Bluetooth.cpp` still contains both
+should request motion through navigation goals or `setAuthorizedMotionCommand()`,
+not by writing motor pulses from another module. `Bluetooth.cpp` still contains both
 command handling and telemetry formatting so command names, CSV fields, and
 test workflows stay in one visible interface file during hardware validation.
 

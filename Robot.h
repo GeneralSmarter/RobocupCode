@@ -170,10 +170,6 @@ extern bool frontTofValid;
 extern bool leftTofValid;
 extern bool rightTofValid;
 
-extern unsigned long lastFrontTofReadMs;
-extern unsigned long lastLeftTofReadMs;
-extern unsigned long lastRightTofReadMs;
-
 extern int frontBlockCounter;
 extern int frontClearCounter;
 
@@ -189,7 +185,6 @@ extern float turnCheckStartYaw;
 extern bool returnHomeRequested;
 
 extern RobotState currentState;
-extern RobotState previousState;
 
 extern int currentWaypointIndex;
 extern bool endMatchPrinted;
@@ -243,8 +238,12 @@ void cancelNavigationGoal(PlannerStopReason reason, const char* detail);
 bool isNavigationGoalActive();
 bool didNavigationGoalComplete();
 bool didNavigationGoalFail();
+NavigationStatus getNavigationStatus();
 void clearNavigationGoalResult();
 const char* plannerStopReasonName(PlannerStopReason reason);
+PlannerDebugSnapshot getPlannerDebugSnapshot();
+int plannerDebugMapState(float worldX, float worldY);
+int plannerDebugSeedMapOccupied(float worldX, float worldY);
 bool setEmergencyScanPolicyEnabled(bool enabled);
 bool isEmergencyScanPolicyEnabled();
 bool isTurnDirectionObservable(float turnTicksPerSec);
@@ -353,7 +352,7 @@ bool isWeightSearchActive();
 void cancelWeightSearch(const char* detail);
 void setRobotState(RobotState newState);
 const char* robotStateName(RobotState state);
-void setMotionCommand(float forwardSpeed, float turnSpeed);
+void requestMotionStop();
 
 #endif  // ROBOT_HOST_SIM
 #endif  // ROBOT_H

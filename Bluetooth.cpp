@@ -1,4 +1,4 @@
-﻿#include "Robot.h"
+#include "Robot.h"
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -235,11 +235,6 @@ const unsigned long TEST_TRUTH_FIRST_SAMPLE_MS = 120;
 const unsigned long TEST_TRUTH_SAMPLE_INTERVAL_MS = 1000;
 const unsigned long TEST_TURN_PULSE_SAMPLE_INTERVAL_MS = 100;
 const unsigned long TEST_TURN_PULSE_COAST_MS = 1000;
-const unsigned long TEST_TURN_LADDER_PULSE_MS = 250;
-const unsigned long TEST_TURN_LADDER_COAST_MS = 500;
-const int TEST_TURN_LADDER_OFFSETS_US[] = {120, 160, 200, 240, 280, 300};
-const int TEST_TURN_LADDER_STEP_COUNT =
-  sizeof(TEST_TURN_LADDER_OFFSETS_US) / sizeof(TEST_TURN_LADDER_OFFSETS_US[0]);
 const float TEST_SIDE_MIN_SECONDS = 1.0;
 const float TEST_SIDE_MAX_SECONDS = 30.0;
 const unsigned long TEST_SIDE_SAMPLE_INTERVAL_MS = 1000;
@@ -938,7 +933,7 @@ static void printFloatRangeError(const char* commandName, float minValue, float 
 
 static void stopManualDrive() {
   bluetoothManualActive = false;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   stopMotors();
 }
 
@@ -1244,7 +1239,7 @@ static void runBluetoothTestSide(float durationSeconds) {
   }
 
   stopMotors();
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   bluetoothManualActive = false;
   bluetoothAbortMotionRequested = false;
 
@@ -1268,7 +1263,7 @@ static void updateBluetoothTestSide() {
 
   unsigned long now = millis();
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
 
   if (now >= sideTestNextSampleMs) {
     printSideDecisionRow(sideTestSampleNumber++);
@@ -1500,7 +1495,7 @@ static void finishBluetoothTurnPulseTest() {
   bluetoothManualActive = false;
   robotRunEnabled = false;
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   setRobotState(END_MATCH);
   Serial2.print("TURNPULSE complete: final_nav_heading_delta_deg=");
   Serial2.println(finalHeadingDeg, 2);
@@ -1594,7 +1589,7 @@ static void updateBluetoothTurnPulseTest() {
       turnPulseCoasting = true;
       bluetoothManualActive = false;
       motorStopRequested = true;
-      setMotionCommand(0.0, 0.0);
+      requestMotionStop();
       Serial2.println("TURNPULSE drive phase complete; logging coast.");
     }
   }
@@ -1755,7 +1750,6 @@ static bool handleCoreBluetoothCommand(const char* command) {
 
     if (currentState == END_MATCH) {
       currentState = INIT;
-      previousState = INIT;
     }
 
     Serial2.println("OK start requested.");

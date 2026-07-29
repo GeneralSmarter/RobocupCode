@@ -1,4 +1,4 @@
-﻿#include "Robot.h"
+#include "Robot.h"
 
 // =====================================================
 // Mission state machine
@@ -17,7 +17,7 @@
 //   and manual drive is inactive. This file assigns goals and watches goal
 //   completion/failure; it never writes servo pulses directly.
 // Global state:
-//   Modifies currentState/previousState, currentWaypointIndex, route pause
+//   Modifies currentState, currentWaypointIndex, route pause
 //   timers, returnHomeRequested, robotRunEnabled during END_MATCH, weight
 //   search latches, and navigation goal results via LocalPlanner APIs.
 // Motion is never executed from this state machine.  It only assigns goals to
@@ -89,7 +89,7 @@ static void resumeInterruptedRoute(const char* eventName, const char* detail) {
   weightInterruptLastMs = millis();
   waypointActionUntilMs = millis() + WAYPOINT_ACTION_PAUSE_MS;
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   clearNavigationGoalResult();
   sendBluetoothEvent("weight_interrupt_resume_route", detail);
 }
@@ -105,7 +105,7 @@ static void completeWeightSearch(const char* eventName, const char* detail) {
   if (completedMode == WEIGHT_SEARCH_MODE_TEST) {
     robotRunEnabled = false;
     motorStopRequested = true;
-    setMotionCommand(0.0, 0.0);
+    requestMotionStop();
     clearNavigationGoalResult();
     setRobotState(END_MATCH);
     return;
@@ -115,7 +115,7 @@ static void completeWeightSearch(const char* eventName, const char* detail) {
     weightInterruptLastMs = millis();
     waypointActionUntilMs = millis() + WAYPOINT_ACTION_PAUSE_MS;
     motorStopRequested = true;
-    setMotionCommand(0.0, 0.0);
+    requestMotionStop();
     clearNavigationGoalResult();
     sendBluetoothEvent("weight_interrupt_resume_route", detail);
     return;
@@ -132,7 +132,7 @@ static void failWeightSearch(const char* detail) {
   sendBluetoothEvent("weight_search_hunt_failed", detail);
   clearWeightSearchState();
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   clearNavigationGoalResult();
   setRobotState(END_MATCH);
 }
@@ -169,7 +169,7 @@ static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
     weightSearchAnchorY = robotY;
   }
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   setWeightSearchPhase(alignToWaypoint ? WEIGHT_SEARCH_ALIGN_CENTER
                                         : WEIGHT_SEARCH_SETTLE_CENTER);
 }
@@ -255,14 +255,15 @@ void startWeightSearchTest() {
 void cancelWeightSearch(const char* detail) {
   // Cancels any scan/hunt-owned navigation goal and returns the mission layer
   // to a stopped, non-searching state.
-  if (isNavigationGoalActive() &&
-      (navigationGoal.owner == NAV_OWNER_WEIGHT_SCAN ||
-       navigationGoal.owner == NAV_OWNER_OBJECT_HUNT)) {
+  NavigationStatus navigation = getNavigationStatus();
+  if (navigation.active &&
+      (navigation.owner == NAV_OWNER_WEIGHT_SCAN ||
+       navigation.owner == NAV_OWNER_OBJECT_HUNT)) {
     cancelNavigationGoal(PLANNER_STOP_ABORTED, detail);
   }
   clearWeightSearchState();
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   clearNavigationGoalResult();
   sendBluetoothEvent("weight_search_hunt_failed", detail);
 }
@@ -354,7 +355,7 @@ static void updateWeightSearch() {
 
     case WEIGHT_SEARCH_SETTLE_CENTER:
       motorStopRequested = true;
-      setMotionCommand(0.0, 0.0);
+      requestMotionStop();
       if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
         setWeightSearchPhase(WEIGHT_SEARCH_CHECK_CENTER);
       }
@@ -374,7 +375,7 @@ static void updateWeightSearch() {
 
     case WEIGHT_SEARCH_SETTLE_LEFT:
       motorStopRequested = true;
-      setMotionCommand(0.0, 0.0);
+      requestMotionStop();
       if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
         setWeightSearchPhase(WEIGHT_SEARCH_CHECK_LEFT);
       }
@@ -394,7 +395,7 @@ static void updateWeightSearch() {
 
     case WEIGHT_SEARCH_SETTLE_RIGHT:
       motorStopRequested = true;
-      setMotionCommand(0.0, 0.0);
+      requestMotionStop();
       if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
         setWeightSearchPhase(WEIGHT_SEARCH_CHECK_RIGHT);
       }
@@ -441,7 +442,7 @@ static void updateWeightSearch() {
 
     case WEIGHT_SEARCH_SETTLE_CONFIRM:
       motorStopRequested = true;
-      setMotionCommand(0.0, 0.0);
+      requestMotionStop();
       if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
         setWeightSearchPhase(WEIGHT_SEARCH_CHECK_CONFIRM);
       }
@@ -549,10 +550,11 @@ static bool assignSearchWaypointStandoffOrStartSearch() {
 static bool tryStartRouteWeightInterrupt() {
   // Opportunistic route interrupt: if a confirmed object appears during a
   // route-owned navigation goal, pause the route and handle one target.
+  NavigationStatus navigation = getNavigationStatus();
   if (weightInterruptCooldownActive() ||
       currentWaypointIndex >= NUM_POINTS ||
-      !isNavigationGoalActive() ||
-      navigationGoal.owner != NAV_OWNER_ROUTE ||
+      !navigation.active ||
+      navigation.owner != NAV_OWNER_ROUTE ||
       !searchTargetVisible()) {
     return false;
   }
@@ -598,7 +600,7 @@ void runStateMachine() {
 void runInitState() {
   // Resets mission-owned latches and assigns the first active state. It does
   // not reset yaw/pose; ZERO owns coordinate reset explicitly.
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   motorStopRequested = true;
   currentWaypointIndex = 0;
   waypointActionUntilMs = 0;
@@ -627,7 +629,8 @@ void runFollowPathState() {
   }
 
   // Test goals own the same controller without advancing the route.
-  if (isNavigationGoalActive() && navigationGoal.owner != NAV_OWNER_ROUTE) {
+  NavigationStatus navigation = getNavigationStatus();
+  if (navigation.active && navigation.owner != NAV_OWNER_ROUTE) {
     return;
   }
 
@@ -642,7 +645,8 @@ void runFollowPathState() {
   }
 
   if (didNavigationGoalComplete()) {
-    if (navigationGoal.owner == NAV_OWNER_ROUTE) {
+    navigation = getNavigationStatus();
+    if (navigation.owner == NAV_OWNER_ROUTE) {
       const char* action = path[currentWaypointIndex].action;
       if (waypointActionIs(action, "SEARCH")) {
         clearNavigationGoalResult();
@@ -664,7 +668,7 @@ void runFollowPathState() {
   if (waypointActionUntilMs != 0) {
     if (millis() < waypointActionUntilMs) {
       motorStopRequested = true;
-      setMotionCommand(0.0, 0.0);
+      requestMotionStop();
       return;
     }
     waypointActionUntilMs = 0;
@@ -704,7 +708,7 @@ void runUnusedState(const char* stateName) {
   // Placeholder states fail safe. They are named in RobotState but not yet
   // implemented as a scoring mission.
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   Serial.print(stateName);
   Serial.println(" is not implemented. Entering safe stop.");
   setRobotState(END_MATCH);
@@ -715,7 +719,7 @@ void runEndMatchState() {
   // neutral and disables robotRunEnabled so loop() cannot keep advancing
   // autonomous logic.
   motorStopRequested = true;
-  setMotionCommand(0.0, 0.0);
+  requestMotionStop();
   robotRunEnabled = false;
 
   if (!endMatchPrinted) {
@@ -756,7 +760,6 @@ void setRobotState(RobotState newState) {
     enforceEndMatchMotionSafety();
   }
   if (currentState != newState) {
-    previousState = currentState;
     Serial.print("STATE: ");
     Serial.print(robotStateName(currentState));
     Serial.print(" -> ");
@@ -780,15 +783,6 @@ const char* robotStateName(RobotState state) {
   return "UNKNOWN";
 }
 
-void setMotionCommand(float forwardSpeed, float turnSpeed) {
-  // Legacy neutral/direct desired-speed setter. Non-neutral safety-supervised
-  // commands should flow through setAuthorizedMotionCommand(); a neutral call
-  // is allowed here for cleanup from any module.
-  if (fabs(forwardSpeed) < 1.0f && fabs(turnSpeed) < 1.0f) {
-    stopMotors();
-    return;
-  }
-  desiredForwardSpeed = forwardSpeed;
-  desiredTurnSpeed = turnSpeed;
-  motionCommandAuthority = MOTION_AUTHORITY_NONE;
+void requestMotionStop() {
+  stopMotors();
 }

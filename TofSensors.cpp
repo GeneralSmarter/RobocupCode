@@ -134,10 +134,6 @@ static void syncLegacyTofGlobals() {
   leftTofValid = rangeSensors[RANGE_LEFT].valid;
   rightTofValid = rangeSensors[RANGE_RIGHT].valid;
 
-  lastFrontTofReadMs = rangeSensors[RANGE_FRONT].lastReadMs;
-  lastLeftTofReadMs = rangeSensors[RANGE_LEFT].lastReadMs;
-  lastRightTofReadMs = rangeSensors[RANGE_RIGHT].lastReadMs;
-
   frontBlocked = rangeSensors[RANGE_FRONT].blocked;
 }
 

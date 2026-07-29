@@ -33,9 +33,6 @@
 // =====================================================
 // Debug and build label
 // =====================================================
-const bool DEBUG_DRIVE = true;
-const bool DEBUG_TURN  = false;
-
 const char ROBOT_BUILD_LABEL[] = "V7-permanent-obstacles-0720a";
 
 // =====================================================
@@ -189,11 +186,6 @@ const unsigned long TOF_STALE_TIMEOUT_MS = 750;
 
 const int FRONT_BLOCK_CONFIRM_READS = 2;
 const int FRONT_CLEAR_CONFIRM_READS = 3;
-const unsigned long FRONT_CLEAR_SETTLE_TIMEOUT_MS = 500;
-
-// Retained only for the host simulator while RANGE_FAKE_REAR remains the
-// compatibility slot name. Production firmware does not publish this value.
-const uint16_t FAKE_REAR_TOF_DISTANCE_MM = 4000;
 
 // SEN0628 8x8 rear obstacle sensor. RANGE_FAKE_REAR remains the temporary
 // range-slot identifier, but its runtime value now comes from this sensor.
@@ -400,20 +392,6 @@ const float PLANNER_MIN_PROGRESS_M = 0.03;
 const float PLANNER_FRONT_SPEED_BUFFER_M = 0.06;
 const float PLANNER_MAX_DECELERATION_MPS2 = 0.60;
 const float PLANNER_SENSING_LATENCY_S = 0.12;
-// At higher base speeds the robot must commit to a side escape before the
-// virtual front reaches the emergency stop band. This cap applies only while
-// an asymmetric inner-fan clearance escape is active; open-field driving still
-// uses the requested base speed.
-const float PLANNER_ESCAPE_SPEED_LIMIT_START_M = 0.48;
-const float PLANNER_ESCAPE_SPEED_LIMIT_FULL_M = 0.28;
-const float PLANNER_ESCAPE_MIN_SPEED_TPS = PLANNER_MIN_DRIVABLE_SPEED_TPS;
-// Once a side-escape is urgent, do not let generic point-progress scoring
-// choose straight or opposite-side arcs that keep walking the chassis into the
-// wall pocket. If no committed same-side arc is safe, stop and let reverse
-// recovery create a new observation pose before the front sensor is buried.
-const float PLANNER_ESCAPE_FORCE_TURN_URGENCY = 0.60;
-const float PLANNER_ESCAPE_FORCE_TURN_MIN_RATIO = 0.15;
-const float PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS = 0.0;
 const float PLANNER_TURN_TARGET_SPEED = 1050.0;
 // This marker selects the original, physically calibrated slow-turn pulse
 // pair inside the single motor-output path.
@@ -477,8 +455,6 @@ const float PLANNER_FINAL_BLOCKED_ACCEPTANCE_M = 0.16;
 // forward field. This prevents TEST GOTO 0 0 from driving farther away after a
 // gap traverse that ended beyond the requested target.
 const float PLANNER_POINT_ALIGN_START_DEG = 30.0;
-const float PLANNER_POINT_ALIGN_BEHIND_DEG = 90.0;
-const float PLANNER_POINT_ALIGN_SIDE_TIE_MM = 50.0;
 // Reverse recovery is an explicit no-forward-path recovery. The range-channel
 // identifier is legacy; hasTrustedRearCoverage() is the non-bypassable
 // capability gate for planner publication and final motor output.

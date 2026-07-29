@@ -1,4 +1,4 @@
-﻿// =====================================================
+// =====================================================
 // ROBOCUP ROBOT CODE
 // =====================================================
 // Responsibility:
@@ -106,7 +106,7 @@ void loop() {
     runStateMachine();
   } else if (!isManualDriveActive()) {
     motorStopRequested = true;
-    setMotionCommand(0.0, 0.0);
+    requestMotionStop();
   }
   recordMainLoopPhaseDuration("state_machine", phaseStartedUs);
 

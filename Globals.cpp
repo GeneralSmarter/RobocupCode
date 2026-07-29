@@ -140,10 +140,6 @@ bool frontTofValid = false;
 bool leftTofValid = false;
 bool rightTofValid = false;
 
-unsigned long lastFrontTofReadMs = 0;
-unsigned long lastLeftTofReadMs = 0;
-unsigned long lastRightTofReadMs = 0;
-
 int frontBlockCounter = 0;
 int frontClearCounter = 0;
 
@@ -164,7 +160,6 @@ bool bluetoothOutputEnabled = false;
 RobotSerialClass robotSerial;
 
 RobotState currentState = INIT;
-RobotState previousState = INIT;
 
 int currentWaypointIndex = 0;
 bool endMatchPrinted = false;
