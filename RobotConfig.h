@@ -368,13 +368,20 @@ const unsigned long MAP_STATIC_EXPIRY_MS = 10000;
 const unsigned long MAP_TRAVERSED_EXPIRY_MS = 5000;
 
 const int PLANNER_CURVATURE_SAMPLES = 13;
-const int PLANNER_SPEED_SAMPLES = 2;
 static_assert(PLANNER_MAX_CANDIDATES_PER_SLICE >= PLANNER_CURVATURE_SAMPLES,
               "Planner must finish at least one curvature band per slice");
 const float PLANNER_HORIZON_S = 0.80;
 const float PLANNER_ROLLOUT_STEP_S = 0.10;
+// Keep collision sampling tied to arena geometry rather than command speed.
+// A rollout may use a shorter time step so successive footprint checks move
+// no more than half a map cell. The ten-degree angular bound is a secondary
+// guard for future configurations; current wheel limits are already tighter.
+const float PLANNER_ROLLOUT_MAX_SPATIAL_STEP_M = LOCAL_MAP_CELL_M * 0.5f;
+const float PLANNER_ROLLOUT_MAX_HEADING_STEP_RAD = 0.174533f;
 const float PLANNER_MAX_TURN_RATIO = 0.65;
-const float PLANNER_MIN_SPEED_SCALE = 0.45;
+// One forward ceiling applies to every point-planner context. Each sampled
+// curve derives a lower safe speed from braking, wheel and swept-path limits.
+const float PLANNER_FORWARD_MAX_SPEED_TPS = 2400.0f;
 // Lowest speed at which the current drivetrain has demonstrated sustained
 // motion.  Below this, stopping is safer and more truthful than planning a
 // trajectory the motors cannot execute.
@@ -451,12 +458,10 @@ const float PLANNER_HUNT_FINISH_TARGET_TOLERANCE_M = 0.025;
 const float PLANNER_HUNT_FINISH_LATERAL_M = 0.22;
 const float PLANNER_HUNT_FINISH_OVERSHOOT_M = 0.35;
 // Once the robot reaches the estimated weight point, add a small hunt-only
-// speed boost for the forward carry-through. The braking/observation cap still
-// wins if forward space is not proven clear.
-const float PLANNER_HUNT_PICKUP_BOOST_ZONE_M =
+// forward carry-through region. The curve planner's single forward ceiling
+// and its computed safe speed still govern motion through this region.
+const float PLANNER_HUNT_PICKUP_CARRY_ZONE_M =
   OBJECT_PICKUP_OVERSHOOT_MM / 1000.0;
-const float PLANNER_HUNT_PICKUP_BOOST_TPS = 250.0;
-const float PLANNER_HUNT_PICKUP_MAX_SPEED_TPS = 2850.0;
 // If a gap traverse crosses the target plane while still a little too angled
 // for the strict finish gate, stop in this short post-window instead of
 // chasing the clamped lookahead point indefinitely. Beyond this window, abort
@@ -481,7 +486,6 @@ const unsigned long PLANNER_NO_PATH_BACKTRACK_DELAY_MS = 250;
 // Abort when neither forward planning nor trusted-rear recovery can make
 // useful progress within this interval.
 const unsigned long PLANNER_NO_PATH_ABORT_MS = 1200;
-const float PLANNER_OBSTACLE_MAX_SPEED_TPS = 1600.0;
 const float PLANNER_OBSTACLE_TURN_ROOM_M = 0.12;
 const float PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M = 0.10;
 const float PLANNER_OBSTACLE_RECONSIDERED_COUNTERSTEER_LEAD_M = 0.20;
@@ -535,7 +539,7 @@ const float PLANNER_RECOVERY_TAKEOVER_PROGRESS_M = LOCAL_MAP_CELL_M;
 // Ultimate recovery is deliberately opt-in. It may run only after ordinary
 // recovery has exhausted an eligible resource or progress bound, and it never weakens the
 // existing footprint, sensor-freshness, authority, or motor-safety gates.
-const bool PLANNER_EMERGENCY_SCAN_ENABLED = false;
+const bool PLANNER_EMERGENCY_SCAN_ENABLED = true;
 constexpr uint8_t PLANNER_EMERGENCY_SCAN_SECTORS = 12;
 constexpr float PLANNER_EMERGENCY_SCAN_STEP_DEG = 30.0f;
 const float PLANNER_EMERGENCY_SCAN_SWEEP_STEP_DEG = 5.0f;

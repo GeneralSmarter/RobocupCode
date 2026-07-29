@@ -2310,6 +2310,8 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
                              float &finalY,
                              float &finalHeadingRad,
                              float &arrivalTimeS,
+                             float &safeTravelM,
+                             float &maximumUnknownFraction,
                              CandidateRejectReason &rejectReason) {
   // A candidate is a constant chassis command (forward, turn) simulated for
   // PLANNER_HORIZON_S. Positive turn is CCW/left; MotorControl later converts
@@ -2349,19 +2351,35 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
   finalY = y;
   finalHeadingRad = heading;
   arrivalTimeS = -1.0;
+  safeTravelM = 0.0f;
+  maximumUnknownFraction = 0.0f;
 
-  for (float elapsed = 0.0; elapsed < PLANNER_HORIZON_S; elapsed += PLANNER_ROLLOUT_STEP_S) {
+  float elapsed = 0.0f;
+  while (elapsed < PLANNER_HORIZON_S - 0.000001f) {
+    float integrationStepS =
+      min(PLANNER_ROLLOUT_STEP_S, PLANNER_HORIZON_S - elapsed);
+    if (fabs(linearMps) > 0.000001f) {
+      integrationStepS = min(
+        integrationStepS,
+        PLANNER_ROLLOUT_MAX_SPATIAL_STEP_M / fabs(linearMps));
+    }
+    if (fabs(angularRadPerSec) > 0.000001f) {
+      integrationStepS = min(
+        integrationStepS,
+        PLANNER_ROLLOUT_MAX_HEADING_STEP_RAD / fabs(angularRadPerSec));
+    }
     // Keep the start of this integration segment so terminal scoring can
-    // measure the closest *continuous* approach to a point goal.  Comparing
-    // only the 100 ms sample endpoints can favour a slower command simply
+    // measure the closest *continuous* approach to a point goal. Comparing
+    // only discrete sample endpoints can favour a slower command simply
     // because one of its samples happens to land nearer the goal.
     float segmentStartX = x;
     float segmentStartY = y;
     float segmentStartHeading = heading;
-    float midpointHeading = heading + angularRadPerSec * PLANNER_ROLLOUT_STEP_S * 0.5;
-    x += linearMps * cosf(midpointHeading) * PLANNER_ROLLOUT_STEP_S;
-    y += linearMps * sinf(midpointHeading) * PLANNER_ROLLOUT_STEP_S;
-    heading += angularRadPerSec * PLANNER_ROLLOUT_STEP_S;
+    float midpointHeading =
+      heading + angularRadPerSec * integrationStepS * 0.5f;
+    x += linearMps * cosf(midpointHeading) * integrationStepS;
+    y += linearMps * sinf(midpointHeading) * integrationStepS;
+    heading += angularRadPerSec * integrationStepS;
     // Project the point goal onto this segment. The robot stops as soon as it
     // enters the arrival circle, so a fast candidate must not lose merely
     // because its next discrete rollout sample has passed that point.
@@ -2399,7 +2417,7 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
         float entryProgress = (-b - sqrtf(discriminant)) /
                               (2.0f * segmentLengthSquared);
         if (entryProgress >= 0.0f && entryProgress <= 1.0f) {
-          arrivalTimeS = elapsed + entryProgress * PLANNER_ROLLOUT_STEP_S;
+          arrivalTimeS = elapsed + entryProgress * integrationStepS;
           if (epoch.finalWaypointIsLocalGoal) {
             float arrivalX = segmentStartX + segmentDx * entryProgress;
             float arrivalY = segmentStartY + segmentDy * entryProgress;
@@ -2421,12 +2439,13 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
             finalHeadingRad = arrivalHeading;
             closestGoalDistanceM = 0.0f;
             headingAtClosestGoalRad = arrivalHeading;
+            safeTravelM = arrivalTravelM;
             return true;
           }
         }
       }
     }
-    float travelledM = linearMps * (elapsed + PLANNER_ROLLOUT_STEP_S);
+    float travelledM = linearMps * (elapsed + integrationStepS);
     // Unknown front space is unsafe. Even an empty local-map cell cannot make
     // this candidate legal if the inner fan has not actually observed far
     // enough ahead of the leading edge of the chassis.
@@ -2438,6 +2457,10 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
       rejectReason = CANDIDATE_REJECT_FOOTPRINT;
       return false;
     }
+    maximumUnknownFraction = max(
+      maximumUnknownFraction,
+      footprintUnknownFractionOnSnapshot(
+        epoch.collision, x, y, heading));
     // A 400 mm passage is a straight-traverse problem, not a turning-space
     // problem. Once both nearby walls are evidenced, reject arcs that would
     // keep steering inside it. The planner therefore aligns before entry or
@@ -2448,11 +2471,48 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
       rejectReason = CANDIDATE_REJECT_CORRIDOR;
       return false;
     }
+    safeTravelM = travelledM;
+    elapsed += integrationStepS;
   }
   finalX = x;
   finalY = y;
   finalHeadingRad = heading;
   return true;
+}
+
+struct ForwardCandidateEvaluation {
+  float clearanceMm;
+  float closestGoalDistanceM;
+  float headingAtClosestGoalRad;
+  float finalX;
+  float finalY;
+  float finalHeadingRad;
+  float arrivalTimeS;
+  float safeTravelM;
+  float maximumUnknownFraction;
+  CandidateRejectReason rejectReason;
+};
+
+static bool evaluateForwardCandidate(const PlannerEpoch &epoch,
+                                     float forwardTicks, float turnTicks,
+                                     ForwardCandidateEvaluation &evaluation) {
+  evaluation.clearanceMm = -1.0f;
+  evaluation.closestGoalDistanceM = epoch.localGoalDistanceM;
+  evaluation.headingAtClosestGoalRad = epoch.startHeadingRad;
+  evaluation.finalX = epoch.startX;
+  evaluation.finalY = epoch.startY;
+  evaluation.finalHeadingRad = epoch.startHeadingRad;
+  evaluation.arrivalTimeS = -1.0f;
+  evaluation.safeTravelM = 0.0f;
+  evaluation.maximumUnknownFraction = 0.0f;
+  evaluation.rejectReason = CANDIDATE_REJECT_NONE;
+  return rolloutCandidate(
+    epoch, forwardTicks, turnTicks, epoch.goalX, epoch.goalY,
+    evaluation.clearanceMm, evaluation.closestGoalDistanceM,
+    evaluation.headingAtClosestGoalRad,
+    evaluation.finalX, evaluation.finalY, evaluation.finalHeadingRad,
+    evaluation.arrivalTimeS, evaluation.safeTravelM,
+    evaluation.maximumUnknownFraction, evaluation.rejectReason);
 }
 
 static bool obstacleRolloutMakesRequiredLateralProgress(
@@ -2914,24 +2974,14 @@ static bool huntPickupCarryThroughActive(float routeLengthM, float routeUx,
 
   float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
   float lateralErrorM = routeLineLateralErrorM(robotX, robotY, routeUx, routeUy);
-  return alongM >= routeLengthM - PLANNER_HUNT_PICKUP_BOOST_ZONE_M &&
+  return alongM >= routeLengthM - PLANNER_HUNT_PICKUP_CARRY_ZONE_M &&
          alongM <= routeLengthM + PLANNER_HUNT_FINISH_OVERSHOOT_M &&
          lateralErrorM <= PLANNER_HUNT_FINISH_LATERAL_M;
 }
 
 
-static float requestedPointGoalSpeedCap(bool routeLineActive,
-                                        float routeLengthM, float routeUx,
-                                        float routeUy) {
-  float requestedCap = baseTargetSpeed;
-  if (obstacleContext.active) {
-    requestedCap = min(requestedCap, PLANNER_OBSTACLE_MAX_SPEED_TPS);
-  }
-  if (routeLineActive && huntPickupCarryThroughActive(routeLengthM, routeUx, routeUy)) {
-    requestedCap = min(PLANNER_HUNT_PICKUP_MAX_SPEED_TPS,
-                       baseTargetSpeed + PLANNER_HUNT_PICKUP_BOOST_TPS);
-  }
-  return requestedCap;
+static float requestedPointGoalSpeedCap() {
+  return min(baseTargetSpeed, PLANNER_FORWARD_MAX_SPEED_TPS);
 }
 
 static bool huntPickupZoneReached(float routeLengthM, float routeUx, float routeUy) {
@@ -3138,8 +3188,7 @@ static TrajectoryPlanResult beginPlannerEpoch(float goalX, float goalY) {
     !obstacleContext.active &&
     routeLineTrackingEligible(routeLengthM, routeUx, routeUy,
                               plannerEpoch.routeHeadingRad);
-  plannerEpoch.requestedSpeedCap = requestedPointGoalSpeedCap(
-    plannerEpoch.lineFollowActive, routeLengthM, routeUx, routeUy);
+  plannerEpoch.requestedSpeedCap = requestedPointGoalSpeedCap();
   plannerEpoch.speedCap =
     calculateSpeedCapTicksPerSec(plannerEpoch.requestedSpeedCap);
   plannerEpoch.previousSelectedTurn =
@@ -3219,8 +3268,7 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
   }
 
   if (!plannerEpoch.awaitingRevalidation) {
-    const int totalCandidates =
-      PLANNER_SPEED_SAMPLES * PLANNER_CURVATURE_SAMPLES;
+    const int totalCandidates = 2 * PLANNER_CURVATURE_SAMPLES;
     unsigned long sliceStartedUs = micros();
     uint8_t processedThisSlice = 0;
     while (plannerEpoch.candidateIndex < totalCandidates) {
@@ -3234,12 +3282,12 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         plannerEpoch.candidateIndex;
       int speedIndex = candidateIndex / PLANNER_CURVATURE_SAMPLES;
       int curvatureIndex = candidateIndex % PLANNER_CURVATURE_SAMPLES;
-      float speedScale = speedIndex == 0 ? 1.0f : PLANNER_MIN_SPEED_SCALE;
       float normalized = -1.0f +
         (2.0f * curvatureIndex) / (PLANNER_CURVATURE_SAMPLES - 1);
-      float forward = max(PLANNER_MIN_DRIVABLE_SPEED_TPS,
-                          plannerEpoch.speedCap * speedScale);
-      forward = min(forward, 3000.0f /
+      float requestedForward = speedIndex == 0
+        ? plannerEpoch.speedCap
+        : PLANNER_MIN_DRIVABLE_SPEED_TPS;
+      float forward = min(requestedForward, 3000.0f /
         (1.0f + fabs(normalized * PLANNER_MAX_TURN_RATIO)));
       float turn = forward * normalized * PLANNER_MAX_TURN_RATIO;
 
@@ -3285,33 +3333,62 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
       }
       processedThisSlice++;
 
-      float clearanceMm = -1.0f;
-      float closestGoalDistanceM = plannerEpoch.localGoalDistanceM;
-      float headingAtClosestGoalRad = plannerEpoch.startHeadingRad;
-      float finalX = plannerEpoch.startX;
-      float finalY = plannerEpoch.startY;
-      float finalHeadingRad = plannerEpoch.startHeadingRad;
-      float arrivalTimeS = -1.0f;
-      CandidateRejectReason rejectReason = CANDIDATE_REJECT_NONE;
-      if (!rolloutCandidate(plannerEpoch, forward, turn,
-                            plannerEpoch.goalX, plannerEpoch.goalY,
-                            clearanceMm, closestGoalDistanceM,
-                            headingAtClosestGoalRad, finalX, finalY,
-                            finalHeadingRad, arrivalTimeS, rejectReason)) {
-        if (rejectReason == CANDIDATE_REJECT_TURN_OBSERVABILITY) {
+      ForwardCandidateEvaluation evaluation;
+      bool rolloutAccepted = evaluateForwardCandidate(
+        plannerEpoch, forward, turn, evaluation);
+      if (!rolloutAccepted && speedIndex == 0 &&
+          evaluation.rejectReason != CANDIDATE_REJECT_TURN_OBSERVABILITY) {
+        // For a fixed turn ratio, speed changes how far the same geometric arc
+        // is traversed during the horizon. Reuse the last fully checked prefix
+        // as this curve's computed safe speed instead of selecting a separate
+        // context-specific speed tier.
+        float safePrefixSpeed = evaluation.safeTravelM * TICKS_PER_METRE /
+                                PLANNER_HORIZON_S - 1.0f;
+        if (safePrefixSpeed >= PLANNER_MIN_DRIVABLE_SPEED_TPS &&
+            safePrefixSpeed < forward - 0.5f) {
+          forward = safePrefixSpeed;
+          turn = forward * normalized * PLANNER_MAX_TURN_RATIO;
+          rolloutAccepted = evaluateForwardCandidate(
+            plannerEpoch, forward, turn, evaluation);
+        }
+      }
+      if (rolloutAccepted && speedIndex == 0 &&
+          obstacleContext.active) {
+        float clearanceConfidence = constrain(
+          evaluation.clearanceMm /
+            (PLANNER_PREFERRED_CLEARANCE_M * 1000.0f),
+          0.0f, 1.0f);
+        float evidenceConfidence = constrain(
+          1.0f - evaluation.maximumUnknownFraction, 0.0f, 1.0f);
+        float speedConfidence = recoveryBudget.forwardTakeoverPending
+          ? 0.0f
+          : min(clearanceConfidence, evidenceConfidence);
+        float confidenceSpeed = PLANNER_MIN_DRIVABLE_SPEED_TPS +
+          (forward - PLANNER_MIN_DRIVABLE_SPEED_TPS) * speedConfidence;
+        if (confidenceSpeed < forward - 0.5f) {
+          forward = confidenceSpeed;
+          turn = forward * normalized * PLANNER_MAX_TURN_RATIO;
+          rolloutAccepted = evaluateForwardCandidate(
+            plannerEpoch, forward, turn, evaluation);
+        }
+      }
+      if (!rolloutAccepted) {
+        if (evaluation.rejectReason == CANDIDATE_REJECT_TURN_OBSERVABILITY) {
           plannerEpoch.rejectedTurnObservability++;
-        } else if (rejectReason == CANDIDATE_REJECT_FORWARD_OBSERVATION) {
+        } else if (evaluation.rejectReason ==
+                   CANDIDATE_REJECT_FORWARD_OBSERVATION) {
           plannerEpoch.rejectedForwardObservation++;
-        } else if (rejectReason == CANDIDATE_REJECT_FOOTPRINT) {
+        } else if (evaluation.rejectReason == CANDIDATE_REJECT_FOOTPRINT) {
           plannerEpoch.rejectedFootprint++;
-        } else if (rejectReason == CANDIDATE_REJECT_CORRIDOR) {
+        } else if (evaluation.rejectReason == CANDIDATE_REJECT_CORRIDOR) {
           plannerEpoch.rejectedCorridor++;
         }
         continue;
       }
       float obstacleLateralProgressScore = 0.0f;
       if (!obstacleRolloutMakesRequiredLateralProgress(
-            plannerEpoch.startX, plannerEpoch.startY, finalX, finalY,
+            plannerEpoch.startX, plannerEpoch.startY,
+            evaluation.finalX, evaluation.finalY,
             plannerEpoch.goalX, plannerEpoch.goalY,
             obstacleLateralProgressScore)) {
         continue;
@@ -3328,8 +3405,10 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         forward, turn, plannerEpoch.goalX, plannerEpoch.goalY,
         plannerEpoch.startX, plannerEpoch.startY,
         plannerEpoch.previousSelectedTurn,
-        closestGoalDistanceM, headingAtClosestGoalRad,
-        finalX, finalY, finalHeadingRad, clearanceMm,
+        evaluation.closestGoalDistanceM,
+        evaluation.headingAtClosestGoalRad,
+        evaluation.finalX, evaluation.finalY,
+        evaluation.finalHeadingRad, evaluation.clearanceMm,
         plannerEpoch.lineFollowActive,
         navigationGoal.startX, navigationGoal.startY,
         plannerEpoch.routeHeadingRad, plannerEpoch.finalGoalDistanceM);
@@ -3338,26 +3417,28 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         // decisive clearance gain before resuming ordinary goal scoring.
         score += 3.0f * obstacleLateralProgressScore;
       }
-      bool reachesGoal = arrivalTimeS >= 0.0f;
+      bool reachesGoal = evaluation.arrivalTimeS >= 0.0f;
       bool betterArrival =
         plannerEpoch.finalWaypointIsLocalGoal &&
         !plannerEpoch.lineFollowActive && reachesGoal &&
         (!plannerEpoch.bestReachesGoal ||
-         arrivalTimeS < plannerEpoch.bestArrivalTimeS - 0.0001f);
+         evaluation.arrivalTimeS <
+           plannerEpoch.bestArrivalTimeS - 0.0001f);
       bool equalArrivalClass =
         !plannerEpoch.finalWaypointIsLocalGoal ||
         plannerEpoch.lineFollowActive ||
         (reachesGoal == plannerEpoch.bestReachesGoal &&
          (!reachesGoal ||
-          fabs(arrivalTimeS - plannerEpoch.bestArrivalTimeS) <= 0.0001f));
+          fabs(evaluation.arrivalTimeS -
+               plannerEpoch.bestArrivalTimeS) <= 0.0001f));
       if (betterArrival ||
           (equalArrivalClass && score > plannerEpoch.bestScore)) {
         plannerEpoch.bestScore = score;
         plannerEpoch.bestForward = forward;
         plannerEpoch.bestTurn = turn;
-        plannerEpoch.bestClearance = clearanceMm;
+        plannerEpoch.bestClearance = evaluation.clearanceMm;
         plannerEpoch.bestReachesGoal = reachesGoal;
-        plannerEpoch.bestArrivalTimeS = arrivalTimeS;
+        plannerEpoch.bestArrivalTimeS = evaluation.arrivalTimeS;
       }
     }
     recordPlannerSlice(sliceStartedUs);
@@ -3420,23 +3501,9 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
     publishForward = freshSpeedCap;
     publishTurn *= speedScale;
   }
-  float clearanceMm = -1.0f;
-  float closestGoalDistanceM = sqrtf(
-    (plannerEpoch.goalX - plannerEpoch.startX) *
-      (plannerEpoch.goalX - plannerEpoch.startX) +
-    (plannerEpoch.goalY - plannerEpoch.startY) *
-      (plannerEpoch.goalY - plannerEpoch.startY));
-  float headingAtClosestGoalRad = plannerEpoch.startHeadingRad;
-  float finalX = plannerEpoch.startX;
-  float finalY = plannerEpoch.startY;
-  float finalHeadingRad = plannerEpoch.startHeadingRad;
-  float arrivalTimeS = -1.0f;
-  CandidateRejectReason rejectReason = CANDIDATE_REJECT_NONE;
-  bool winnerStillSafe = rolloutCandidate(
-    plannerEpoch, publishForward, publishTurn,
-    plannerEpoch.goalX, plannerEpoch.goalY, clearanceMm,
-    closestGoalDistanceM, headingAtClosestGoalRad,
-    finalX, finalY, finalHeadingRad, arrivalTimeS, rejectReason);
+  ForwardCandidateEvaluation evaluation;
+  bool winnerStillSafe = evaluateForwardCandidate(
+    plannerEpoch, publishForward, publishTurn, evaluation);
   recordPlannerSlice(sliceStartedUs);
   if (!winnerStillSafe) {
     return retryPlannerEpoch(PLANNER_STOP_NO_SAFE_TRAJECTORY,
@@ -3445,7 +3512,8 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
   }
   float obstacleLateralProgressScore = 0.0f;
   if (!obstacleRolloutMakesRequiredLateralProgress(
-        plannerEpoch.startX, plannerEpoch.startY, finalX, finalY,
+        plannerEpoch.startX, plannerEpoch.startY,
+        evaluation.finalX, evaluation.finalY,
         plannerEpoch.goalX, plannerEpoch.goalY,
         obstacleLateralProgressScore)) {
     return retryPlannerEpoch(PLANNER_STOP_NO_SAFE_TRAJECTORY,
@@ -3457,7 +3525,7 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
   plannerTelemetry.selectedTurnTicksPerSec = publishTurn;
   plannerTelemetry.selectedCurvature = publishTurn /
     max(1.0f, publishForward);
-  plannerTelemetry.minimumSweptClearanceMm = clearanceMm;
+  plannerTelemetry.minimumSweptClearanceMm = evaluation.clearanceMm;
   plannerTelemetry.candidateCount = plannerEpoch.acceptedCount;
   plannerTelemetry.stopReason = PLANNER_STOP_NONE;
   plannerTelemetry.planReason = "best_safe_arc_revalidated";
