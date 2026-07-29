@@ -1,7 +1,7 @@
-#ifndef NAVIGATION_INTERNAL_H
+﻿#ifndef NAVIGATION_INTERNAL_H
 #define NAVIGATION_INTERNAL_H
 
-#include "Navigation.h"
+#include "../../Navigation.h"
 
 enum NavigationGoalMode {
   NAV_GOAL_NONE,

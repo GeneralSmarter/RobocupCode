@@ -28,7 +28,7 @@ scaffolding. Do not treat those runs as proof of rear safety or competition
 readiness.
 
 Current verification baseline: warning-enabled Teensy compile PASS, simulator
-and firmware/WASM 47/47 PASS, Python 140 PASS with one intentional skip, and
+and firmware/WASM 47/47 PASS, Python 141 PASS with one intentional skip, and
 Python `compileall` PASS.
 
 The field GOTO desktop UI is preview-only. Field clicks do not send `TEST ARM`

@@ -1,7 +1,7 @@
-#ifndef PLANNER_TYPES_H
+﻿#ifndef PLANNER_TYPES_H
 #define PLANNER_TYPES_H
 
-#include "Robot.h"
+#include "../../Robot.h"
 
 // Internal planner-only data structures. Mission and pickup code must use the
 // public navigation status/debug interfaces instead of including this file.

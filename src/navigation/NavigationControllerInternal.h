@@ -1,7 +1,7 @@
-#ifndef NAVIGATION_CONTROLLER_INTERNAL_H
+﻿#ifndef NAVIGATION_CONTROLLER_INTERNAL_H
 #define NAVIGATION_CONTROLLER_INTERNAL_H
 
-#include "Robot.h"
+#include "../../Robot.h"
 #include "NavigationInternal.h"
 
 enum SafePivotStepResult {

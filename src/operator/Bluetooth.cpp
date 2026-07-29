@@ -1,5 +1,5 @@
-#include "Robot.h"
-#include "Navigation.h"
+﻿#include "../../Robot.h"
+#include "../../Navigation.h"
 #include "../../NavigationAdmin.h"
 #include "../../NavigationTest.h"
 #include "../navigation/PlannerDebug.h"

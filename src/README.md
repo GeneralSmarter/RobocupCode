@@ -17,9 +17,10 @@ Folder ownership:
 - `operator/` owns Bluetooth commands, telemetry, and diagnostics.
 - `core/` owns shared runtime storage, helpers, and top-level scheduling.
 
-The small `Robot.h`, `Navigation.h`, and `RobotTypes.h` files inside subsystem
-folders only forward to the visible sketch-root interfaces. Arduino compiles
-`src/` recursively but resolves quoted includes from each nested folder.
+Subsystem sources include sketch-root shared and public headers with explicit
+relative paths such as `../../Robot.h` and `../../Navigation.h`. Do not add
+duplicate forwarding copies of `Robot.h`, `Navigation.h`, or `RobotTypes.h`
+under `src/`.
 
 Do not include `navigation/NavigationInternal.h` outside `navigation/`. Mission
 and future pickup mechanisms need only the root `Navigation.h`.

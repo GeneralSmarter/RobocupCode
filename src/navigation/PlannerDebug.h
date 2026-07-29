@@ -1,7 +1,7 @@
-#ifndef PLANNER_DEBUG_H
+﻿#ifndef PLANNER_DEBUG_H
 #define PLANNER_DEBUG_H
 
-#include "RobotTypes.h"
+#include "../../RobotTypes.h"
 
 struct NavigationDebugStatus {
   bool active;
