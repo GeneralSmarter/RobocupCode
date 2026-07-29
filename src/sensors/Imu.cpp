@@ -8,7 +8,7 @@
 //   robot's boot-time/zero-time orientation.
 // Interacts with:
 //   setup() calls connectIMU() and zeroYaw(). Helpers.cpp converts the raw
-//   clockwise yaw into navigationHeadingDeg(). Odometry.cpp and LocalPlanner.cpp
+//   clockwise yaw into navigationHeadingDeg(). Odometry and navigation modules
 //   consume that navigation heading.
 // Control flow:
 //   IMU connection is blocking during setup; runtime yaw reads happen through

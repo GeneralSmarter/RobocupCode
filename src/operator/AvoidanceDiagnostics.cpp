@@ -1,7 +1,7 @@
 ﻿#include "Robot.h"
 
 // =====================================================
-// Compatibility diagnostics for the local planner
+// Stationary avoidance diagnostics
 // =====================================================
 // Responsibility:
 //   Provides the stationary TEST SIDE diagnostic for comparing left/right

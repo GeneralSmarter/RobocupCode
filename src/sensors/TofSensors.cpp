@@ -8,7 +8,7 @@
 //   readings, front-block debounce, and stale/timeout handling. The physical
 //   rear matrix sensor is owned by RearObstacleSensor.cpp.
 // Interacts with:
-//   RobotCode.ino calls connectTOFSensors() during setup. LocalPlanner.cpp and
+//   RobotCode.ino calls connectTOFSensors() during setup. Navigation modules and
 //   MotorControl.cpp read rangeSensors through the accessor functions.
 //   Bluetooth.cpp prints raw fan/aggregate telemetry. ObjectDetection.cpp owns
 //   the separate VL53L1X object sensors.

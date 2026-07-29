@@ -12,7 +12,7 @@
 // Interacts with:
 //   All behavior modules read this file through Robot.h. MotorControl.cpp uses
 //   motor/PID/timing values, TofSensors.cpp and ObjectDetection.cpp use sensor
-//   configuration, LocalPlanner.cpp uses geometry/planner/recovery values,
+//   configuration, navigation modules use geometry/planner/recovery values,
 //   and Bluetooth.cpp exposes selected tuning knobs at runtime.
 // Control flow:
 //   No functions run here. static_assert checks catch configuration contracts
@@ -515,7 +515,7 @@ const float PLANNER_RECOVERY_TAKEOVER_PROGRESS_M = LOCAL_MAP_CELL_M;
 // Ultimate recovery is deliberately opt-in. It may run only after ordinary
 // recovery has exhausted an eligible resource or progress bound, and it never weakens the
 // existing footprint, sensor-freshness, authority, or motor-safety gates.
-const bool PLANNER_EMERGENCY_SCAN_ENABLED = true;
+const bool PLANNER_EMERGENCY_SCAN_ENABLED = false;
 constexpr uint8_t PLANNER_EMERGENCY_SCAN_SECTORS = 12;
 constexpr float PLANNER_EMERGENCY_SCAN_STEP_DEG = 30.0f;
 const float PLANNER_EMERGENCY_SCAN_SWEEP_STEP_DEG = 5.0f;

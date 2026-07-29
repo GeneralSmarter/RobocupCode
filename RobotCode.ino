@@ -6,7 +6,7 @@
 //   This file owns hardware startup and the top-level loop schedule only.
 // Interacts with:
 //   Robot.h for all shared objects, Bluetooth.cpp for operator commands,
-//   StateMachine.cpp for mission decisions, LocalPlanner.cpp for sensing,
+//   MissionController.cpp for mission decisions, navigation modules for sensing,
 //   odometry and navigation updates, and MotorControl.cpp for the only
 //   periodic servo output path.
 // Control flow:
@@ -20,6 +20,7 @@
 // =====================================================
 
 #include "Robot.h"
+#include "RobotController.h"
 
 // =====================================================
 // Setup
@@ -64,7 +65,7 @@ void setup() {
   robotX = 0.0;
   robotY = 0.0;
   robotTheta = 0.0;
-  initializeNavigationController();
+  initializeRobotController();
 
   Serial.println();
   Serial.println("V7 local-planner navigation ready.");
@@ -103,7 +104,7 @@ void loop() {
 
   phaseStartedUs = micros();
   if (robotRunEnabled && !isManualDriveActive()) {
-    runStateMachine();
+    updateMissionController();
   } else if (!isManualDriveActive()) {
     motorStopRequested = true;
     requestMotionStop();

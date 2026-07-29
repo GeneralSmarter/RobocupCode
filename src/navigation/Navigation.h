@@ -1,0 +1,4 @@
+#ifndef NAVIGATION_IMPLEMENTATION_FORWARDING_H
+#define NAVIGATION_IMPLEMENTATION_FORWARDING_H
+#include "../../Navigation.h"
+#endif

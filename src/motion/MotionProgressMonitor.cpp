@@ -8,11 +8,11 @@
 //   measured encoder speeds, and yaw change during turns.
 // Interacts with:
 //   MotorControl.cpp calls updateStuckDriving() for non-turn navigation, and
-//   LocalPlanner.cpp calls resetTurnStuckCheck()/updateStuckTurning() for
+//   NavigationController calls resetTurnStuckCheck()/updateStuckTurning() for
 //   direct yaw turns and point-alignment turns.
 // Control flow:
-//   This module only sets flags. LocalPlanner.cpp decides whether a stuck flag
-//   fails the active navigation goal.
+//   This module only sets flags. NavigationController decides whether a stuck
+//   flag fails the active navigation goal.
 // Global state:
 //   Modifies driveStuck, wheelMismatchStuck, turnStuck and their timers.
 

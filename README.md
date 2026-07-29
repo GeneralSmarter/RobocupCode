@@ -9,9 +9,9 @@ four forward navigation ToFs are VL53L0X sensors and build a rolling local
 confidence map plus thresholded persistent arena memory; a footprint-aware
 receding-horizon controller selects a safe
 differential-drive arc toward the active waypoint.  There is no fixed
-reverse/turn/bypass/rejoin script and no
-outer-fan wall-follow fallback.  The present fan has no rear or true side
-coverage, so invalid or blind space is never treated as clear.
+reverse/turn/bypass/rejoin script and no outer-fan wall-follow fallback. The
+four-ray front fan has no true side coverage; reverse safety uses the separate
+SEN0628 rear matrix. Invalid, stale, or blind space is never treated as clear.
 
 Read [ROBOT_CODEBASE_AUDIT.md](docs/ROBOT_CODEBASE_AUDIT.md) before planning
 new navigation or mission work. It records the full 2026-07 audit, including
@@ -27,8 +27,9 @@ obstacle testing may use `RANGE_FAKE_REAR` as explicit temporary test
 scaffolding. Do not treat those runs as proof of rear safety or competition
 readiness.
 
-Current verification baseline: Teensy compile PASS, simulator 25/25 PASS,
-Python 76/76 PASS, and Python `compileall` PASS.
+Current verification baseline: warning-enabled Teensy compile PASS, simulator
+and firmware/WASM 47/47 PASS, Python 140 PASS with one intentional skip, and
+Python `compileall` PASS.
 
 The field GOTO desktop UI is preview-only. Field clicks do not send `TEST ARM`
 or `TEST GOTO`; the SE(2) transform, status preflight, bounds preview, and
@@ -46,21 +47,34 @@ explicit confirmation flow are not yet implemented.
 - `Robot.h` - shared hardware/runtime globals and function prototypes.
 - `RobotTypes.h` - shared enums and structs.
 - `RobotConfig.h` - calibration values, pins, geometry, timing, and planner constants.
-- `Globals.cpp` - hardware objects, runtime state, and waypoint list.
-- `Encoders.cpp` - encoder interrupt handlers.
-- `StateMachine.cpp` - high-level robot states.
-- `LocalPlanner.cpp` - local confidence map, safe-arc rollout, goal control,
-  scheduled sensor/odometry/planner updates, and planner telemetry.
-- `Navigation.cpp` - route point-goal assignment.
-- `ObstacleAvoidance.cpp` - stationary fan-clearance diagnostics for `TEST SIDE`.
-- `StuckRecovery.cpp` - wheel/yaw progress detection.
-- `Odometry.cpp` - encoder/IMU pose integration.
-- `Imu.cpp` - BNO055 connection and yaw helpers.
-- `TofSensors.cpp` - SX1509 and ToF setup/read logic.
-- `MotorControl.cpp` - the single motor-output owner and wheel-speed PID.
-- `Helpers.cpp` - angle wrapping, cumulative encoder control snapshots, count
+- `Navigation.h` - the small mission-facing driving API.
+- `NavigationAdmin.h` and `NavigationTest.h` - operator/system and simulator
+  adapters kept out of normal mission code.
+- `src/core/` - shared runtime storage, helpers, and controller scheduling.
+- `src/mission/` - mission controller, the sole route owner, and weight search.
+- `src/motion/` - encoder, odometry, progress, and final motor-output code.
+- `src/sensors/` - navigation/object/rear ranging and IMU code.
+- `src/operator/` - Bluetooth commands, telemetry, and stationary diagnostics.
+- `src/navigation/Navigation.cpp` - goal/result façade and private goal
+  storage.
+- `src/navigation/NavigationController.cpp` - point/turn orchestration and final
+  authorized planner command publication.
+- `src/navigation/PlannerContext.cpp/.h` and `PlannerTypes.h` - the single static owner and
+  internal data types for mutable planning state.
+- `src/navigation/PlannerMap.cpp/.h` - rolling confidence map and persistent arena evidence.
+- `src/navigation/PlannerCollision.cpp/.h` - footprint, clearance, and turn-sweep queries.
+- `src/navigation/ObstacleContext.cpp/.h` - retained obstacle envelope and local bypass goal.
+- `src/navigation/ForwardTrajectoryPlanner.cpp/.h` - forward arc rollout, rejection, scoring,
+  speed capping, and cooperative planning epochs.
+- `src/navigation/RecoveryPlanner.cpp/.h` - evidence-driven reverse and opt-in emergency
+  scan/relocate/retry behavior.
+- `src/navigation/PlannerProgress.cpp/.h` - route-frame progress helpers.
+- `src/navigation/PlannerDebug.cpp/.h` - read-only diagnostics for Bluetooth and the simulator.
+- `src/operator/AvoidanceDiagnostics.cpp` - stationary fan-clearance diagnostics for
+  `TEST SIDE`; it is not an autonomous planner.
+- `src/motion/MotorControl.cpp` - the single motor-output owner and wheel-speed PID.
+- `src/core/Helpers.cpp` - angle wrapping, cumulative encoder control snapshots, count
   reads, and pose print.
-- `Bluetooth.cpp` - CH9143 Bluetooth serial command and telemetry link on `Serial2`.
 
 ## Control Flow
 
@@ -69,21 +83,44 @@ The active V7 firmware has one scheduled control path:
 ```text
 RobotCode.ino loop()
   -> handleBluetoothCommands()
-  -> runStateMachine()
+  -> updateMissionController()
+       -> RouteMission (owns the route, index, pauses, and actions)
+            -> WeightSearch (only while search is active)
+            -> Navigation.h public goals/results
   -> updateRobotController()
        -> updateTOFSensors()
        -> updateObjectTOFSensors()
        -> updateLocalMapFromSensors()
        -> updateOdometry()
        -> updateNavigationController()
+            -> ObstacleContext
+            -> ForwardTrajectoryPlanner or RecoveryPlanner
        -> updateMotorController()
 ```
 
-Keep `MotorControl.cpp` as the only periodic motor-output owner. New behaviours
-should request motion through navigation goals or `setAuthorizedMotionCommand()`,
-not by writing motor pulses from another module. `Bluetooth.cpp` still contains both
-command handling and telemetry formatting so command names, CSV fields, and
-test workflows stay in one visible interface file during hardware validation.
+Keep `src/motion/MotorControl.cpp` as the only periodic motor-output owner. New
+behaviours should request driving through `Navigation.h`. Only bounded diagnostic/manual
+owners should call `setAuthorizedMotionCommand()` directly; no module may write
+motor pulses outside `MotorControl.cpp`. `src/operator/Bluetooth.cpp` still contains command
+handling and telemetry formatting so command names, CSV fields, and test
+workflows stay in one visible interface file during hardware validation.
+
+Mission and future pickup code use navigation as a nonblocking black box:
+
+```cpp
+if (navigationGetStatus().state == NAVIGATION_IDLE) {
+  navigationGoTo(targetX, targetY);
+}
+
+NavigationStatus status = navigationGetStatus();
+if (status.state == NAVIGATION_REACHED) {
+  navigationClearResult();
+  // Perform the location action or submit the next goal.
+}
+```
+
+Only `RouteMission.cpp` reads the onboard route. Navigation receives one point
+at a time and cannot advance, skip, or reinterpret mission actions.
 
 ## Bluetooth CH9143 Link
 
@@ -323,11 +360,12 @@ avoidance has room to bypass and rejoin:
 - `(0.00, 0.80)` pause
 - `(0.00, 0.00)` home
 
-Waypoint actions:
+Waypoint actions are `MissionAction` enum values owned by
+`src/mission/RouteMission.cpp`:
 
-- `"PAUSE"` - run the normal short route settle.
-- `"HOME"` - mark the final home waypoint.
-- `SEARCH` - treat this waypoint as a likely weight location. The robot
+- `MISSION_ACTION_PAUSE` - run the normal short route settle.
+- `MISSION_ACTION_HOME` - mark the final home waypoint.
+- `MISSION_ACTION_SEARCH` - treat this waypoint as a likely weight location. The robot
   first drives to a nominal `250 mm` standoff before the waypoint, aligns to
   the bearing from its current pose to the waypoint, then checks centre and
   sweeps `+/-30 deg` using `WEIGHT_SEARCH_SWEEP_DEG`. It hunts at most one

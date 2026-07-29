@@ -15,15 +15,16 @@
 // Interacts with:
 //   Every RobotCode module includes this file. Globals are defined in
 //   Globals.cpp, while behavior is implemented by Bluetooth.cpp,
-//   StateMachine.cpp, LocalPlanner.cpp, MotorControl.cpp, TofSensors.cpp,
+//   MissionController.cpp, navigation modules, MotorControl.cpp, TofSensors.cpp,
 //   Odometry.cpp, Imu.cpp, Encoders.cpp, ObjectDetection.cpp, and helpers.
 // Control flow:
 //   This file does not execute code, but it exposes the contracts that let
 //   RobotCode.ino schedule the system and let modules call each other without
 //   owning each other's internals.
 // Global state:
-//   Declares motors, encoders, pose, PID state, IMU, ToF sensors, navigation
-//   goals, telemetry, motion authority, route waypoints, and timing stamps.
+//   Declares motors, encoders, pose, PID state, IMU, ToF sensors, motion
+//   authority and timing stamps. Route state lives in RouteMission.cpp and
+//   mutable navigation state stays behind internal navigation headers.
 //   Units are documented beside the owning constants/types where possible:
 //   pose in metres/degrees, ranges in millimetres, speeds in encoder ticks/s,
 //   and motor commands in servo microseconds.
@@ -186,7 +187,6 @@ extern bool returnHomeRequested;
 
 extern RobotState currentState;
 
-extern int currentWaypointIndex;
 extern bool endMatchPrinted;
 
 extern float desiredForwardSpeed;
@@ -204,21 +204,16 @@ extern const char* lastMotorOutputMode;
 extern int lastLeftMotorUs;
 extern int lastRightMotorUs;
 
-extern NavigationGoal navigationGoal;
-extern PlannerTelemetry plannerTelemetry;
 extern bool motorStopRequested;
 // Motion authority is the high-level owner (mission/test/manual). The command
 // authority records who last submitted the current desiredForward/Turn command.
 extern MotionAuthority motionAuthority;
 extern MotionAuthority motionCommandAuthority;
+extern MotionCommandMode motionCommandMode;
 extern bool escapeBacktrackEnabled;
 extern unsigned long lastSensorUpdateMs;
 extern unsigned long lastOdometryUpdateMs;
-extern unsigned long lastPlannerUpdateMs;
 extern unsigned long lastMotorControlUpdateMs;
-
-extern Waypoint path[];
-extern const int NUM_POINTS;
 
 // =====================================================
 // Function declarations
@@ -226,29 +221,8 @@ extern const int NUM_POINTS;
 void leftISR();
 void rightISR();
 
-void goToPoint(float targetX, float targetY);
-void runWaypointAction(const char* action);
-
-void initializeNavigationController();
-void updateRobotController();
-void updateNavigationController();
-void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owner);
-void startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner);
-void cancelNavigationGoal(PlannerStopReason reason, const char* detail);
-bool isNavigationGoalActive();
-bool didNavigationGoalComplete();
-bool didNavigationGoalFail();
-NavigationStatus getNavigationStatus();
-void clearNavigationGoalResult();
-const char* plannerStopReasonName(PlannerStopReason reason);
-PlannerDebugSnapshot getPlannerDebugSnapshot();
-int plannerDebugMapState(float worldX, float worldY);
-int plannerDebugSeedMapOccupied(float worldX, float worldY);
-bool setEmergencyScanPolicyEnabled(bool enabled);
-bool isEmergencyScanPolicyEnabled();
 bool isTurnDirectionObservable(float turnTicksPerSec);
 bool isTurnSweepSafe();
-void clearLocalMap();
 void updateLocalMapFromSensors();
 void markTraversedFreeSpace();
 
@@ -316,7 +290,8 @@ unsigned long maximumMainLoopPhaseUs();
 void resetMainLoopTimingDiagnostics();
 void revokeMotionAuthority();
 bool claimMotionAuthority(MotionAuthority authority);
-bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed, float turnSpeed);
+bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed,
+                                float turnSpeed, MotionCommandMode mode);
 const char* motionAuthorityName(MotionAuthority authority);
 const char* motionSafetyReasonName(MotionSafetyReason reason);
 MotionSafetyReason lastMotionSafetyReason();
@@ -341,15 +316,11 @@ bool isManualDriveActive();
 void updateManualDriveTimeout();
 void printWaitingForStart();
 
-void runStateMachine();
+void updateMissionController();
 void runInitState();
 void runFollowPathState();
 void runReturnHomeState();
-void runUnusedState(const char* stateName);
 void runEndMatchState();
-void startWeightSearchTest();
-bool isWeightSearchActive();
-void cancelWeightSearch(const char* detail);
 void setRobotState(RobotState newState);
 const char* robotStateName(RobotState state);
 void requestMotionStop();

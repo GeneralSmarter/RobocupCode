@@ -8,7 +8,7 @@
 //   encoder/PID reset snapshots, atomic encoder reads, and startup/status
 //   printing.
 // Interacts with:
-//   Odometry.cpp and LocalPlanner.cpp use wrapAngle()/navigationHeadingDeg().
+//   Odometry.cpp and the navigation modules use these heading helpers.
 //   MotorControl.cpp and Odometry.cpp depend on readEncoderCounts() snapshots.
 //   Bluetooth.cpp and RobotCode.ino use the print helpers for operator output.
 // Control flow:

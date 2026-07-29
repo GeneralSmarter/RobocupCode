@@ -8,7 +8,7 @@
 //   estimated pose in the navigation/world frame.
 // Interacts with:
 //   Helpers.cpp supplies signed encoder snapshots and IMU heading conversion.
-//   LocalPlanner.cpp reads robotX/robotY/robotTheta for map transforms and
+//   Navigation and map modules read robotX/robotY/robotTheta for transforms and
 //   trajectory rollout. Bluetooth.cpp reports the pose in STATUS/CSV.
 // Control flow:
 //   updateRobotController() calls updateOdometry() on the odometry schedule,

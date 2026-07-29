@@ -9,7 +9,7 @@
 //   Any module converting between chassis commands, wheel speeds, IMU yaw, or
 //   odometry should use these helpers or match these formulas exactly.
 // Interacts with:
-//   MotorControl.cpp mixes forward/turn into wheel targets, LocalPlanner.cpp
+//   MotorControl.cpp mixes forward/turn into wheel targets; planner modules
 //   rolls out differential-drive arcs, Odometry.cpp integrates heading, and
 //   Helpers.cpp converts raw BNO055 yaw into navigation heading.
 // Control flow:

@@ -9,9 +9,9 @@
 //   independent watchdog timer, mixes chassis velocity into wheel targets, and
 //   converts wheel-speed errors into servo microsecond pulses.
 // Interacts with:
-//   StateMachine.cpp/LocalPlanner.cpp/Bluetooth.cpp request motion through
+//   MissionController.cpp/NavigationController.cpp/Bluetooth.cpp request motion through
 //   requestMotionStop() or setAuthorizedMotionCommand(). TofSensors.cpp and
-//   LocalPlanner.cpp provide safety predicates. Encoders feed PID speed
+//   PlannerCollision.cpp provides safety predicates. Encoders feed PID speed
 //   feedback. RobotCode.ino calls serviceMotorSafetyWatchdog() and
 //   updateMotorController() every loop.
 // Control flow:
@@ -191,7 +191,9 @@ static MotionSafetyReason evaluateMotionSafety(MotionAuthority claimant,
   const bool needsReverse = forwardSpeed <= -1.0f;
   const bool needsTurnSide = fabs(turnSpeed) >= 1.0f;
   const bool plannerGenerated =
-    navigationGoal.active && navigationGoal.authority == claimant;
+    motionCommandMode == MOTION_COMMAND_NAV_DRIVE ||
+    motionCommandMode == MOTION_COMMAND_NAV_TURN ||
+    motionCommandMode == MOTION_COMMAND_NAV_SCAN_TURN;
   const bool needsTurnSweep = needsTurnSide &&
     (fabs(forwardSpeed) <= 1.0f || !plannerGenerated);
 
@@ -254,6 +256,7 @@ static void rejectUnsafeMotion(MotionSafetyReason reason) {
   desiredForwardSpeed = 0.0f;
   desiredTurnSpeed = 0.0f;
   motionCommandAuthority = MOTION_AUTHORITY_NONE;
+  motionCommandMode = MOTION_COMMAND_STANDARD;
   motorStopRequested = true;
   if (!safetyStopActive || lastSafetyReason != reason) {
     sendBluetoothEvent("motion_safety_stop", motionSafetyReasonName(reason));
@@ -294,6 +297,7 @@ void stopMotors() {
   desiredForwardSpeed = 0.0f;
   desiredTurnSpeed = 0.0f;
   motionCommandAuthority = MOTION_AUTHORITY_NONE;
+  motionCommandMode = MOTION_COMMAND_STANDARD;
   motorStopRequested = true;
   writeMotorUS(STOP_US, STOP_US);
 }
@@ -326,7 +330,8 @@ bool claimMotionAuthority(MotionAuthority authority) {
   return true;
 }
 
-bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed, float turnSpeed) {
+bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed,
+                                float turnSpeed, MotionCommandMode mode) {
   // Accepts a chassis command in encoder ticks/s only if the caller owns the
   // current motion authority and the latest safety evidence permits it.
   //
@@ -356,6 +361,7 @@ bool setAuthorizedMotionCommand(MotionAuthority authority, float forwardSpeed, f
   desiredForwardSpeed = forwardSpeed;
   desiredTurnSpeed = turnSpeed;
   motionCommandAuthority = authority;
+  motionCommandMode = mode;
   motorStopRequested = !nonNeutral;
   if (nonNeutral) {
     renewMotorCommandLease();
@@ -512,11 +518,12 @@ void updateMotorController() {
   }
   noteSafeMotion();
 
-  // Pivot turns use yaw-based progress monitoring in LocalPlanner.  Feeding
+  // Pivot turns use yaw-based progress monitoring in NavigationController.
   // their opposing wheel targets into straight-drive monitoring can leave a
   // stale drive-stuck flag for the next point goal.
-  bool navigationTurn = navigationGoal.active &&
-                        navigationGoal.mode == NAV_GOAL_TURN;
+  bool navigationTurn =
+    motionCommandMode == MOTION_COMMAND_NAV_TURN ||
+    motionCommandMode == MOTION_COMMAND_NAV_SCAN_TURN;
   if (!navigationTurn) {
     updateStuckDriving(leftTarget, rightTarget, leftSpeed, rightSpeed);
   }
@@ -524,8 +531,7 @@ void updateMotorController() {
   // Restore the proven V4 in-place turn pulse pairs for navigation turns.
   // They remain owned by this single periodic writer, so planner and safety
   // scheduling stay nonblocking and no behaviour writes a servo directly.
-  bool useCalibratedTurnPulses = navigationGoal.active &&
-                                 navigationGoal.mode == NAV_GOAL_TURN &&
+  bool useCalibratedTurnPulses = navigationTurn &&
                                  fabs(desiredForwardSpeed) < 1.0 &&
                                  fabs(desiredTurnSpeed) >= 1.0;
   if (useCalibratedTurnPulses) {
@@ -534,7 +540,7 @@ void updateMotorController() {
     bool slowTurn = fabs(desiredTurnSpeed) < PLANNER_TURN_TARGET_SPEED;
     int leftPulse;
     int rightPulse;
-    if (navigationGoal.owner == NAV_OWNER_WEIGHT_SCAN) {
+    if (motionCommandMode == MOTION_COMMAND_NAV_SCAN_TURN) {
       int offset = constrain(weightScanTurnOffsetUs,
                              WEIGHT_SCAN_TURN_OFFSET_MIN_US,
                              WEIGHT_SCAN_TURN_OFFSET_MAX_US);

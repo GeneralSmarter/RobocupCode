@@ -1,0 +1,4 @@
+#ifndef ROBOT_TYPES_NAVIGATION_FORWARDING_H
+#define ROBOT_TYPES_NAVIGATION_FORWARDING_H
+#include "../../RobotTypes.h"
+#endif

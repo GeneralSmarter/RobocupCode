@@ -8,10 +8,10 @@
 //   classification, and conversion from low-sensor endpoints to a world-frame
 //   pickup target.
 // Interacts with:
-//   TofSensors.cpp starts object pins as part of ToF setup. StateMachine.cpp
+//   TofSensors.cpp starts object pins as part of ToF setup. Mission code
 //   uses objectCandidate/objectTargetEstimate for search and hunt behavior.
 //   Bluetooth.cpp exposes TEST OBJECT, TEST HUNT TARGET, TEST HUNT, and CSV
-//   fields. LocalPlanner.cpp treats hunt targets as ordinary point goals.
+//   fields. Navigation treats hunt targets as ordinary point goals.
 // Control flow:
 //   updateObjectTOFSensors() updates one VL53L1X channel per call to avoid a
 //   long sensor burst in the main loop. refreshObjectTargetEstimate() performs

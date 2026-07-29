@@ -1,30 +1,23 @@
 #include "Robot.h"
+#include "Navigation.h"
+#include "WeightSearch.h"
 
 // =====================================================
-// Mission state machine
+// Weight-search mission component
 // =====================================================
 // Responsibility:
-//   Owns high-level mission progression: boot init, waypoint route following,
-//   return-home request handling, END_MATCH cleanup, and the object/weight
-//   search mini-state-machine.
+//   Owns the object/weight search mini-state-machine and its route interrupt.
 // Interacts with:
-//   Navigation.cpp/LocalPlanner.cpp receive goals through goToPoint(),
-//   startNavigationPoint(), and startNavigationTurn(). ObjectDetection.cpp
-//   supplies candidate/target state. Bluetooth.cpp starts tests and prints
-//   state telemetry. MotorControl.cpp remains the only motor-output owner.
+//   Navigation.h receives point and turn goals. ObjectDetection.cpp supplies
+//   candidate/target state. RouteMission.cpp owns route dispatch and consumes
+//   typed search results. Bluetooth.cpp starts tests and prints telemetry.
 // Control flow:
-//   RobotCode.ino calls runStateMachine() only when robotRunEnabled is true
-//   and manual drive is inactive. This file assigns goals and watches goal
-//   completion/failure; it never writes servo pulses directly.
+//   RouteMission.cpp calls updateWeightSearch() while a search is active. This
+//   component assigns goals and watches their results; it never writes servo
+//   pulses directly.
 // Global state:
-//   Modifies currentState, currentWaypointIndex, route pause
-//   timers, returnHomeRequested, robotRunEnabled during END_MATCH, weight
-//   search latches, and navigation goal results via LocalPlanner APIs.
-// Motion is never executed from this state machine.  It only assigns goals to
-// the incremental navigation controller and observes their results.
-
-static unsigned long waypointActionUntilMs = 0;
-static bool endMatchSafetyTransitionActive = false;
+//   Modifies only weight-search latches and navigation results through the
+//   public API. RouteMission.cpp alone decides whether to advance its index.
 
 enum WeightSearchPhase {
   WEIGHT_SEARCH_IDLE,
@@ -61,10 +54,11 @@ static float weightSearchAnchorX = 0.0;
 static float weightSearchAnchorY = 0.0;
 static WeightSearchPhase weightSearchConfirmResumePhase = WEIGHT_SEARCH_IDLE;
 static const char* weightSearchConfirmDetail = "confirm";
-
-static bool waypointActionIs(const char* action, const char* expected) {
-  return action != NULL && strcmp(action, expected) == 0;
-}
+static WeightSearchStatus weightSearchStatus = {
+  WEIGHT_SEARCH_RESULT_IDLE,
+  WEIGHT_SEARCH_ORIGIN_NONE,
+  "idle"
+};
 
 bool isWeightSearchActive() {
   return weightSearchPhase != WEIGHT_SEARCH_IDLE;
@@ -81,16 +75,52 @@ static void clearWeightSearchState() {
   weightSearchMode = WEIGHT_SEARCH_MODE_NONE;
 }
 
+void initializeWeightSearch() {
+  clearWeightSearchState();
+  weightSearchPhaseStartedMs = 0;
+  weightSearchHuntStartedMs = 0;
+  weightInterruptLastMs = 0;
+  weightSearchTurnStarted = false;
+  weightSearchStatus = {
+    WEIGHT_SEARCH_RESULT_IDLE,
+    WEIGHT_SEARCH_ORIGIN_NONE,
+    "idle"
+  };
+}
+
+WeightSearchStatus getWeightSearchStatus() {
+  if (isWeightSearchActive()) {
+    WeightSearchStatus running = weightSearchStatus;
+    running.result = WEIGHT_SEARCH_RESULT_RUNNING;
+    return running;
+  }
+  return weightSearchStatus;
+}
+
+void clearWeightSearchResult() {
+  if (!isWeightSearchActive()) {
+    weightSearchStatus = {
+      WEIGHT_SEARCH_RESULT_IDLE,
+      WEIGHT_SEARCH_ORIGIN_NONE,
+      "idle"
+    };
+  }
+}
+
 static void resumeInterruptedRoute(const char* eventName, const char* detail) {
   // Ends a route interrupt without advancing the waypoint. A short pause gives
   // the route controller a clean stopped handoff before it resumes.
   sendBluetoothEvent(eventName, detail);
+  weightSearchStatus = {
+    WEIGHT_SEARCH_RESULT_COMPLETED,
+    WEIGHT_SEARCH_ORIGIN_ROUTE_INTERRUPT,
+    detail
+  };
   clearWeightSearchState();
   weightInterruptLastMs = millis();
-  waypointActionUntilMs = millis() + WAYPOINT_ACTION_PAUSE_MS;
   motorStopRequested = true;
   requestMotionStop();
-  clearNavigationGoalResult();
+  navigationClearResult();
   sendBluetoothEvent("weight_interrupt_resume_route", detail);
 }
 
@@ -100,41 +130,44 @@ static void completeWeightSearch(const char* eventName, const char* detail) {
   // waypoint.
   sendBluetoothEvent(eventName, detail);
   WeightSearchMode completedMode = weightSearchMode;
+  WeightSearchOrigin completedOrigin = completedMode == WEIGHT_SEARCH_MODE_TEST
+    ? WEIGHT_SEARCH_ORIGIN_TEST
+    : completedMode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
+      ? WEIGHT_SEARCH_ORIGIN_WAYPOINT
+      : WEIGHT_SEARCH_ORIGIN_ROUTE_INTERRUPT;
+  weightSearchStatus = {
+    WEIGHT_SEARCH_RESULT_COMPLETED,
+    completedOrigin,
+    detail
+  };
   clearWeightSearchState();
-
-  if (completedMode == WEIGHT_SEARCH_MODE_TEST) {
-    robotRunEnabled = false;
-    motorStopRequested = true;
-    requestMotionStop();
-    clearNavigationGoalResult();
-    setRobotState(END_MATCH);
-    return;
-  }
-
   if (completedMode == WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME) {
     weightInterruptLastMs = millis();
-    waypointActionUntilMs = millis() + WAYPOINT_ACTION_PAUSE_MS;
-    motorStopRequested = true;
-    requestMotionStop();
-    clearNavigationGoalResult();
     sendBluetoothEvent("weight_interrupt_resume_route", detail);
-    return;
   }
-
-  currentWaypointIndex++;
-  waypointActionUntilMs = millis() + WAYPOINT_ACTION_PAUSE_MS;
-  clearNavigationGoalResult();
+  motorStopRequested = true;
+  requestMotionStop();
+  navigationClearResult();
 }
 
 static void failWeightSearch(const char* detail) {
   // Fail closed on object-hunt/search faults. The current implementation does
   // not try to continue the mission after a hunt failure.
   sendBluetoothEvent("weight_search_hunt_failed", detail);
+  WeightSearchOrigin failedOrigin = weightSearchMode == WEIGHT_SEARCH_MODE_TEST
+    ? WEIGHT_SEARCH_ORIGIN_TEST
+    : weightSearchMode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
+      ? WEIGHT_SEARCH_ORIGIN_WAYPOINT
+      : WEIGHT_SEARCH_ORIGIN_ROUTE_INTERRUPT;
+  weightSearchStatus = {
+    WEIGHT_SEARCH_RESULT_FAILED,
+    failedOrigin,
+    detail
+  };
   clearWeightSearchState();
   motorStopRequested = true;
   requestMotionStop();
-  clearNavigationGoalResult();
-  setRobotState(END_MATCH);
+  navigationClearResult();
 }
 
 static bool searchTargetVisible() {
@@ -154,54 +187,60 @@ static void beginSearchTargetConfirm(const char* detail,
                                      WeightSearchPhase resumePhase);
 
 static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
+                              float anchorX, float anchorY,
                               const char* detail) {
   // Starts the search scan from either the current pose or a route waypoint
   // anchor. The scan itself is built from ordinary navigation turn goals, so
   // it remains safety-supervised.
   sendBluetoothEvent("weight_search_start", detail);
   weightSearchMode = mode;
-  if (mode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT &&
-      currentWaypointIndex < NUM_POINTS) {
-    weightSearchAnchorX = path[currentWaypointIndex].x;
-    weightSearchAnchorY = path[currentWaypointIndex].y;
-  } else {
-    weightSearchAnchorX = robotX;
-    weightSearchAnchorY = robotY;
-  }
+  weightSearchStatus.origin = mode == WEIGHT_SEARCH_MODE_TEST
+    ? WEIGHT_SEARCH_ORIGIN_TEST
+    : mode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
+      ? WEIGHT_SEARCH_ORIGIN_WAYPOINT
+      : WEIGHT_SEARCH_ORIGIN_ROUTE_INTERRUPT;
+  weightSearchStatus.result = WEIGHT_SEARCH_RESULT_RUNNING;
+  weightSearchStatus.detail = detail;
+  weightSearchAnchorX = anchorX;
+  weightSearchAnchorY = anchorY;
   motorStopRequested = true;
   requestMotionStop();
   setWeightSearchPhase(alignToWaypoint ? WEIGHT_SEARCH_ALIGN_CENTER
                                         : WEIGHT_SEARCH_SETTLE_CENTER);
 }
 
-static void beginRouteWeightInterrupt(WeightSearchMode mode, const char* detail) {
+static void beginRouteWeightInterrupt(WeightSearchMode mode,
+                                      float anchorX, float anchorY,
+                                      const char* detail) {
   // Cancels the route-owned goal before beginning an opportunistic object
   // confirmation. This prevents route and hunt goals from owning motion at
   // the same time.
-  if (isNavigationGoalActive()) {
-    cancelNavigationGoal(PLANNER_STOP_ABORTED, detail);
+  if (navigationGetStatus().state == NAVIGATION_RUNNING) {
+    navigationCancel();
   }
-  clearNavigationGoalResult();
+  navigationClearResult();
   weightSearchMode = mode;
-  if (mode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT &&
-      currentWaypointIndex < NUM_POINTS) {
-    weightSearchAnchorX = path[currentWaypointIndex].x;
-    weightSearchAnchorY = path[currentWaypointIndex].y;
-  } else {
-    weightSearchAnchorX = robotX;
-    weightSearchAnchorY = robotY;
-  }
+  weightSearchStatus.origin = mode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
+    ? WEIGHT_SEARCH_ORIGIN_WAYPOINT
+    : WEIGHT_SEARCH_ORIGIN_ROUTE_INTERRUPT;
+  weightSearchStatus.result = WEIGHT_SEARCH_RESULT_RUNNING;
+  weightSearchStatus.detail = detail;
+  weightSearchAnchorX = anchorX;
+  weightSearchAnchorY = anchorY;
   sendBluetoothEvent("weight_interrupt_start", detail);
   beginSearchTargetConfirm(detail, WEIGHT_SEARCH_IDLE);
 }
 
 static void lockSearchTarget(const char* detail) {
   // Converts the current confirmed object target into a normal point goal.
-  // LocalPlanner.cpp handles the pickup carry-through behavior for object
-  // hunt owners.
+  // The navigation controller handles pickup carry-through for object-hunt
+  // owners.
   sendBluetoothEvent("weight_search_target_locked", detail);
-  startNavigationPoint(objectTargetEstimate.worldX, objectTargetEstimate.worldY,
-                       NAV_OWNER_OBJECT_HUNT);
+  if (!navigationGoToPickup(objectTargetEstimate.worldX,
+                            objectTargetEstimate.worldY)) {
+    failWeightSearch("hunt_goal_rejected");
+    return;
+  }
   weightSearchHuntStartedMs = millis();
   setWeightSearchPhase(WEIGHT_SEARCH_HUNTING);
 }
@@ -230,7 +269,11 @@ static void beginSearchTargetConfirm(const char* detail,
                                    -WEIGHT_SEARCH_CONFIRM_TURN_MAX_DEG,
                                    WEIGHT_SEARCH_CONFIRM_TURN_MAX_DEG);
   sendBluetoothEvent("weight_search_confirm_turn", detail);
-  startNavigationTurn(confirmTurnDeg, NAV_OWNER_WEIGHT_SCAN);
+  if (!navigationScanTurnBy(confirmTurnDeg)) {
+    completeWeightSearch("weight_search_scan_skipped",
+                         "confirm_turn_rejected");
+    return;
+  }
   weightSearchTurnStarted = true;
   setWeightSearchPhase(WEIGHT_SEARCH_CONFIRM_TURN);
 }
@@ -248,23 +291,23 @@ static bool checkSearchTargetWindow(const char* detail,
 void startWeightSearchTest() {
   // Bluetooth TEST SEARCH entry point. It uses the same phase machine as route
   // searches but finishes by stopping in END_MATCH.
-  clearNavigationGoalResult();
-  beginWeightSearch(WEIGHT_SEARCH_MODE_TEST, false, "test_search");
+  navigationClearResult();
+  beginWeightSearch(WEIGHT_SEARCH_MODE_TEST, false, robotX, robotY,
+                    "test_search");
 }
 
 void cancelWeightSearch(const char* detail) {
   // Cancels any scan/hunt-owned navigation goal and returns the mission layer
   // to a stopped, non-searching state.
-  NavigationStatus navigation = getNavigationStatus();
-  if (navigation.active &&
-      (navigation.owner == NAV_OWNER_WEIGHT_SCAN ||
-       navigation.owner == NAV_OWNER_OBJECT_HUNT)) {
-    cancelNavigationGoal(PLANNER_STOP_ABORTED, detail);
+  if (navigationGetStatus().state == NAVIGATION_RUNNING) {
+    navigationCancel();
   }
+  weightSearchStatus.result = WEIGHT_SEARCH_RESULT_FAILED;
+  weightSearchStatus.detail = detail;
   clearWeightSearchState();
   motorStopRequested = true;
   requestMotionStop();
-  clearNavigationGoalResult();
+  navigationClearResult();
   sendBluetoothEvent("weight_search_hunt_failed", detail);
 }
 
@@ -273,22 +316,27 @@ static bool updateWeightSearchTurn(float relativeTurnDeg, WeightSearchPhase next
   // to report completion/failure. This is the nonblocking replacement for a
   // delay-based scan.
   if (!weightSearchTurnStarted) {
-    startNavigationTurn(relativeTurnDeg, NAV_OWNER_WEIGHT_SCAN);
+    if (!navigationScanTurnBy(relativeTurnDeg)) {
+      completeWeightSearch("weight_search_scan_skipped",
+                           "scan_turn_rejected");
+      return false;
+    }
     weightSearchTurnStarted = true;
     return false;
   }
 
-  if (isNavigationGoalActive()) {
+  NavigationStatus navigation = navigationGetStatus();
+  if (navigation.state == NAVIGATION_RUNNING) {
     return false;
   }
 
-  if (didNavigationGoalComplete()) {
-    clearNavigationGoalResult();
+  if (navigation.state == NAVIGATION_REACHED) {
+    navigationClearResult();
     setWeightSearchPhase(nextPhase);
     return true;
   }
 
-  if (didNavigationGoalFail()) {
+  if (navigation.state == NAVIGATION_FAILED) {
     completeWeightSearch("weight_search_scan_skipped", "scan_turn_failed");
   }
   return false;
@@ -297,13 +345,8 @@ static bool updateWeightSearchTurn(float relativeTurnDeg, WeightSearchPhase next
 static void updateWeightSearchAlignment() {
   // Aligns the robot to face the SEARCH waypoint before the centre/left/right
   // scan windows. All angles are navigation degrees, positive CCW/left.
-  if (currentWaypointIndex >= NUM_POINTS) {
-    completeWeightSearch("weight_search_align_failed", "no_search_waypoint");
-    return;
-  }
-
-  float dx = path[currentWaypointIndex].x - robotX;
-  float dy = path[currentWaypointIndex].y - robotY;
+  float dx = weightSearchAnchorX - robotX;
+  float dy = weightSearchAnchorY - robotY;
   if (sqrtf(dx * dx + dy * dy) <= 0.001f) {
     setWeightSearchPhase(WEIGHT_SEARCH_SETTLE_CENTER);
     return;
@@ -318,36 +361,36 @@ static void updateWeightSearchAlignment() {
 
   if (!weightSearchTurnStarted) {
     sendBluetoothEvent("weight_search_align_start", "standoff");
-    startNavigationTurn(relativeTurnDeg, NAV_OWNER_WEIGHT_SCAN);
+    if (!navigationScanTurnBy(relativeTurnDeg)) {
+      completeWeightSearch("weight_search_align_failed",
+                           "align_turn_rejected");
+      return;
+    }
     weightSearchTurnStarted = true;
     return;
   }
 
-  if (isNavigationGoalActive()) {
+  NavigationStatus navigation = navigationGetStatus();
+  if (navigation.state == NAVIGATION_RUNNING) {
     return;
   }
 
-  if (didNavigationGoalComplete()) {
-    clearNavigationGoalResult();
+  if (navigation.state == NAVIGATION_REACHED) {
+    navigationClearResult();
     setWeightSearchPhase(WEIGHT_SEARCH_SETTLE_CENTER);
     return;
   }
 
-  if (didNavigationGoalFail()) {
-    clearNavigationGoalResult();
+  if (navigation.state == NAVIGATION_FAILED) {
+    navigationClearResult();
     completeWeightSearch("weight_search_align_failed", "align_turn_failed");
   }
 }
 
-static void updateWeightSearch() {
+void updateWeightSearch() {
   // Runs one tick of the weight-search phase machine. Settle phases command
   // neutral and wait for fresh object readings; turn phases delegate to
-  // LocalPlanner.cpp; hunt phase delegates to a point goal.
-  if (currentWaypointIndex >= NUM_POINTS) {
-    clearWeightSearchState();
-    return;
-  }
-
+  // the navigation API; hunt phase delegates to a point goal.
   switch (weightSearchPhase) {
     case WEIGHT_SEARCH_ALIGN_CENTER:
       updateWeightSearchAlignment();
@@ -417,16 +460,16 @@ static void updateWeightSearch() {
       break;
 
     case WEIGHT_SEARCH_CONFIRM_TURN:
-      if (isNavigationGoalActive()) {
+      if (navigationGetStatus().state == NAVIGATION_RUNNING) {
         break;
       }
-      if (didNavigationGoalComplete()) {
-        clearNavigationGoalResult();
+      if (navigationGetStatus().state == NAVIGATION_REACHED) {
+        navigationClearResult();
         setWeightSearchPhase(WEIGHT_SEARCH_SETTLE_CONFIRM);
         break;
       }
-      if (didNavigationGoalFail()) {
-        clearNavigationGoalResult();
+      if (navigationGetStatus().state == NAVIGATION_FAILED) {
+        navigationClearResult();
         if (weightSearchConfirmResumePhase == WEIGHT_SEARCH_IDLE) {
           if (weightSearchMode == WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME) {
             resumeInterruptedRoute("weight_interrupt_confirm_lost", "confirm_turn_failed");
@@ -473,19 +516,20 @@ static void updateWeightSearch() {
       float dy = robotY - weightSearchAnchorY;
       float deviationM = sqrtf(dx * dx + dy * dy);
       if (deviationM > WEIGHT_SEARCH_MAX_ROUTE_DEVIATION_M) {
-        cancelNavigationGoal(PLANNER_STOP_ABORTED, "weight_search_max_deviation");
+        navigationCancel();
         failWeightSearch("max_route_deviation");
         break;
       }
       if (millis() - weightSearchHuntStartedMs > WEIGHT_SEARCH_HUNT_TIMEOUT_MS) {
-        cancelNavigationGoal(PLANNER_STOP_ABORTED, "weight_search_hunt_timeout");
+        navigationCancel();
         failWeightSearch("hunt_timeout");
         break;
       }
-      if (isNavigationGoalActive()) {
+      NavigationStatus navigation = navigationGetStatus();
+      if (navigation.state == NAVIGATION_RUNNING) {
         break;
       }
-      if (didNavigationGoalComplete()) {
+      if (navigation.state == NAVIGATION_REACHED) {
         completeWeightSearch(
           weightSearchMode == WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME
             ? "weight_interrupt_hunt_success"
@@ -493,7 +537,7 @@ static void updateWeightSearch() {
           "object_hunt_complete");
         break;
       }
-      if (didNavigationGoalFail()) {
+      if (navigation.state == NAVIGATION_FAILED) {
         failWeightSearch("object_hunt_failed");
       }
       break;
@@ -505,16 +549,13 @@ static void updateWeightSearch() {
   }
 }
 
-static bool assignSearchWaypointStandoffOrStartSearch() {
+bool startSearchWaypointApproach(float searchX, float searchY,
+                                 float approachOriginX,
+                                 float approachOriginY,
+                                 const char* detail) {
   // SEARCH waypoints are approached from a short standoff distance. This gives
   // the object sensors space to observe the target before the hunt goal is
   // created.
-  if (currentWaypointIndex >= NUM_POINTS) {
-    return false;
-  }
-
-  float searchX = path[currentWaypointIndex].x;
-  float searchY = path[currentWaypointIndex].y;
   float robotToSearchX = searchX - robotX;
   float robotToSearchY = searchY - robotY;
   float robotToSearchM = sqrtf(robotToSearchX * robotToSearchX +
@@ -522,19 +563,17 @@ static bool assignSearchWaypointStandoffOrStartSearch() {
   if (robotToSearchM <= WEIGHT_SEARCH_STANDOFF_M) {
     sendBluetoothEvent("weight_search_standoff_start", "inside_standoff");
     beginWeightSearch(WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT, true,
-                      path[currentWaypointIndex].action);
+                      searchX, searchY, detail);
     return true;
   }
 
-  float originX = currentWaypointIndex > 0 ? path[currentWaypointIndex - 1].x : robotX;
-  float originY = currentWaypointIndex > 0 ? path[currentWaypointIndex - 1].y : robotY;
-  float approachX = searchX - originX;
-  float approachY = searchY - originY;
+  float approachX = searchX - approachOriginX;
+  float approachY = searchY - approachOriginY;
   float approachM = sqrtf(approachX * approachX + approachY * approachY);
   if (approachM <= WEIGHT_SEARCH_STANDOFF_M) {
     sendBluetoothEvent("weight_search_standoff_start", "short_segment");
     beginWeightSearch(WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT, true,
-                      path[currentWaypointIndex].action);
+                      searchX, searchY, detail);
     return true;
   }
 
@@ -543,246 +582,32 @@ static bool assignSearchWaypointStandoffOrStartSearch() {
   float standoffX = searchX - unitX * WEIGHT_SEARCH_STANDOFF_M;
   float standoffY = searchY - unitY * WEIGHT_SEARCH_STANDOFF_M;
   sendBluetoothEvent("weight_search_standoff_start", "route_standoff");
-  startNavigationPoint(standoffX, standoffY, NAV_OWNER_ROUTE);
-  return true;
+  return navigationGoTo(standoffX, standoffY);
 }
 
-static bool tryStartRouteWeightInterrupt() {
+bool tryStartRouteWeightInterrupt(float routeTargetX, float routeTargetY,
+                                  bool currentActionIsSearch) {
   // Opportunistic route interrupt: if a confirmed object appears during a
   // route-owned navigation goal, pause the route and handle one target.
-  NavigationStatus navigation = getNavigationStatus();
+  NavigationStatus navigation = navigationGetStatus();
   if (weightInterruptCooldownActive() ||
-      currentWaypointIndex >= NUM_POINTS ||
-      !navigation.active ||
-      navigation.owner != NAV_OWNER_ROUTE ||
+      navigation.state != NAVIGATION_RUNNING ||
       !searchTargetVisible()) {
     return false;
   }
 
-  WeightSearchMode mode = waypointActionIs(path[currentWaypointIndex].action, "SEARCH")
+  WeightSearchMode mode = currentActionIsSearch
     ? WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
     : WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME;
-  beginRouteWeightInterrupt(mode,
+  beginRouteWeightInterrupt(mode, routeTargetX, routeTargetY,
                             mode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
                               ? "search_waypoint_interrupt"
                               : "route_interrupt");
   return true;
 }
 
-void runStateMachine() {
-  // Dispatches the high-level robot state. Obstacle/recovery labels are kept
-  // for telemetry compatibility but no longer run separate scripted routines.
-  switch (currentState) {
-    case INIT:
-      runInitState();
-      break;
-    case FOLLOW_PATH:
-      runFollowPathState();
-      break;
-    case RETURN_HOME:
-      runReturnHomeState();
-      break;
-    case END_MATCH:
-      runEndMatchState();
-      break;
-    case OBSTACLE_AVOID:
-    case STUCK_RECOVERY:
-      // These labels are retained for telemetry compatibility.  Local
-      // planning now absorbs avoidance and recovery without nested routines.
-      setRobotState(FOLLOW_PATH);
-      break;
-    default:
-      runUnusedState(robotStateName(currentState));
-      break;
-  }
-}
-
-void runInitState() {
-  // Resets mission-owned latches and assigns the first active state. It does
-  // not reset yaw/pose; ZERO owns coordinate reset explicitly.
-  requestMotionStop();
-  motorStopRequested = true;
-  currentWaypointIndex = 0;
-  waypointActionUntilMs = 0;
-  clearWeightSearchState();
-  weightInterruptLastMs = 0;
-  endMatchPrinted = false;
-  clearNavigationGoalResult();
-  clearLocalMap();
-
-  Serial.println();
-  Serial.println("INIT complete. Starting FOLLOW_PATH.");
-  setRobotState(FOLLOW_PATH);
-}
-
-void runFollowPathState() {
-  // The mission layer advances waypoint indices only. It never makes a motor
-  // decision and therefore cannot fight the local planner underneath it.
-  if (returnHomeRequested) {
-    setRobotState(RETURN_HOME);
-    return;
-  }
-
-  if (isWeightSearchActive()) {
-    updateWeightSearch();
-    return;
-  }
-
-  // Test goals own the same controller without advancing the route.
-  NavigationStatus navigation = getNavigationStatus();
-  if (navigation.active && navigation.owner != NAV_OWNER_ROUTE) {
-    return;
-  }
-
-  if (tryStartRouteWeightInterrupt()) {
-    return;
-  }
-
-  if (didNavigationGoalFail()) {
-    // Keep the robot in a visible, re-plannable safe stop.  Do not quietly
-    // advance the route or replay a fixed recovery routine.
-    return;
-  }
-
-  if (didNavigationGoalComplete()) {
-    navigation = getNavigationStatus();
-    if (navigation.owner == NAV_OWNER_ROUTE) {
-      const char* action = path[currentWaypointIndex].action;
-      if (waypointActionIs(action, "SEARCH")) {
-        clearNavigationGoalResult();
-        beginWeightSearch(WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT, true, action);
-        return;
-      }
-      runWaypointAction(action);
-      currentWaypointIndex++;
-      waypointActionUntilMs = millis() + WAYPOINT_ACTION_PAUSE_MS;
-    }
-    clearNavigationGoalResult();
-  }
-
-  if (currentWaypointIndex >= NUM_POINTS) {
-    setRobotState(END_MATCH);
-    return;
-  }
-
-  if (waypointActionUntilMs != 0) {
-    if (millis() < waypointActionUntilMs) {
-      motorStopRequested = true;
-      requestMotionStop();
-      return;
-    }
-    waypointActionUntilMs = 0;
-  }
-
-  if (!isNavigationGoalActive()) {
-    Serial.print("Waypoint ");
-    Serial.print(currentWaypointIndex + 1);
-    Serial.print(" of ");
-    Serial.println(NUM_POINTS);
-    if (waypointActionIs(path[currentWaypointIndex].action, "SEARCH")) {
-      assignSearchWaypointStandoffOrStartSearch();
-    } else {
-      goToPoint(path[currentWaypointIndex].x, path[currentWaypointIndex].y);
-    }
-  }
-}
-
-void runReturnHomeState() {
-  // Assigns a single local-planner point goal at world origin and waits for
-  // completion. Failure currently leaves the result visible rather than
-  // attempting an unproven recovery.
-  if (!isNavigationGoalActive() && !didNavigationGoalComplete() && !didNavigationGoalFail()) {
-    Serial.println("RETURN_HOME: assigning local navigation goal x=0.000 y=0.000");
-    startNavigationPoint(0.0, 0.0, NAV_OWNER_RETURN_HOME);
-    return;
-  }
-
-  if (didNavigationGoalComplete()) {
-    Serial.println("RETURN_HOME complete.");
-    clearNavigationGoalResult();
-    setRobotState(END_MATCH);
-  }
-}
-
-void runUnusedState(const char* stateName) {
-  // Placeholder states fail safe. They are named in RobotState but not yet
-  // implemented as a scoring mission.
-  motorStopRequested = true;
-  requestMotionStop();
-  Serial.print(stateName);
-  Serial.println(" is not implemented. Entering safe stop.");
-  setRobotState(END_MATCH);
-}
-
-void runEndMatchState() {
-  // END_MATCH is the normal stopped terminal state. It keeps requesting
-  // neutral and disables robotRunEnabled so loop() cannot keep advancing
-  // autonomous logic.
-  motorStopRequested = true;
-  requestMotionStop();
-  robotRunEnabled = false;
-
-  if (!endMatchPrinted) {
-    Serial.println();
-    Serial.println("END_MATCH. Robot stopped.");
-    printPose();
-    printWaitingForStart();
-    endMatchPrinted = true;
-  }
-}
-
-static void enforceEndMatchMotionSafety() {
-  if (endMatchSafetyTransitionActive) {
-    stopMotors();
-    return;
-  }
-
-  endMatchSafetyTransitionActive = true;
-  // Revoke first so cleanup cannot allow an old goal to republish a command.
-  revokeMotionAuthority();
-  disarmBluetoothMotionModes();
-  if (isNavigationGoalActive()) {
-    cancelNavigationGoal(PLANNER_STOP_ABORTED, "end_match");
-  }
-  if (isWeightSearchActive()) {
-    cancelWeightSearch("end_match");
-  }
-  robotRunEnabled = false;
-  stopMotors();
-  endMatchSafetyTransitionActive = false;
-}
-
-void setRobotState(RobotState newState) {
-  // Central state transition helper. Entering END_MATCH first revokes motion
-  // authority and cancels goals so no old owner can publish a command during
-  // cleanup.
-  if (newState == END_MATCH) {
-    enforceEndMatchMotionSafety();
-  }
-  if (currentState != newState) {
-    Serial.print("STATE: ");
-    Serial.print(robotStateName(currentState));
-    Serial.print(" -> ");
-    Serial.println(robotStateName(newState));
-  }
-  currentState = newState;
-}
-
-const char* robotStateName(RobotState state) {
-  switch (state) {
-    case INIT: return "INIT";
-    case FOLLOW_PATH: return "FOLLOW_PATH";
-    case APPROACH_OBJECT: return "APPROACH_OBJECT";
-    case COLLECT_SORT: return "COLLECT_SORT";
-    case RETURN_HOME: return "RETURN_HOME";
-    case UNLOAD: return "UNLOAD";
-    case OBSTACLE_AVOID: return "OBSTACLE_AVOID";
-    case STUCK_RECOVERY: return "STUCK_RECOVERY";
-    case END_MATCH: return "END_MATCH";
-  }
-  return "UNKNOWN";
-}
-
-void requestMotionStop() {
-  stopMotors();
+void beginWaypointWeightSearch(float searchX, float searchY,
+                               const char* detail) {
+  beginWeightSearch(WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT, true,
+                    searchX, searchY, detail);
 }

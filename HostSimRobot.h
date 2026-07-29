@@ -67,8 +67,6 @@ extern bool escapeBacktrackEnabled;
 extern bool motorStopRequested;
 extern bool robotRunEnabled;
 extern RobotState currentState;
-extern NavigationGoal navigationGoal;
-extern PlannerTelemetry plannerTelemetry;
 extern MotionAuthority motionAuthority;
 extern MotionAuthority motionCommandAuthority;
 extern RangeSensorState rangeSensors[RANGE_SENSOR_COUNT];
@@ -76,7 +74,6 @@ extern ObjectCandidateState objectCandidate;
 extern ObjectTargetEstimate objectTargetEstimate;
 extern unsigned long lastSensorUpdateMs;
 extern unsigned long lastOdometryUpdateMs;
-extern unsigned long lastPlannerUpdateMs;
 extern unsigned long lastMotorControlUpdateMs;
 
 float navigationHeadingDeg();
@@ -87,23 +84,23 @@ void updateStuckTurning(float currentYaw);
 void updateOdometry();
 void updateTOFSensors();
 void updateMotorController();
+void updateLocalMapFromSensors();
+void markTraversedFreeSpace();
 void stopMotors();
-NavigationStatus getNavigationStatus();
-PlannerDebugSnapshot getPlannerDebugSnapshot();
-int plannerDebugMapState(float worldX, float worldY);
-int plannerDebugSeedMapOccupied(float worldX, float worldY);
 void sendBluetoothTelemetry();
 void sendBluetoothEvent(const char* eventName, const char* eventDetail);
 void setRobotState(RobotState newState);
 void requestMotionStop();
 bool setAuthorizedMotionCommand(MotionAuthority authority,
                                 float forwardSpeed,
-                                float turnSpeed);
+                                float turnSpeed,
+                                MotionCommandMode mode);
 bool isMotorCommandLeaseArmed();
 MotionSafetyReason lastMotionSafetyReason();
 const char* motionSafetyReasonName(MotionSafetyReason reason);
 void recordMainLoopPhaseDuration(const char* phase, unsigned long startedUs);
 bool isRangeSensorValid(RangeSensorId id);
+bool isRangeSensorCurrent(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 bool hasTrustedRearCoverage();
 uint16_t getRangeSensorDistance(RangeSensorId id);

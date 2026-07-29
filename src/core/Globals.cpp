@@ -11,9 +11,9 @@
 //   All modules read or update some of this state. The main ownership pattern
 //   is: Encoders.cpp owns raw counts, TofSensors.cpp owns rangeSensors and
 //   legacy ToF globals, ObjectDetection.cpp owns object candidate state,
-//   Odometry.cpp owns robotX/robotY/robotTheta updates, LocalPlanner.cpp owns
+//   Odometry.cpp owns robotX/robotY/robotTheta updates; Navigation owns
 //   navigationGoal/plannerTelemetry, MotorControl.cpp owns desired command and
-//   motor authority/output diagnostics, and StateMachine.cpp owns mission
+//   motor authority/output diagnostics, and RouteMission.cpp owns route
 //   state/waypoint progress.
 // Control flow:
 //   No functions run here. Initial values define the boot-time safe state:
@@ -161,7 +161,6 @@ RobotSerialClass robotSerial;
 
 RobotState currentState = INIT;
 
-int currentWaypointIndex = 0;
 bool endMatchPrinted = false;
 
 float desiredForwardSpeed = 0.0;
@@ -173,24 +172,6 @@ float lastMeasuredRightWheelSpeed = 0.0;
 float lastImuClockwiseYawDeg = 0.0;
 float lastNavigationHeadingDeg = 0.0;
 const char* lastMotorOutputMode = "neutral";
-
-NavigationGoal navigationGoal = {
-  // Idle goal. startNavigationPoint() and startNavigationTurn() fill every
-  // field when a mission/test command claims motion authority.
-  NAV_GOAL_NONE,
-  NAV_OWNER_ROUTE,
-  MOTION_AUTHORITY_NONE,
-  false,
-  false,
-  false,
-  0.0,
-  0.0,
-  0.0,
-  0.0,
-  0.0,
-  0.0,
-  0
-};
 
 PlannerTelemetry plannerTelemetry = {
   // Safe neutral telemetry defaults. String pointers are static literals used
@@ -234,6 +215,7 @@ PlannerTelemetry plannerTelemetry = {
 bool motorStopRequested = true;
 MotionAuthority motionAuthority = MOTION_AUTHORITY_NONE;
 MotionAuthority motionCommandAuthority = MOTION_AUTHORITY_NONE;
+MotionCommandMode motionCommandMode = MOTION_COMMAND_STANDARD;
 unsigned long lastSensorUpdateMs = 0;
 unsigned long lastOdometryUpdateMs = 0;
 unsigned long lastPlannerUpdateMs = 0;
@@ -242,13 +224,3 @@ unsigned long lastMotorControlUpdateMs = 0;
 int lastLeftMotorUs = STOP_US;
 int lastRightMotorUs = STOP_US;
 
-Waypoint path[] = {
-  // Default calibration route in world metres. StateMachine.cpp assigns these
-  // one at a time; LocalPlanner.cpp decides the safe short arcs between them.
-  {1.20, 0.00, "PAUSE"},
-  {1.20, 0.80, "PAUSE"},
-  {0.00, 0.80, "PAUSE"},
-  {0.00, 0.00, "HOME"}
-};
-
-extern const int NUM_POINTS = sizeof(path) / sizeof(path[0]);

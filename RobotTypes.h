@@ -10,7 +10,7 @@
 //   and simple geometry records.
 // Interacts with:
 //   Included through Robot.h by all modules. Bluetooth.cpp prints many of
-//   these fields, LocalPlanner.cpp consumes navigation and planner structs,
+//   these fields, navigation modules consume navigation and planner structs,
 //   TofSensors.cpp fills RangeSensorState, ObjectDetection.cpp fills object
 //   structs, and MotorControl.cpp enforces MotionAuthority.
 // Control flow:
@@ -151,40 +151,13 @@ struct AvoidSideClearance {
   float scoreMm;
 };
 
-// The active mission currently uses INIT, FOLLOW_PATH, RETURN_HOME and
-// END_MATCH. Other labels are retained so telemetry keeps a stable schema
-// while future mission phases are built.
+// Keep the historical numeric values used by saved telemetry while exposing
+// only states with implemented entry, exit, and failure behavior.
 enum RobotState {
-  INIT,
-  FOLLOW_PATH,
-  APPROACH_OBJECT,
-  COLLECT_SORT,
-  RETURN_HOME,
-  UNLOAD,
-  OBSTACLE_AVOID,
-  STUCK_RECOVERY,
-  END_MATCH
-};
-
-enum NavigationGoalMode {
-  NAV_GOAL_NONE,
-  NAV_GOAL_POINT,
-  NAV_GOAL_TURN
-};
-
-// Owner identifies why a goal exists. It affects completion events,
-// test-vs-route cleanup, and special object-hunt finish behavior.
-enum NavigationGoalOwner {
-  NAV_OWNER_ROUTE,
-  NAV_OWNER_RETURN_HOME,
-  NAV_OWNER_TEST_DRIVE,
-  NAV_OWNER_TEST_GOTO,
-  NAV_OWNER_TEST_AVOID,
-  NAV_OWNER_TEST_ESCAPE,
-  NAV_OWNER_TEST_TURN,
-  NAV_OWNER_TEST_HUNT,
-  NAV_OWNER_WEIGHT_SCAN,
-  NAV_OWNER_OBJECT_HUNT
+  INIT = 0,
+  FOLLOW_PATH = 1,
+  RETURN_HOME = 4,
+  END_MATCH = 8
 };
 
 // Exactly one of these may own motion at a time. MotorControl.cpp enforces it
@@ -194,6 +167,16 @@ enum MotionAuthority {
   MOTION_AUTHORITY_MISSION,
   MOTION_AUTHORITY_TEST,
   MOTION_AUTHORITY_MANUAL
+};
+
+// Tells the final motor writer how to realise an accepted chassis command.
+// Navigation selects this explicitly so motor control never reads private
+// navigation-goal state.
+enum MotionCommandMode {
+  MOTION_COMMAND_STANDARD,
+  MOTION_COMMAND_NAV_DRIVE,
+  MOTION_COMMAND_NAV_TURN,
+  MOTION_COMMAND_NAV_SCAN_TURN
 };
 
 constexpr bool motionAuthorityAllows(MotionAuthority active,
@@ -212,51 +195,32 @@ static_assert(!motionAuthorityAllows(MOTION_AUTHORITY_MISSION,
               "Mismatched motion authorities must be rejected");
 
 enum PlannerStopReason {
-  PLANNER_STOP_NONE,
-  PLANNER_STOP_FRONT_BLOCKED,
-  PLANNER_STOP_FRONT_INVALID,
-  PLANNER_STOP_NO_SAFE_TRAJECTORY,
-  PLANNER_STOP_TURN_SIDE_INVALID,
-  PLANNER_STOP_TURN_CLEARANCE,
-  PLANNER_STOP_STUCK,
-  PLANNER_STOP_RECOVERY_DIVERGENCE,
-  PLANNER_STOP_RECOVERY_DISPLACEMENT,
-  PLANNER_STOP_RECOVERY_TIME,
-  PLANNER_STOP_RECOVERY_DISTANCE,
-  PLANNER_STOP_RECOVERY_REPEATED,
-  PLANNER_STOP_RECOVERY_NO_PROGRESS,
-  PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME,
-  PLANNER_STOP_EMERGENCY_SCAN_ABORTED,
-  PLANNER_STOP_EMERGENCY_RETRY_EXHAUSTED,
-  PLANNER_STOP_ABORTED
+  PLANNER_STOP_NONE = 0,
+  PLANNER_STOP_FRONT_BLOCKED = 1,
+  PLANNER_STOP_FRONT_INVALID = 2,
+  PLANNER_STOP_NO_SAFE_TRAJECTORY = 3,
+  PLANNER_STOP_TURN_SIDE_INVALID = 4,
+  PLANNER_STOP_TURN_CLEARANCE = 5,
+  PLANNER_STOP_STUCK = 6,
+  PLANNER_STOP_RECOVERY_TIME = 9,
+  PLANNER_STOP_RECOVERY_DISTANCE = 10,
+  PLANNER_STOP_RECOVERY_REPEATED = 11,
+  PLANNER_STOP_RECOVERY_NO_PROGRESS = 12,
+  PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME = 13,
+  PLANNER_STOP_EMERGENCY_SCAN_ABORTED = 14,
+  PLANNER_STOP_EMERGENCY_RETRY_EXHAUSTED = 15,
+  PLANNER_STOP_ABORTED = 16
 };
 
-struct NavigationGoal {
-  // Active goal in world metres/degrees. For NAV_GOAL_POINT, targetX/Y are the
-  // desired waypoint. For NAV_GOAL_TURN, targetYawDeg is an absolute
-  // navigation-frame heading, positive CCW/left.
-  NavigationGoalMode mode;
-  NavigationGoalOwner owner;
-  MotionAuthority authority;
-  bool active;
-  bool completed;
-  bool failed;
-  float targetX;
-  float targetY;
-  float targetYawDeg;
-  float startX;
-  float startY;
-  float startYawDeg;
-  unsigned long startedMs;
+enum NavigationRunState {
+  NAVIGATION_IDLE,
+  NAVIGATION_RUNNING,
+  NAVIGATION_REACHED,
+  NAVIGATION_FAILED
 };
 
 struct NavigationStatus {
-  bool active;
-  bool completed;
-  bool failed;
-  NavigationGoalMode mode;
-  NavigationGoalOwner owner;
-  MotionAuthority authority;
+  NavigationRunState state;
   PlannerStopReason stopReason;
   const char* detail;
 };
@@ -318,12 +282,17 @@ struct PlannerTelemetry {
   bool plannerEpochActive;
 };
 
+enum MissionAction {
+  MISSION_ACTION_PAUSE,
+  MISSION_ACTION_SEARCH,
+  MISSION_ACTION_HOME
+};
+
 struct Waypoint {
-  // Default route point in world metres plus an action string such as PAUSE,
-  // HOME, or SEARCH. StateMachine.cpp interprets the action.
+  // Default route point in world metres plus the action owned by RouteMission.
   float x;
   float y;
-  const char* action;
+  MissionAction action;
 };
 
 #endif

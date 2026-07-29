@@ -1,4 +1,10 @@
 #include "Robot.h"
+#include "Navigation.h"
+#include "../../NavigationAdmin.h"
+#include "../../NavigationTest.h"
+#include "../navigation/PlannerDebug.h"
+#include "../mission/RouteMission.h"
+#include "../mission/WeightSearch.h"
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,8 +17,8 @@
 //   test harnesses, manual drive interface, telemetry queue, CSV/status
 //   output, and command-time tuning controls.
 // Interacts with:
-//   StateMachine.cpp is started/stopped by START/STOP/HOME and test commands.
-//   LocalPlanner.cpp receives navigation/test goals. MotorControl.cpp provides
+//   MissionController.cpp is started/stopped by START/STOP/HOME and test commands.
+//   Navigation.h receives navigation/test goals. MotorControl.cpp provides
 //   motion authority, safety, PID/output diagnostics, and manual/test command
 //   acceptance. TofSensors.cpp/ObjectDetection.cpp provide diagnostics.
 // Control flow:
@@ -35,6 +41,7 @@ static bool bluetoothSideTestActive = false;
 static bool bluetoothTurnPulseTestActive = false;
 static bool bluetoothArcTestActive = false;
 static bool bluetoothTurnTruthActive = false;
+static bool bluetoothNavigationTestActive = false;
 static bool turnPulseCoasting = false;
 static unsigned long lastManualDriveCommandMs = 0;
 static unsigned long lastBluetoothMotionTelemetryMs = 0;
@@ -447,15 +454,7 @@ void setupBluetooth() {
 }
 
 static int displayWaypointIndex() {
-  if (NUM_POINTS <= 0) {
-    return 0;
-  }
-
-  if (currentWaypointIndex >= NUM_POINTS) {
-    return NUM_POINTS;
-  }
-
-  return currentWaypointIndex + 1;
+  return routeMissionDisplayIndex();
 }
 
 void sendBluetoothStatus() {
@@ -463,6 +462,8 @@ void sendBluetoothStatus() {
   // pose, sensing, authority, motor, planner, object, timing, and telemetry
   // diagnostics in one line for saved regression oracles.
   beginTelemetryRow();
+  const NavigationDebugStatus navigation = getNavigationDebugStatus();
+  const PlannerTelemetry& plannerTelemetry = getPlannerTelemetry();
   long leftCount;
   long rightCount;
   readEncoderCounts(leftCount, rightCount);
@@ -482,7 +483,7 @@ void sendBluetoothStatus() {
   Serial2.print(" authority=");
   Serial2.print(motionAuthorityName(motionAuthority));
   Serial2.print(" goalAuthority=");
-  Serial2.print(motionAuthorityName(navigationGoal.authority));
+  Serial2.print(motionAuthorityName(navigation.authority));
   Serial2.print(" safetyStop=");
   Serial2.print(isMotionSafetyStopActive() ? 1 : 0);
   Serial2.print(" safetyReason=");
@@ -514,7 +515,7 @@ void sendBluetoothStatus() {
   Serial2.print(" waypoint=");
   Serial2.print(displayWaypointIndex());
   Serial2.print("/");
-  Serial2.print(NUM_POINTS);
+  Serial2.print(routeMissionPointCount());
   Serial2.print(" x=");
   Serial2.print(robotX, 3);
   Serial2.print(" y=");
@@ -585,7 +586,7 @@ void sendBluetoothStatus() {
   Serial2.print(" escape=");
   Serial2.print(escapeBacktrackEnabled ? 1 : 0);
   Serial2.print(" emergency=");
-  Serial2.print(isEmergencyScanPolicyEnabled() ? 1 : 0);
+  Serial2.print(navigationIsEmergencyScanEnabled() ? 1 : 0);
   Serial2.print(" stuck=");
   Serial2.print((driveStuck || wheelMismatchStuck || turnStuck) ? 1 : 0);
   Serial2.print(" home=");
@@ -722,6 +723,7 @@ static void sendBluetoothSchemaMetadata() {
 // maps its closest typed state into those compatibility fields.
 static void sendBluetoothMotionRow() {
   beginTelemetryRow();
+  const PlannerTelemetry& plannerTelemetry = getPlannerTelemetry();
   Serial2.print("telemetry,");
   Serial2.print(NAV_TELEMETRY_SCHEMA_VERSION);
   Serial2.print(","); Serial2.print(telemetrySequence++);
@@ -982,7 +984,8 @@ static void runManualDriveCommand(float forwardPercent, float turnPercent) {
   // same single motor-output path as autonomous navigation.
   if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_MANUAL,
                                   baseTargetSpeed * forwardPercent / 100.0,
-                                  baseTargetSpeed * turnPercent / 100.0)) {
+                                  baseTargetSpeed * turnPercent / 100.0,
+                                  MOTION_COMMAND_STANDARD)) {
     bluetoothManualActive = false;
     Serial2.print("MANUAL blocked by continuous safety supervisor: ");
     Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
@@ -1035,6 +1038,22 @@ static void beginBluetoothTestMotion() {
   clearStuckFlags();
 }
 
+static void recordBluetoothNavigationSubmission(bool accepted,
+                                                const char* detail) {
+  bluetoothNavigationTestActive = accepted;
+  if (accepted) {
+    return;
+  }
+
+  Serial2.println("ERROR navigation goal rejected.");
+  sendBluetoothEvent("navigation_goal_rejected", detail);
+  bluetoothTurnTruthActive = false;
+  robotRunEnabled = false;
+  motorStopRequested = true;
+  requestMotionStop();
+  setRobotState(END_MATCH);
+}
+
 static void runBluetoothTestDrive(float distanceMetres) {
   // TEST DRIVE creates a point goal straight ahead from the current pose.
   // distanceMetres is metres; heading comes from navigationHeadingDeg().
@@ -1065,9 +1084,12 @@ static void runBluetoothTestDrive(float distanceMetres) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_drive_start", "manual");
-  startNavigationPoint(robotX + cosf(headingRad) * distanceMetres,
-                       robotY + sinf(headingRad) * distanceMetres,
-                       NAV_OWNER_TEST_DRIVE);
+  recordBluetoothNavigationSubmission(
+    navigationStartTestPoint(
+      robotX + cosf(headingRad) * distanceMetres,
+      robotY + sinf(headingRad) * distanceMetres,
+      NAVIGATION_TEST_DRIVE),
+    "test_drive");
 }
 
 static void runBluetoothTestGoto(float targetX, float targetY) {
@@ -1092,7 +1114,9 @@ static void runBluetoothTestGoto(float targetX, float targetY) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_goto_start", "manual");
-  startNavigationPoint(targetX, targetY, NAV_OWNER_TEST_GOTO);
+  recordBluetoothNavigationSubmission(
+    navigationStartTestPoint(targetX, targetY, NAVIGATION_TEST_GOTO),
+    "test_goto");
 }
 
 static void refreshObjectTargetEstimateForCommand() {
@@ -1153,8 +1177,12 @@ static void runBluetoothTestHunt() {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_hunt_start", "object_target");
-  startNavigationPoint(objectTargetEstimate.worldX, objectTargetEstimate.worldY,
-                       NAV_OWNER_TEST_HUNT);
+  recordBluetoothNavigationSubmission(
+    navigationStartTestPoint(
+      objectTargetEstimate.worldX,
+      objectTargetEstimate.worldY,
+      NAVIGATION_TEST_PICKUP),
+    "test_hunt");
 }
 
 static void runBluetoothTestSearch() {
@@ -1197,7 +1225,9 @@ static void runBluetoothTestAvoid(float distanceMetres) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_avoid_start", "manual");
-  startNavigationPoint(targetX, targetY, NAV_OWNER_TEST_AVOID);
+  recordBluetoothNavigationSubmission(
+    navigationStartTestPoint(targetX, targetY, NAVIGATION_TEST_AVOID),
+    "test_avoid");
 }
 
 static void runBluetoothTestEscape(float distanceMetres) {
@@ -1229,7 +1259,9 @@ static void runBluetoothTestEscape(float distanceMetres) {
 
   beginBluetoothTestMotion();
   sendBluetoothEvent("test_escape_start", "manual");
-  startNavigationPoint(targetX, targetY, NAV_OWNER_TEST_ESCAPE);
+  recordBluetoothNavigationSubmission(
+    navigationStartTestPoint(targetX, targetY, NAVIGATION_TEST_ESCAPE),
+    "test_escape");
 }
 
 static void runBluetoothTestSide(float durationSeconds) {
@@ -1302,7 +1334,9 @@ static void runBluetoothTestTurn(float angleDeg) {
   turnTruthNextSampleMs = turnTruthStartMs + TEST_TRUTH_FIRST_SAMPLE_MS;
   bluetoothTurnTruthActive = true;
   sendBluetoothEvent("test_turn_start", "manual");
-  startNavigationTurn(angleDeg, NAV_OWNER_TEST_TURN);
+  recordBluetoothNavigationSubmission(
+    navigationStartTestTurn(angleDeg),
+    "test_turn");
 }
 
 static void printBluetoothTurnTruth(const char* phase) {
@@ -1330,8 +1364,10 @@ static void updateBluetoothTurnTruth() {
   if (!bluetoothTurnTruthActive) {
     return;
   }
+  const NavigationDebugStatus navigation = getNavigationDebugStatus();
+  const PlannerTelemetry& plannerTelemetry = getPlannerTelemetry();
   const unsigned long now = millis();
-  if (navigationGoal.active && navigationGoal.owner == NAV_OWNER_TEST_TURN) {
+  if (navigation.testTurnActive) {
     if (now >= turnTruthNextSampleMs) {
       printBluetoothTurnTruth("d");
       turnTruthNextSampleMs = now + TEST_TRUTH_SAMPLE_INTERVAL_MS;
@@ -1339,10 +1375,28 @@ static void updateBluetoothTurnTruth() {
     return;
   }
 
-  printBluetoothTurnTruth(navigationGoal.completed ? "e" : "x");
-  Serial2.print(navigationGoal.completed ? "test_turn_end," : "test_turn_abort,");
+  printBluetoothTurnTruth(navigation.completed ? "e" : "x");
+  Serial2.print(navigation.completed ? "test_turn_end," : "test_turn_abort,");
   Serial2.println(plannerTelemetry.safeStopReason);
   bluetoothTurnTruthActive = false;
+}
+
+static void updateBluetoothNavigationTest() {
+  if (!bluetoothNavigationTestActive) {
+    return;
+  }
+  NavigationStatus navigation = navigationGetStatus();
+  if (navigation.state == NAVIGATION_RUNNING) {
+    return;
+  }
+  bluetoothNavigationTestActive = false;
+  robotRunEnabled = false;
+  motorStopRequested = true;
+  requestMotionStop();
+  setRobotState(END_MATCH);
+  Serial.println(navigation.state == NAVIGATION_REACHED
+    ? "TEST complete. Motors stopped."
+    : "TEST aborted. Motors stopped.");
 }
 
 static void finishBluetoothArcTest(const char* detail) {
@@ -1368,7 +1422,8 @@ static void finishBluetoothArcTest(const char* detail) {
   bluetoothArcTestActive = false;
   bluetoothManualActive = false;
   robotRunEnabled = false;
-  setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST, 0.0, 0.0);
+  setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST, 0.0, 0.0,
+                             MOTION_COMMAND_STANDARD);
   stopMotors();
   setRobotState(END_MATCH);
   sendBluetoothEvent("test_arc_end", detail);
@@ -1418,7 +1473,8 @@ static void runBluetoothTestArc(float forwardTicksPerSec,
   clearStuckFlags();
   if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST,
                                   arcTestForwardTicksPerSec,
-                                  arcTestTurnTicksPerSec)) {
+                                  arcTestTurnTicksPerSec,
+                                  MOTION_COMMAND_STANDARD)) {
     bluetoothArcTestActive = false;
     Serial2.print("ERROR TEST ARC refused by continuous safety supervisor: ");
     Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
@@ -1446,7 +1502,8 @@ static void updateBluetoothArcTest() {
   lastManualDriveCommandMs = millis();
   if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST,
                                   arcTestForwardTicksPerSec,
-                                  arcTestTurnTicksPerSec)) {
+                                  arcTestTurnTicksPerSec,
+                                  MOTION_COMMAND_STANDARD)) {
     finishBluetoothArcTest("safety_abort");
     return;
   }
@@ -1526,8 +1583,8 @@ static void runBluetoothTestTurnPulse(float signedSeconds) {
     return;
   }
 
-  if (isNavigationGoalActive()) {
-    cancelNavigationGoal(PLANNER_STOP_ABORTED, "turnpulse_started");
+  if (navigationGetStatus().state == NAVIGATION_RUNNING) {
+    navigationCancelWithReason(PLANNER_STOP_ABORTED, "turnpulse_started");
   }
   bluetoothAbortMotionRequested = false;
   bluetoothManualArmed = false;
@@ -1543,7 +1600,8 @@ static void runBluetoothTestTurnPulse(float signedSeconds) {
   turnPulseCoasting = false;
   bluetoothTurnPulseTestActive = true;
   if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST, 0.0,
-                                  turnPulseCommandTicksPerSec)) {
+                                  turnPulseCommandTicksPerSec,
+                                  MOTION_COMMAND_STANDARD)) {
     Serial2.print("ERROR TEST TURNPULSE refused by continuous safety supervisor: ");
     Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
     finishBluetoothTurnPulseTest();
@@ -1577,7 +1635,8 @@ static void updateBluetoothTurnPulseTest() {
       return;
     }
     if (!setAuthorizedMotionCommand(MOTION_AUTHORITY_TEST, 0.0,
-                                    turnPulseCommandTicksPerSec)) {
+                                    turnPulseCommandTicksPerSec,
+                                    MOTION_COMMAND_STANDARD)) {
       Serial2.print("TURNPULSE aborted by continuous safety supervisor: ");
       Serial2.println(motionSafetyReasonName(lastMotionSafetyReason()));
       finishBluetoothTurnPulseTest();
@@ -1681,8 +1740,9 @@ static void revokeAndCancelAllMotion(const char* detail) {
   bluetoothTurnPulseTestActive = false;
   bluetoothArcTestActive = false;
   bluetoothSideTestActive = false;
-  if (isNavigationGoalActive()) {
-    cancelNavigationGoal(PLANNER_STOP_ABORTED, detail);
+  bluetoothNavigationTestActive = false;
+  if (navigationGetStatus().state == NAVIGATION_RUNNING) {
+    navigationCancelWithReason(PLANNER_STOP_ABORTED, detail);
   }
   if (isWeightSearchActive()) {
     cancelWeightSearch(detail);
@@ -1696,6 +1756,7 @@ void disarmBluetoothMotionModes() {
   bluetoothManualActive = false;
   bluetoothTurnPulseTestActive = false;
   bluetoothArcTestActive = false;
+  bluetoothNavigationTestActive = false;
 }
 
 static void zeroRobotPoseFromBluetooth() {
@@ -1709,8 +1770,8 @@ static void zeroRobotPoseFromBluetooth() {
   robotTheta = 0.0;
 
   resetEncodersAndPID();
-  clearLocalMap();
-  currentWaypointIndex = 0;
+  navigationResetMap();
+  resetRouteMission();
   returnHomeRequested = false;
   clearStuckFlags();
   robotRunEnabled = false;
@@ -1739,6 +1800,11 @@ static bool handleCoreBluetoothCommand(const char* command) {
   if (commandEquals(command, "START")) {
     revokeAndCancelAllMotion("start_authority_transition");
     claimMotionAuthority(MOTION_AUTHORITY_MISSION);
+    // A fresh mission owns the decision to clear navigation's local map.
+    // Navigation itself no longer performs mission-start cleanup.
+    if (currentState == INIT || currentState == END_MATCH) {
+      navigationResetMap();
+    }
     robotRunEnabled = true;
     bluetoothTestArmed = false;
     bluetoothManualArmed = false;
@@ -1746,7 +1812,7 @@ static bool handleCoreBluetoothCommand(const char* command) {
     bluetoothAbortMotionRequested = false;
     endMatchPrinted = false;
     returnHomeRequested = false;
-    clearNavigationGoalResult();
+    navigationClearResult();
 
     if (currentState == END_MATCH) {
       currentState = INIT;
@@ -1782,9 +1848,9 @@ static bool handleCoreBluetoothCommand(const char* command) {
     bluetoothManualArmed = false;
     bluetoothManualActive = false;
     bluetoothTurnPulseTestActive = false;
-    if (isNavigationGoalActive()) {
-      cancelNavigationGoal(PLANNER_STOP_ABORTED, "home_requested");
-      clearNavigationGoalResult();
+    if (navigationGetStatus().state == NAVIGATION_RUNNING) {
+      navigationCancelWithReason(PLANNER_STOP_ABORTED, "home_requested");
+      navigationClearResult();
     }
     returnHomeRequested = true;
     Serial2.println("OK return home requested.");
@@ -1966,7 +2032,7 @@ static bool handleTuningBluetoothCommand(const char* command) {
   }
 
   if (commandEquals(command, "EMERGENCY ON")) {
-    if (!setEmergencyScanPolicyEnabled(true)) {
+    if (!navigationSetEmergencyScanEnabled(true)) {
       Serial2.println("ERROR EMERGENCY cannot change during an active navigation goal.");
       return true;
     }
@@ -1978,7 +2044,7 @@ static bool handleTuningBluetoothCommand(const char* command) {
   }
 
   if (commandEquals(command, "EMERGENCY OFF")) {
-    if (!setEmergencyScanPolicyEnabled(false)) {
+    if (!navigationSetEmergencyScanEnabled(false)) {
       Serial2.println("ERROR EMERGENCY cannot change during an active navigation goal.");
       return true;
     }
@@ -1989,7 +2055,7 @@ static bool handleTuningBluetoothCommand(const char* command) {
 
   if (commandEquals(command, "EMERGENCY STATUS")) {
     Serial2.print("EMERGENCY ");
-    Serial2.println(isEmergencyScanPolicyEnabled() ? "ON" : "OFF");
+    Serial2.println(navigationIsEmergencyScanEnabled() ? "ON" : "OFF");
     return true;
   }
 
@@ -2277,5 +2343,6 @@ bool handleBluetoothCommands() {
   updateBluetoothTurnPulseTest();
   updateBluetoothArcTest();
   updateBluetoothTurnTruth();
+  updateBluetoothNavigationTest();
   return bluetoothAbortMotionRequested;
 }

@@ -26,39 +26,94 @@ The correct cleanup is evolutionary. Preserve the current driving behaviour,
 put a narrow navigation API in front of it, extract cohesive internals behind
 that API, and only then build pickup and mission states against the API.
 
-## Implementation checkpoint: 2026-07-29
+## Implementation result: 2026-07-29
 
-The first cleanup checkpoint has been applied:
+The cleanup plan is implemented through Patch 11:
 
-- Patch 1 confirmed-dead-code removals are complete for firmware constants,
-  write-only globals, unused planner fields, disabled turn-ladder calibration
-  baggage, unused WASM exports, the unused competition scoring helper, and
-  the listed Python unused names.
-- Patch 2 has begun: the misleading non-neutral `setMotionCommand()` API was
-  replaced by stop-only `requestMotionStop()`, and mission route/weight-search
-  owner checks now use `NavigationStatus` instead of reading `navigationGoal`
-  directly.
-- Patch 3 has begun: the WASM bridge now reads planner internals through
-  `PlannerDebugSnapshot`, `plannerDebugMapState()`, and
-  `plannerDebugSeedMapOccupied()` instead of directly naming obstacle context,
-  emergency recovery state, local-map cells, or planner epochs. The bridge
-  still includes `LocalPlanner.cpp`; removing that include waits for the
-  `PlannerContext` and file-split patches.
+- confirmed dead constants, write-only fields, unused exports, obsolete
+  placeholder states, and unproduced stop reasons are removed;
+- `Navigation.h` is the public goal/result façade used by mission code;
+  mutable `NavigationGoal` storage and its type now live behind
+  `NavigationInternal.h`;
+- `PlannerContext` is the one static owner of map, obstacle, planning epoch,
+  recovery, and emergency mutable state; the temporary reference-alias layer
+  is gone;
+- the former 5,040-line `LocalPlanner.cpp` is split into `Navigation`,
+  `NavigationController`, `PlannerMap`, `PlannerCollision`,
+  `ObstacleContext`, `ForwardTrajectoryPlanner`, `PlannerProgress`,
+  `RecoveryPlanner`, and `PlannerDebug`;
+- Bluetooth reads navigation status and planner telemetry through read-only
+  public/debug accessors instead of planner globals;
+- the WASM bridge compiles those modules separately and no longer includes an
+  implementation `.cpp` file or reads file-static planner state;
+- the JavaScript planner, fallback selector, duplicated wall state, fake arc
+  display, and unused duplicated tuning constants are removed from the
+  simulator. JavaScript now owns only the deterministic field, sensors,
+  drivetrain, telemetry support, and UI;
+- weight search is extracted from the mission dispatcher into
+  `WeightSearch.cpp/.h`; the former `StateMachine.cpp`, now
+  `src/mission/MissionController.cpp`, owns only the implemented top-level
+  mission states;
+- misleading modules were renamed: `StuckRecovery.cpp` is now
+  `MotionProgressMonitor.cpp`, and the stationary `TEST SIDE` helper is now
+  `AvoidanceDiagnostics.cpp`;
+- the documented opt-in emergency-scan default is restored to `false`, while
+  explicit opt-in emergency tests remain in the regression suite.
 
-Latest software gate after this checkpoint:
+Final software gates:
 
-- warning-enabled Teensy 4.0 firmware compile: PASS;
-- full validation compile and WASM build: PASS;
-- legacy JavaScript simulator tests: PASS;
-- targeted Python source-shape/live-map tests: PASS;
-- full Python compileall: PASS;
-- remaining full-validation failures are the pre-existing emergency-scan
-  baseline issues: two firmware/WASM emergency-recovery tests and the Python
-  default-contract assertion for `PLANNER_EMERGENCY_SCAN_ENABLED`.
+- clean warning-enabled Teensy 4.0 compile: PASS;
+- firmware/WASM and simulator suite: 47/47 PASS;
+- Python suite: 134 PASS, one intentional skip;
+- Python `compileall`: PASS.
 
-Next strict-plan step: do not start feature work. Create `PlannerContext` and
-move mutable planner state into it before extracting map, collision, obstacle,
-forward trajectory, progress, and recovery modules.
+The firmware compile reports 154,488 bytes of flash code, 29,880 bytes of
+flash data, 200,800 bytes of RAM1 variables, and 12,416 bytes of RAM2
+variables. These are software build results only, not physical validation.
+
+## Black-box and folder follow-up: 2026-07-30
+
+The follow-up isolation and organization plan is implemented:
+
+- `Navigation.h` is now the complete mission-facing API: four goal submission
+  functions, cancel, typed status, and result clearing. Submissions return
+  `bool` when a goal is busy or rejected.
+- Public status is reduced to `IDLE`, `RUNNING`, `REACHED`, or `FAILED`, with a
+  typed planner stop reason and detail.
+- Map reset and emergency policy moved to `NavigationAdmin.h`; test and
+  simulator adapters moved to `NavigationTest.h`.
+- Goal owner/mode and mutable goal storage live only under `src/navigation/`.
+- Motor commands carry an explicit standard, navigation-drive,
+  navigation-turn, or navigation-scan-turn mode. `MotorControl.cpp` no longer
+  reads private navigation fields and remains the only periodic motor writer.
+- `RouteMission.cpp` exclusively owns the route array, route index, pauses,
+  and `MissionAction` values. `MissionController.cpp` owns top-level state
+  changes. Navigation never advances the route or terminates a mission/test.
+- Weight search receives explicit coordinates and reports a typed result. It
+  does not read or increment route state.
+- Firmware implementation files are grouped under `src/core`,
+  `src/navigation`, `src/mission`, `src/motion`, `src/sensors`, and
+  `src/operator`. Root headers remain the small public/shared surface.
+- The WASM build and bridge use the public, admin, test, and read-only debug
+  interfaces without including `NavigationInternal.h`.
+- Python source-contract tests enforce the new boundary and recursive folder
+  layout.
+
+Verification for the follow-up:
+
+- clean warning-enabled Teensy 4.0 compile: PASS, 155,256 bytes code,
+  30,904 bytes data, 201,824 bytes RAM1 variables, and 12,416 bytes RAM2
+  variables;
+- firmware/WASM and simulator suite: 47/47 PASS;
+- Python suite: 140 PASS, one intentional skip;
+- exact custom and `heading-back` cases under clean and website-default
+  sensing: PASS;
+- rebuilt-WASM Visual Lab clear GOTO: PASS, `waypoint_reached`, neutral, no
+  contact.
+
+No planner geometry, recovery policy, speed ceiling, or safety threshold was
+tuned during this architecture refactor. No upload, serial connection, or
+physical movement was performed.
 
 ## Audit scope and evidence
 
@@ -284,8 +339,9 @@ Do not restore the old blocking implementation.
 
 ### Stationary `TEST SIDE` compatibility module
 
-`ObstacleAvoidance.cpp` is not used by autonomous obstacle avoidance. Its only
-consumer is the stationary `TEST SIDE` diagnostic in `Bluetooth.cpp`.
+The former `ObstacleAvoidance.cpp`, now `AvoidanceDiagnostics.cpp`, is not
+used by autonomous obstacle avoidance. Its only consumer is the stationary
+`TEST SIDE` diagnostic in `Bluetooth.cpp`.
 
 Options:
 
@@ -384,14 +440,14 @@ This will make “the planner” mean one thing everywhere.
 | `RearObstacleSensor.cpp` | Keep | Active cooperative rear sensor path and trusted-rear gate. |
 | `RearObstaclePolicy.h` | Keep | Pure aggregation/hysteresis logic with tests. |
 | `ObjectDetection.cpp` | Keep, later separate from mission | Sensor/candidate owner. It should publish observations; pickup mission logic should not be added here. |
-| `StuckRecovery.cpp` | Keep, consider rename | It detects lack of progress; it does not perform recovery. `MotionProgressMonitor.cpp` would be clearer. |
+| `MotionProgressMonitor.cpp` | Keep | Renamed from `StuckRecovery.cpp`; it detects lack of progress and does not perform recovery. |
 | `Globals.cpp` | Restructure | Remove dead globals, then migrate subsystem state into owner-specific context structs. |
 | `RobotTypes.h` | Restructure | Retire unreachable states and unproduced stop reasons after protocol checks; split mission, navigation, sensor, and telemetry types. |
 | `RobotConfig.h` | Keep, prune | Remove 11 confirmed unused constants; later split hardware, safety, planner, and mission config. |
 | `Robot.h` | Restructure first | It is a 359-line universal include exposing nearly all globals and functions. Replace it with focused headers. |
 | `Navigation.cpp` | Replace with façade | Make it the only mission-facing navigation API. |
-| `ObstacleAvoidance.cpp` | Optional diagnostic | Rename or remove with `TEST SIDE`; it is not autonomous driving code. |
-| `LocalPlanner.cpp` | Split behind façade | Preserve algorithm; extract map, collision, obstacle, rollout, and recovery ownership. |
+| `AvoidanceDiagnostics.cpp` | Optional diagnostic | Renamed to reflect its stationary `TEST SIDE` role; it is not autonomous driving code. |
+| Navigation and planner modules | Split complete | The former `LocalPlanner.cpp` responsibilities now have explicit map, collision, obstacle, rollout, recovery, controller, façade, and debug owners. |
 | `StateMachine.cpp` | Split after façade | Move weight search into its own mission component; remove placeholder states; future pickup states use navigation results only. |
 | `Bluetooth.cpp` | Split later | Remove dead ladder constants; separate command parsing, telemetry transport, and motion-test commands without changing the protocol. |
 | `HostSimRobot.h` | Restructure with planner | Keep the host platform shim, but stop making it a second version of the entire `Robot.h` interface. |
@@ -568,8 +624,8 @@ Gate:
 
 ### Patch 3: decouple the WASM bridge
 
-The bridge currently includes `LocalPlanner.cpp` directly and reads its
-file-static state. Before splitting files:
+The bridge originally included `LocalPlanner.cpp` directly and read its
+file-static state. The implemented decoupling:
 
 - add `PlannerDebugSnapshot`;
 - change the bridge to use public/debug accessors;
