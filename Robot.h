@@ -245,6 +245,8 @@ bool didNavigationGoalComplete();
 bool didNavigationGoalFail();
 void clearNavigationGoalResult();
 const char* plannerStopReasonName(PlannerStopReason reason);
+bool setEmergencyScanPolicyEnabled(bool enabled);
+bool isEmergencyScanPolicyEnabled();
 bool isTurnDirectionObservable(float turnTicksPerSec);
 bool isTurnSweepSafe();
 void clearLocalMap();

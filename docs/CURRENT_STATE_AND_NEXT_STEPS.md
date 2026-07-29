@@ -9,12 +9,12 @@ the next smallest useful steps. Read it alongside `ROBOT_CODEBASE_AUDIT.md`,
 
 P0 disposition: P0-01, P0-02, P0-07, and P0-08 are fixed in software, with
 physical validation still applicable to the motion findings. P0-03 is partly
-fixed and depends on real sensor coverage. P0-04 fake rear is intentionally
-deferred; P0-05 sensor safety proof is open. P0-06 phase 1 is implemented, but
-coherent sensor snapshots and physical watchdog timing remain follow-ups.
-Operator decision, 2026-07-14: obstacle testing may continue with the current
-`RANGE_FAKE_REAR` channel. Treat this as explicit temporary test scaffolding,
-not proof of rear safety or competition readiness.
+fixed and depends on real sensor coverage. The legacy `RANGE_FAKE_REAR` slot is
+now backed by the production SEN0628 driver; it authorizes reverse only while
+the sensor is initialized, valid, fresh, and non-blocked. P0-05 sensor safety
+proof remains open. P0-06 phase 1 is implemented, but coherent sensor snapshots
+and physical watchdog timing remain follow-ups. This software integration is
+not proof of rear coverage, mounting geometry, or competition readiness.
 
 ## 1. Current Firmware Baseline
 
@@ -64,11 +64,16 @@ Accepted navigation behaviour:
 
 - Four high fan VL53L0X sensors are active and valid in open space.
 - V7 local planner can drive point goals.
-- Physical reverse recovery is disabled: `hasTrustedRearCoverage()` returns
-  false for the current robot, and both the planner and final motor owner require
-  that capability. `RANGE_FAKE_REAR` cannot authorize physical reverse.
+- Physical firmware now exposes the same evidence-driven reverse planner used
+  by WASM. `hasTrustedRearCoverage()` becomes true only while the SEN0628 is
+  connected, initialized, valid, fresh, and non-blocked; the planner and final
+  motor owner both enforce that capability.
 - The WASM simulator provides a field-raycast rear channel so deterministic
   reverse-recovery behavior can be tested without claiming physical validity.
+- Ultimate scan/relocate/retry recovery has one shared policy setter in the
+  physical firmware and WASM. It defaults off in both; use `EMERGENCY ON`
+  before a physical goal, or `emergencyScanEnabled` in a Visual Lab scenario.
+  Policy changes are rejected while a navigation goal is active.
 - Reverse recovery is a single cooperative repositioning mode. It samples
   reverse-only-wheel arcs through persistent known-clear cells, prioritizes the
   best 50 mm clearance band, and then scores forward continuation, unexplored

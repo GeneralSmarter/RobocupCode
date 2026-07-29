@@ -226,6 +226,8 @@ enum PlannerStopReason {
   PLANNER_STOP_RECOVERY_REPEATED,
   PLANNER_STOP_RECOVERY_NO_PROGRESS,
   PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME,
+  PLANNER_STOP_EMERGENCY_SCAN_ABORTED,
+  PLANNER_STOP_EMERGENCY_RETRY_EXHAUSTED,
   PLANNER_STOP_ABORTED
 };
 
@@ -261,9 +263,9 @@ struct PlannerTelemetry {
   float localGoalDistanceM;
   float routeAlongProgressM;
   float routeSignedLateralErrorM;
-  float recoveryPhaseElapsedS;
-  float cumulativeRecoveryDistanceM;
-  float recoveryBestProgressM;
+  float obstacleProgressAgeS;
+  float cumulativeReverseDistanceM;
+  float obstacleBestProgressM;
   float recoveryCurrentClearanceM;
   float recoveryEndpointClearanceM;
   float recoveryClearanceGainM;

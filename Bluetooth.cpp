@@ -413,6 +413,7 @@ static void printBluetoothHelp() {
   Serial2.println("  FBASE <l> <r>  set temporary forward motor base pulses");
   Serial2.println("  FBASE RESET    restore default forward motor base pulses");
   Serial2.println("  ESCAPE ON/OFF/STATUS  reverse policy (trusted rear coverage required)");
+  Serial2.println("  EMERGENCY ON/OFF/STATUS  ultimate scan/retry recovery policy");
   Serial2.println("  TEST ARM       allow one or more test motion commands");
   Serial2.println("  TEST DISARM    disable test motion commands");
   Serial2.println("  TEST DRIVE <m> drive a fixed distance at current heading");
@@ -588,6 +589,8 @@ void sendBluetoothStatus() {
   Serial2.print(frontBlocked ? 1 : 0);
   Serial2.print(" escape=");
   Serial2.print(escapeBacktrackEnabled ? 1 : 0);
+  Serial2.print(" emergency=");
+  Serial2.print(isEmergencyScanPolicyEnabled() ? 1 : 0);
   Serial2.print(" stuck=");
   Serial2.print((driveStuck || wheelMismatchStuck || turnStuck) ? 1 : 0);
   Serial2.print(" home=");
@@ -661,13 +664,13 @@ void sendBluetoothStatus() {
   Serial2.print("/");
   Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 2);
   Serial2.print("/");
-  Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 1);
+  Serial2.print(plannerTelemetry.obstacleProgressAgeS, 1);
   Serial2.print("/");
-  Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 2);
+  Serial2.print(plannerTelemetry.cumulativeReverseDistanceM, 2);
   Serial2.print("/");
   Serial2.print(plannerTelemetry.recoveryCount);
   Serial2.print("/");
-  Serial2.print(plannerTelemetry.recoveryBestProgressM, 2);
+  Serial2.print(plannerTelemetry.obstacleBestProgressM, 2);
   Serial2.print(" objectTarget=");
   Serial2.print(objectTargetEstimate.valid ? 1 : 0);
   Serial2.print("/");
@@ -751,9 +754,9 @@ static void sendBluetoothMotionRow() {
   Serial2.print(","); Serial2.print(plannerTelemetry.planReason);
   Serial2.print(","); Serial2.print(0);
   Serial2.print(","); Serial2.print(plannerTelemetry.minimumSweptClearanceMm, 1);
-  Serial2.print(","); Serial2.print(plannerTelemetry.recoveryPhaseElapsedS, 2);
+  Serial2.print(","); Serial2.print(plannerTelemetry.obstacleProgressAgeS, 2);
   Serial2.print(","); Serial2.print(plannerTelemetry.recoveryPlateauCount);
-  Serial2.print(","); Serial2.print(plannerTelemetry.cumulativeRecoveryDistanceM, 3);
+  Serial2.print(","); Serial2.print(plannerTelemetry.cumulativeReverseDistanceM, 3);
   Serial2.print(","); Serial2.print(plannerTelemetry.routeSignedLateralErrorM, 3);
   Serial2.print(","); Serial2.print(plannerTelemetry.selectedForwardTicksPerSec, 1);
   Serial2.print(","); Serial2.print(plannerTelemetry.selectedTurnTicksPerSec, 1);
@@ -1965,6 +1968,39 @@ static bool handleTuningBluetoothCommand(const char* command) {
 
   if (commandHasPrefix(command, "ESCAPE")) {
     Serial2.println("ERROR usage: ESCAPE ON, ESCAPE OFF, or ESCAPE STATUS");
+    return true;
+  }
+
+  if (commandEquals(command, "EMERGENCY ON")) {
+    if (!setEmergencyScanPolicyEnabled(true)) {
+      Serial2.println("ERROR EMERGENCY cannot change during an active navigation goal.");
+      return true;
+    }
+    Serial2.println(hasTrustedRearCoverage()
+      ? "OK ultimate scan/retry recovery enabled."
+      : "OK emergency recovery policy enabled; motion remains gated without trusted rear coverage.");
+    sendBluetoothEvent("emergency_set", "on");
+    return true;
+  }
+
+  if (commandEquals(command, "EMERGENCY OFF")) {
+    if (!setEmergencyScanPolicyEnabled(false)) {
+      Serial2.println("ERROR EMERGENCY cannot change during an active navigation goal.");
+      return true;
+    }
+    Serial2.println("OK ultimate scan/retry recovery disabled.");
+    sendBluetoothEvent("emergency_set", "off");
+    return true;
+  }
+
+  if (commandEquals(command, "EMERGENCY STATUS")) {
+    Serial2.print("EMERGENCY ");
+    Serial2.println(isEmergencyScanPolicyEnabled() ? "ON" : "OFF");
+    return true;
+  }
+
+  if (commandHasPrefix(command, "EMERGENCY")) {
+    Serial2.println("ERROR usage: EMERGENCY ON, EMERGENCY OFF, or EMERGENCY STATUS");
     return true;
   }
 

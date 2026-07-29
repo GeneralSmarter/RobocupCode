@@ -518,22 +518,43 @@ const float PLANNER_REVERSE_UNEXPLORED_WEIGHT = 0.30;
 const float PLANNER_REVERSE_SWEEP_CLEARANCE_WEIGHT = 0.15;
 const float PLANNER_REVERSE_EFFICIENCY_WEIGHT = 0.05;
 
-// Fail-closed envelope for reverse repositioning while preserving the
-// original point goal.
-const float PLANNER_RECOVERY_MAX_GOAL_DIVERGENCE_M = 0.45;
-const float PLANNER_RECOVERY_MAX_LATERAL_DISPLACEMENT_M = 0.75;
-// A single phase must settle/reverse/rejoin within 12 s.  At the capped
-// recovery speed, 2.4 m is already twice the nominal test route length.
-const unsigned long PLANNER_RECOVERY_MAX_PHASE_TIME_MS = 12000;
-const float PLANNER_RECOVERY_MAX_CUMULATIVE_DISTANCE_M = 2.40;
+// Reverse recovery owns reverse-only resource limits. Forward obstacle
+// bypasses are instead supervised against their active local goal.
+const unsigned long PLANNER_REVERSE_RECOVERY_MAX_TIME_MS = 12000;
+const float PLANNER_RECOVERY_MAX_CUMULATIVE_REVERSE_DISTANCE_M = 2.40;
 // The 120 mm forward recheck can require several short repositioning arcs to
-// build lateral clearance around a close obstacle. Cumulative distance, phase
-// time and net-progress gates remain active across every handoff.
+// build lateral clearance around a close obstacle. Attempts and cumulative
+// reverse distance remain active across every handoff.
 const uint8_t PLANNER_RECOVERY_MAX_COUNT = 6;
-// Require at least 50 mm improvement in either global distance or route
-// along-progress during each rolling 6 s window.
-const unsigned long PLANNER_RECOVERY_NO_PROGRESS_TIMEOUT_MS = 6000;
-const float PLANNER_RECOVERY_PROGRESS_EPSILON_M = 0.05;
+// A safe forward bypass must improve its current local objective by one map
+// cell during each rolling window. Target changes start a fresh window.
+const unsigned long PLANNER_OBSTACLE_PROGRESS_TIMEOUT_MS = 6000;
+const float PLANNER_OBSTACLE_PROGRESS_EPSILON_M = LOCAL_MAP_CELL_M;
+const float PLANNER_RECOVERY_TAKEOVER_PROGRESS_M = LOCAL_MAP_CELL_M;
+
+// Ultimate recovery is deliberately opt-in. It may run only after ordinary
+// recovery has exhausted an eligible resource or progress bound, and it never weakens the
+// existing footprint, sensor-freshness, authority, or motor-safety gates.
+const bool PLANNER_EMERGENCY_SCAN_ENABLED = false;
+constexpr uint8_t PLANNER_EMERGENCY_SCAN_SECTORS = 12;
+constexpr float PLANNER_EMERGENCY_SCAN_STEP_DEG = 30.0f;
+const float PLANNER_EMERGENCY_SCAN_SWEEP_STEP_DEG = 5.0f;
+const unsigned long PLANNER_EMERGENCY_SENSOR_WAIT_MS = 500;
+const unsigned long PLANNER_EMERGENCY_SECTOR_TIMEOUT_MS = 2500;
+const unsigned long PLANNER_EMERGENCY_RELOCATE_TIMEOUT_MS = 8000;
+const unsigned long PLANNER_EMERGENCY_TOTAL_TIMEOUT_MS = 20000;
+const float PLANNER_EMERGENCY_MAX_RELOCATION_M = 0.80f;
+const float PLANNER_EMERGENCY_RECHECK_DISTANCE_M = 0.12f;
+const float PLANNER_EMERGENCY_TARGET_CLEARANCE_M = 0.08f;
+static_assert(PLANNER_EMERGENCY_SCAN_SECTORS *
+                PLANNER_EMERGENCY_SCAN_STEP_DEG == 360.0f,
+              "Emergency scan sectors must cover exactly one revolution");
+static_assert(PLANNER_EMERGENCY_SENSOR_WAIT_MS <
+                PLANNER_EMERGENCY_SECTOR_TIMEOUT_MS,
+              "Emergency scan sensor wait must fit inside a sector");
+static_assert(PLANNER_EMERGENCY_RELOCATE_TIMEOUT_MS <
+                PLANNER_EMERGENCY_TOTAL_TIMEOUT_MS,
+              "Emergency relocation must fit inside the total bound");
 const uint16_t TOF_SUDDEN_CLOSE_DROP_MM = 400;
 const uint16_t TOF_CLOSE_CONFIRM_TOLERANCE_MM = 200;
 const uint8_t TOF_CLOSE_CONFIRM_READS = 2;

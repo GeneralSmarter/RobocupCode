@@ -80,8 +80,6 @@ enum ObstacleBypassPhase {
 };
 
 static bool reverseRecoveryActive = false;
-static float reverseRecoveryStartX = 0.0;
-static float reverseRecoveryStartY = 0.0;
 static unsigned long reverseRecoveryStartedMs = 0;
 static unsigned long reverseRecoveryStepCount = 0;
 static unsigned long noSafeTrajectorySinceMs = 0;
@@ -103,31 +101,77 @@ struct ReverseRecoveryState {
   uint8_t plateauCount;
 };
 static ReverseRecoveryState reverseRecoveryState = {};
-static bool recoveryAttemptResetPending = false;
 static ObstacleBypassPhase obstacleBypassPhase = BYPASS_IDLE;
 static float obstacleBypassSideSign = 0.0f;
-static unsigned long obstacleBypassPhaseStartedMs = 0;
-static bool recoveryLivenessActive = false;
-static float recoveryLivenessStartX = 0.0f;
-static float recoveryLivenessStartY = 0.0f;
-static float recoveryLivenessLastX = 0.0f;
-static float recoveryLivenessLastY = 0.0f;
-static float recoveryInitialGoalDistanceM = 0.0f;
-static float recoveryBestGoalDistanceM = 0.0f;
-static float recoveryStartRouteAlongM = 0.0f;
-static float recoveryBestRouteAlongM = 0.0f;
-static float recoveryProgressCheckpointGoalDistanceM = 0.0f;
-static float recoveryProgressCheckpointRouteAlongM = 0.0f;
-static float recoveryCumulativeDistanceM = 0.0f;
-static float recoveryBestProgressM = 0.0f;
-static uint8_t recoveryAttemptCount = 0;
-static unsigned long recoveryLastProgressMs = 0;
+struct RecoveryBudget {
+  bool forwardTakeoverPending;
+  uint8_t attemptCount;
+  float cumulativeReverseDistanceM;
+  float lastReverseX;
+  float lastReverseY;
+  float takeoverStartGoalDistanceM;
+  float takeoverStartRouteAlongM;
+};
+static RecoveryBudget recoveryBudget = {};
 static float lastFootprintRejectWorldX = 0.0f;
 static float lastFootprintRejectWorldY = 0.0f;
 static int lastFootprintRejectCellX = -1;
 static int lastFootprintRejectCellY = -1;
 static float lastCorridorRejectLeftM = -1.0f;
 static float lastCorridorRejectRightM = -1.0f;
+
+enum EmergencyRecoveryPhase {
+  EMERGENCY_RECOVERY_IDLE,
+  EMERGENCY_RECOVERY_SETTLE_CURRENT,
+  EMERGENCY_RECOVERY_SCAN_TURN,
+  EMERGENCY_RECOVERY_SCAN_DWELL,
+  EMERGENCY_RECOVERY_SCAN_UNWIND,
+  EMERGENCY_RECOVERY_RELOCATE,
+  EMERGENCY_RECOVERY_SETTLE_RELOCATED,
+  EMERGENCY_RECOVERY_RESET_RETRY,
+  EMERGENCY_RECOVERY_RETRY_ACTIVE
+};
+
+struct EmergencyRecoveryState {
+  EmergencyRecoveryPhase phase;
+  bool consumed;
+  bool retryActive;
+  PlannerStopReason triggerReason;
+  const char* triggerDetail;
+  unsigned long startedMs;
+  unsigned long phaseStartedMs;
+  unsigned long relocationStartedMs;
+  float startX;
+  float startY;
+  float lastX;
+  float lastY;
+  float relocationCheckpointX;
+  float relocationCheckpointY;
+  float relocationDistanceM;
+  float bestRotationalClearanceM;
+  float scanLastYawDeg;
+  float scanAccumulatedDeg;
+  float scanTargetAccumulatedDeg;
+  int8_t scanDirection;
+  uint8_t scanSector;
+  unsigned long fanReadBaselineMs[4];
+  uint32_t rearFrameBaseline;
+};
+
+static EmergencyRecoveryState emergencyRecoveryState = {};
+static bool emergencyScanPolicyEnabled = PLANNER_EMERGENCY_SCAN_ENABLED;
+
+bool setEmergencyScanPolicyEnabled(bool enabled) {
+  if (navigationGoal.active) {
+    return false;
+  }
+  emergencyScanPolicyEnabled = enabled;
+  return true;
+}
+
+bool isEmergencyScanPolicyEnabled() {
+  return emergencyScanPolicyEnabled;
+}
 
 struct ObstacleContext {
   bool active;
@@ -144,6 +188,12 @@ struct ObstacleContext {
   float sideSign;
   float sideEscapeAlongM;
   bool sideReconsidered;
+  bool progressGoalValid;
+  float progressGoalX;
+  float progressGoalY;
+  float progressStartDistanceM;
+  float progressBestDistanceM;
+  unsigned long progressLastMs;
   unsigned long startedMs;
   unsigned long clearSinceMs;
 };
@@ -158,12 +208,14 @@ struct ObstacleEnvelope {
 
 static ObstacleContext obstacleContext = {};
 
-static void resetRecoveryLivenessState();
+static void resetRecoveryBudget();
 static bool routeLineFrame(float &routeLengthM, float &routeUx,
                            float &routeUy, float &routeHeadingRad);
 static float routeLineSignedLateralErrorM(float worldX, float worldY,
                                           float routeUx, float routeUy);
 static void resetObstacleContext(const char* reason);
+static bool handleRecoveryExhaustion(PlannerStopReason reason,
+                                     const char* detail);
 
 enum ReverseSurveyDecision {
   REVERSE_SURVEY_REVERSE,
@@ -249,6 +301,7 @@ struct ReversePlannerEpoch {
   bool active;
   bool awaitingRevalidation;
   bool commandStoppedForAge;
+  bool emergencyScanObjective;
   unsigned long startedMs;
   unsigned long goalStartedMs;
   MotionAuthority authority;
@@ -275,6 +328,7 @@ struct ReversePlannerEpoch {
   float bestTurn;
   float bestRearClearance;
   float bestEndpointClearanceM;
+  float bestRotationalClearanceM;
   float bestSweepClearanceM;
   float bestForwardQuality;
   float bestUnexploredScore;
@@ -1065,6 +1119,41 @@ static float poseKnownClearanceM(const PlannerCollisionSnapshot &snapshot,
   return constrain(clearanceM, 0.0f, PLANNER_REVERSE_CLEARANCE_CAP_M);
 }
 
+static float rotationalEnvelopeClearanceM(
+    const PlannerCollisionSnapshot &snapshot,
+    float worldX, float worldY) {
+  const float front = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float rear = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float left = ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm / 1000.0f +
+                     PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float right = ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm / 1000.0f +
+                      PLANNER_TOTAL_HARD_CLEARANCE_M;
+  const float sweepRadiusM = max(
+    max(hypotf(front, left), hypotf(front, right)),
+    max(hypotf(rear, left), hypotf(rear, right)));
+  float bestM = PLANNER_REVERSE_CLEARANCE_CAP_M;
+  for (int cellY = 0; cellY < LOCAL_MAP_CELLS; ++cellY) {
+    for (int cellX = 0; cellX < LOCAL_MAP_CELLS; ++cellX) {
+      int bit = cellY * LOCAL_MAP_CELLS + cellX;
+      if ((snapshot.occupied[bit >> 3] &
+           (uint8_t)(1U << (bit & 7))) == 0) {
+        continue;
+      }
+      float cellWorldX = snapshot.originX +
+        (cellX + 0.5f) * LOCAL_MAP_CELL_M;
+      float cellWorldY = snapshot.originY +
+        (cellY + 0.5f) * LOCAL_MAP_CELL_M;
+      float centreDistanceM = hypotf(cellWorldX - worldX,
+                                     cellWorldY - worldY);
+      bestM = min(bestM, centreDistanceM - sweepRadiusM -
+                         LOCAL_MAP_CELL_M * 0.70710678f);
+    }
+  }
+  return constrain(bestM, 0.0f, PLANNER_REVERSE_CLEARANCE_CAP_M);
+}
+
 static float projectedUnexploredScore(
     const PlannerCollisionSnapshot &snapshot,
     float worldX, float worldY, float headingRad) {
@@ -1172,6 +1261,23 @@ static bool footprintClearOnSnapshot(const PlannerCollisionSnapshot &snapshot,
   return true;
 }
 
+static bool turnSegmentFootprintClear(
+    const PlannerCollisionSnapshot &snapshot,
+    float worldX, float worldY, float startHeadingDeg,
+    float direction, float sweepDeg) {
+  int intervals = max(1, (int)ceilf(
+    sweepDeg / PLANNER_EMERGENCY_SCAN_SWEEP_STEP_DEG));
+  for (int interval = 0; interval <= intervals; ++interval) {
+    float progressDeg = sweepDeg * ((float)interval / intervals);
+    float headingRad = wrapAngle(
+      startHeadingDeg + direction * progressDeg) * DEG_TO_RAD;
+    if (!footprintClearOnSnapshot(snapshot, worldX, worldY, headingRad)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static float lateralObstacleDistanceOnSnapshot(
     const PlannerCollisionSnapshot &snapshot,
     float worldX, float worldY, float lateralX, float lateralY) {
@@ -1210,7 +1316,6 @@ static void resetObstacleContext(const char* reason) {
   obstacleContext = {};
   obstacleBypassSideSign = 0.0f;
   obstacleBypassPhase = BYPASS_IDLE;
-  obstacleBypassPhaseStartedMs = 0;
   if (wasActive) {
     plannerTelemetry.replanReason = reason;
     sendBluetoothEvent("obstacle_context_clear", reason);
@@ -1332,13 +1437,17 @@ static bool scanRouteObstacle(float originX, float originY,
   return true;
 }
 
-static float obstacleTargetLateralM(float sideSign,
-                                    float minimumLateralM,
-                                    float maximumLateralM) {
-  float lateralClearanceM =
+static float obstacleTargetMinimumLateralM() {
+  return
     max(ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm,
         ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm) / 1000.0f +
     PLANNER_TOTAL_HARD_CLEARANCE_M + LOCAL_MAP_CELL_M * 0.5f;
+}
+
+static float obstacleTargetLateralM(float sideSign,
+                                    float minimumLateralM,
+                                    float maximumLateralM) {
+  float lateralClearanceM = obstacleTargetMinimumLateralM();
   float targetLateralM = sideSign > 0.0f
     ? maximumLateralM + lateralClearanceM
     : minimumLateralM - lateralClearanceM;
@@ -1347,10 +1456,104 @@ static float obstacleTargetLateralM(float sideSign,
     : min(targetLateralM, -lateralClearanceM);
 }
 
-static void obstacleSideEscapeTarget(const ObstacleEnvelope &envelope,
-                                     float routeUx, float routeUy,
-                                     float sideSign,
-                                     float &targetX, float &targetY) {
+static void obstacleTargetWorldPosition(
+    float routeUx, float routeUy,
+    float targetAlongM, float targetLateralM,
+    float &targetX, float &targetY) {
+  targetX = obstacleContext.originX +
+            routeUx * targetAlongM - routeUy * targetLateralM;
+  targetY = obstacleContext.originY +
+            routeUy * targetAlongM + routeUx * targetLateralM;
+}
+
+static bool obstacleTargetPoseClear(
+    const PlannerCollisionSnapshot &snapshot,
+    float routeUx, float routeUy,
+    float targetAlongM, float targetLateralM) {
+  float targetX;
+  float targetY;
+  obstacleTargetWorldPosition(
+    routeUx, routeUy, targetAlongM, targetLateralM,
+    targetX, targetY);
+  float approachHeadingRad = atan2f(targetY - robotY,
+                                    targetX - robotX);
+  return footprintClearOnSnapshot(
+    snapshot, targetX, targetY, approachHeadingRad);
+}
+
+static bool chooseInsideBandTargetLateral(
+    const PlannerCollisionSnapshot &snapshot,
+    float routeUx, float routeUy, float sideSign,
+    float targetAlongM, float nominalTargetLateralM,
+  float &selectedTargetLateralM) {
+  selectedTargetLateralM = nominalTargetLateralM;
+  if (obstacleTargetPoseClear(
+        snapshot, routeUx, routeUy,
+        targetAlongM, nominalTargetLateralM)) {
+    return true;
+  }
+
+  const float minimumSignedLateralM =
+    obstacleTargetMinimumLateralM();
+  const float nominalSignedLateralM =
+    sideSign * nominalTargetLateralM;
+  const float maximumInwardShiftM =
+    nominalSignedLateralM - minimumSignedLateralM;
+  if (maximumInwardShiftM <= 0.0f) {
+    return false;
+  }
+
+  const float sampleStepM = LOCAL_MAP_CELL_M * 0.5f;
+  const int sampleCount = max(
+    1, (int)ceilf(maximumInwardShiftM / sampleStepM));
+  bool foundSafeBand = false;
+  float firstSafeInwardShiftM = 0.0f;
+  float outerSafeLateralM = nominalTargetLateralM;
+  float innerSafeLateralM = nominalTargetLateralM;
+  for (int sample = 1; sample <= sampleCount; ++sample) {
+    float inwardShiftM = min(
+      maximumInwardShiftM, sample * sampleStepM);
+    float candidateLateralM =
+      nominalTargetLateralM - sideSign * inwardShiftM;
+    bool clear = obstacleTargetPoseClear(
+      snapshot, routeUx, routeUy,
+      targetAlongM, candidateLateralM);
+    if (!clear) {
+      if (foundSafeBand) {
+        break;
+      }
+      continue;
+    }
+    if (!foundSafeBand) {
+      firstSafeInwardShiftM = inwardShiftM;
+      outerSafeLateralM = candidateLateralM;
+      foundSafeBand = true;
+    }
+    innerSafeLateralM = candidateLateralM;
+  }
+  if (!foundSafeBand) {
+    return false;
+  }
+  if (firstSafeInwardShiftM <= sampleStepM + 0.001f) {
+    return true;
+  }
+
+  float signedOuterM = sideSign * outerSafeLateralM;
+  float signedInnerM = sideSign * innerSafeLateralM;
+  float safeBandWidthM = max(0.0f, signedOuterM - signedInnerM);
+  float insideBufferM = min(
+    safeBandWidthM,
+    PLANNER_PREFERRED_CLEARANCE_M * 0.5f);
+  selectedTargetLateralM =
+    innerSafeLateralM + sideSign * insideBufferM;
+  return true;
+}
+
+static void obstacleSideEscapeTarget(
+    const ObstacleEnvelope &envelope,
+    float routeUx, float routeUy,
+    float sideSign,
+    float &targetX, float &targetY) {
   float frontClearM = ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm / 1000.0f +
                       PLANNER_TOTAL_HARD_CLEARANCE_M +
                       LOCAL_MAP_CELL_M * 0.5f;
@@ -1358,10 +1561,9 @@ static void obstacleSideEscapeTarget(const ObstacleEnvelope &envelope,
                                   PLANNER_OBSTACLE_TURN_ROOM_M);
   float targetLateralM = obstacleTargetLateralM(
     sideSign, envelope.minLateralM, envelope.maxLateralM);
-  targetX = obstacleContext.originX +
-            routeUx * targetAlongM - routeUy * targetLateralM;
-  targetY = obstacleContext.originY +
-            routeUy * targetAlongM + routeUx * targetLateralM;
+  obstacleTargetWorldPosition(
+    routeUx, routeUy, targetAlongM, targetLateralM,
+    targetX, targetY);
 }
 
 static bool obstacleSideEscapeCorridorBlocked(
@@ -1371,7 +1573,8 @@ static bool obstacleSideEscapeCorridorBlocked(
   float targetX;
   float targetY;
   obstacleSideEscapeTarget(
-    envelope, routeUx, routeUy, sideSign, targetX, targetY);
+    envelope, routeUx, routeUy,
+    sideSign, targetX, targetY);
   float dx = targetX - robotX;
   float dy = targetY - robotY;
   float distanceM = sqrtf(dx * dx + dy * dy);
@@ -1544,7 +1747,6 @@ static bool updateObstacleContext(float targetX, float targetY) {
     obstacleContext.clearSinceMs = 0;
     obstacleBypassSideSign = obstacleContext.sideSign;
     obstacleBypassPhase = BYPASS_SIDE_ESCAPE;
-    obstacleBypassPhaseStartedMs = millis();
     plannerTelemetry.replanReason = "obstacle_context_started";
     sendBluetoothEvent("obstacle_context_start",
                        obstacleContext.sideSign > 0.0f ? "left" : "right");
@@ -1601,7 +1803,6 @@ static bool updateObstacleContext(float targetX, float targetY) {
       obstacleContext.clearSinceMs = 0;
       obstacleBypassSideSign = obstacleContext.sideSign;
       obstacleBypassPhase = BYPASS_SIDE_ESCAPE;
-      obstacleBypassPhaseStartedMs = millis();
       plannerTelemetry.replanReason = "obstacle_side_infeasible";
       sendBluetoothEvent(
         "obstacle_side_switch",
@@ -1660,7 +1861,7 @@ static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
   float rearClearM = ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm / 1000.0f +
                      PLANNER_TOTAL_HARD_CLEARANCE_M +
                      LOCAL_MAP_CELL_M * 0.5f;
-  float targetLateralM = obstacleTargetLateralM(
+  float nominalTargetLateralM = obstacleTargetLateralM(
     obstacleContext.sideSign,
     obstacleContext.minLateralM,
     obstacleContext.maxLateralM);
@@ -1674,7 +1875,7 @@ static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
     ? PLANNER_OBSTACLE_RECONSIDERED_COUNTERSTEER_LEAD_M
     : PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
   bool laterallyClear = obstacleContext.sideSign * currentLateralM >=
-    obstacleContext.sideSign * targetLateralM -
+    obstacleContext.sideSign * nominalTargetLateralM -
       countersteerLeadM;
   float targetAlongM;
   if (laterallyClear ||
@@ -1687,16 +1888,36 @@ static void buildObstacleLocalGoal(float &localGoalX, float &localGoalY) {
     float approachAlongM =
       max(0.05f, obstacleContext.nearAlongM - frontClearM -
                  PLANNER_OBSTACLE_TURN_ROOM_M);
-    targetAlongM = obstacleContext.sideReconsidered
-      ? min(obstacleContext.sideEscapeAlongM, approachAlongM)
-      : approachAlongM;
+    if (obstacleContext.sideReconsidered) {
+      float sideEscapeTargetAlongM = obstacleContext.sideEscapeAlongM;
+      if (sideEscapeTargetAlongM >
+          obstacleContext.nearAlongM + PLANNER_PREFERRED_CLEARANCE_M) {
+        sideEscapeTargetAlongM =
+          obstacleContext.nearAlongM - PLANNER_PREFERRED_CLEARANCE_M;
+      }
+      targetAlongM = min(sideEscapeTargetAlongM, approachAlongM);
+    } else {
+      targetAlongM = approachAlongM;
+    }
   }
-  localGoalX = obstacleContext.originX +
-               obstacleContext.routeUx * targetAlongM -
-               obstacleContext.routeUy * targetLateralM;
-  localGoalY = obstacleContext.originY +
-               obstacleContext.routeUy * targetAlongM +
-               obstacleContext.routeUx * targetLateralM;
+  PlannerCollisionSnapshot collision;
+  capturePlannerCollisionSnapshot(collision);
+  float targetLateralM = nominalTargetLateralM;
+  chooseInsideBandTargetLateral(
+    collision,
+    obstacleContext.routeUx,
+    obstacleContext.routeUy,
+    obstacleContext.sideSign,
+    targetAlongM,
+    targetLateralM,
+    targetLateralM);
+  obstacleTargetWorldPosition(
+    obstacleContext.routeUx,
+    obstacleContext.routeUy,
+    targetAlongM,
+    targetLateralM,
+    localGoalX,
+    localGoalY);
 }
 
 static float minimumFanSweepClearanceMm() {
@@ -1761,6 +1982,8 @@ const char* plannerStopReasonName(PlannerStopReason reason) {
     case PLANNER_STOP_RECOVERY_REPEATED: return "recovery_repeated";
     case PLANNER_STOP_RECOVERY_NO_PROGRESS: return "recovery_no_progress";
     case PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME: return "recovery_no_useful_outcome";
+    case PLANNER_STOP_EMERGENCY_SCAN_ABORTED: return "emergency_scan_aborted";
+    case PLANNER_STOP_EMERGENCY_RETRY_EXHAUSTED: return "emergency_retry_exhausted";
     case PLANNER_STOP_ABORTED: return "aborted";
   }
   return "unknown";
@@ -1817,8 +2040,8 @@ static void finishNavigationGoal(bool success, PlannerStopReason reason, const c
   resetReversePlannerEpoch();
   reverseRecoveryActive = false;
   reverseRecoveryState = {};
-  recoveryAttemptResetPending = false;
-  resetRecoveryLivenessState();
+  resetRecoveryBudget();
+  emergencyRecoveryState = {};
   plannerTelemetry.reverseRecoveryActive = false;
   resetGeometricNoPathEvidence();
   reverseRecoveryRejectsReported = false;
@@ -1901,9 +2124,9 @@ void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owne
   plannerTelemetry.localGoalDistanceM = 0.0;
   plannerTelemetry.routeAlongProgressM = 0.0;
   plannerTelemetry.routeSignedLateralErrorM = 0.0;
-  plannerTelemetry.recoveryPhaseElapsedS = 0.0;
-  plannerTelemetry.cumulativeRecoveryDistanceM = 0.0;
-  plannerTelemetry.recoveryBestProgressM = 0.0;
+  plannerTelemetry.obstacleProgressAgeS = 0.0;
+  plannerTelemetry.cumulativeReverseDistanceM = 0.0;
+  plannerTelemetry.obstacleBestProgressM = 0.0;
   plannerTelemetry.recoveryCurrentClearanceM = 0.0f;
   plannerTelemetry.recoveryEndpointClearanceM = 0.0f;
   plannerTelemetry.recoveryClearanceGainM = 0.0f;
@@ -1919,8 +2142,8 @@ void startNavigationPoint(float targetX, float targetY, NavigationGoalOwner owne
   recentBlockedTurnMs = 0;
   reverseRecoveryActive = false;
   reverseRecoveryState = {};
-  resetRecoveryLivenessState();
-  recoveryAttemptResetPending = false;
+  resetRecoveryBudget();
+  emergencyRecoveryState = {};
   reverseRecoveryStepCount = 0;
   resetGeometricNoPathEvidence();
   candidateRejectsReported = false;
@@ -2234,6 +2457,7 @@ static bool rolloutCandidate(const PlannerEpoch &epoch,
 
 static bool obstacleRolloutMakesRequiredLateralProgress(
     float startX, float startY, float finalX, float finalY,
+    float localGoalX, float localGoalY,
     float &lateralProgressScore) {
   lateralProgressScore = 0.0f;
   if (!obstacleContext.active) {
@@ -2245,10 +2469,11 @@ static bool obstacleRolloutMakesRequiredLateralProgress(
                         startDy * obstacleContext.routeUy;
   float currentLateralM = -startDx * obstacleContext.routeUy +
                            startDy * obstacleContext.routeUx;
-  float targetLateralM = obstacleTargetLateralM(
-    obstacleContext.sideSign,
-    obstacleContext.minLateralM,
-    obstacleContext.maxLateralM);
+  float targetDx = localGoalX - obstacleContext.originX;
+  float targetDy = localGoalY - obstacleContext.originY;
+  float targetLateralM =
+    -targetDx * obstacleContext.routeUy +
+     targetDy * obstacleContext.routeUx;
   float countersteerLeadM = obstacleContext.sideReconsidered
     ? PLANNER_OBSTACLE_RECONSIDERED_COUNTERSTEER_LEAD_M
     : PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M;
@@ -2391,137 +2616,191 @@ static bool routeLineTrackingEligible(float &routeLengthM, float &routeUx,
     PLANNER_LINE_FOLLOW_ENABLE_HEADING_DEG;
 }
 
-static void resetRecoveryLivenessState() {
-  recoveryLivenessActive = false;
-  recoveryLivenessStartX = robotX;
-  recoveryLivenessStartY = robotY;
-  recoveryLivenessLastX = robotX;
-  recoveryLivenessLastY = robotY;
-  recoveryInitialGoalDistanceM = 0.0f;
-  recoveryBestGoalDistanceM = 0.0f;
-  recoveryStartRouteAlongM = 0.0f;
-  recoveryBestRouteAlongM = 0.0f;
-  recoveryProgressCheckpointGoalDistanceM = 0.0f;
-  recoveryProgressCheckpointRouteAlongM = 0.0f;
-  recoveryCumulativeDistanceM = 0.0f;
-  recoveryBestProgressM = 0.0f;
-  recoveryAttemptCount = 0;
-  recoveryLastProgressMs = 0;
+static void resetRecoveryBudget() {
+  recoveryBudget = {};
+  recoveryBudget.lastReverseX = robotX;
+  recoveryBudget.lastReverseY = robotY;
+  plannerTelemetry.obstacleProgressAgeS = 0.0f;
+  plannerTelemetry.cumulativeReverseDistanceM = 0.0f;
+  plannerTelemetry.obstacleBestProgressM = 0.0f;
+  plannerTelemetry.recoveryCount = 0;
 }
 
-static bool abortRecoveryLiveness(PlannerStopReason reason,
-                                  const char* detail) {
-  // finishNavigationGoal() neutralizes the command before publishing the
-  // typed abort.  This monitor never supplies a success result.
+static bool emergencyRecoveryOwnerEligible(NavigationGoalOwner owner) {
+  return owner == NAV_OWNER_ROUTE ||
+         owner == NAV_OWNER_RETURN_HOME ||
+         owner == NAV_OWNER_TEST_GOTO ||
+         owner == NAV_OWNER_TEST_AVOID ||
+         owner == NAV_OWNER_TEST_ESCAPE;
+}
+
+static bool emergencyRecoveryReasonEligible(PlannerStopReason reason) {
+  return reason == PLANNER_STOP_RECOVERY_TIME ||
+         reason == PLANNER_STOP_RECOVERY_DISTANCE ||
+         reason == PLANNER_STOP_RECOVERY_REPEATED ||
+         reason == PLANNER_STOP_RECOVERY_NO_PROGRESS ||
+         reason == PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME ||
+         reason == PLANNER_STOP_NO_SAFE_TRAJECTORY;
+}
+
+static bool emergencySensorFramesCurrent() {
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; ++i) {
+    if (!isRangeSensorCurrent((RangeSensorId)i)) {
+      return false;
+    }
+  }
+  return hasTrustedRearCoverage() &&
+         isRangeSensorCurrent(RANGE_FAKE_REAR);
+}
+
+static bool emergencyRecoverySensorsHealthy() {
+  return emergencySensorFramesCurrent() &&
+         !isRangeSensorBlocked(RANGE_FAKE_REAR);
+}
+
+static bool tryBeginEmergencyRecovery(PlannerStopReason reason,
+                                      const char* detail) {
+  if (!emergencyScanPolicyEnabled ||
+      emergencyRecoveryState.consumed ||
+      navigationGoal.mode != NAV_GOAL_POINT ||
+      !emergencyRecoveryOwnerEligible(navigationGoal.owner) ||
+      !emergencyRecoveryReasonEligible(reason) ||
+      navigationGoal.authority == MOTION_AUTHORITY_NONE ||
+      navigationGoal.authority != motionAuthority ||
+      driveStuck || wheelMismatchStuck || turnStuck ||
+      !emergencyRecoverySensorsHealthy()) {
+    return false;
+  }
+  if (reason == PLANNER_STOP_NO_SAFE_TRAJECTORY &&
+      recoveryBudget.attemptCount == 0) {
+    return false;
+  }
+
+  const unsigned long now = millis();
+  resetPlannerEpoch();
+  resetReversePlannerEpoch();
+  reverseRecoveryActive = false;
+  reverseRecoveryState = {};
+  resetRecoveryBudget();
+  resetGeometricNoPathEvidence();
+  emergencyRecoveryState = {};
+  emergencyRecoveryState.phase = EMERGENCY_RECOVERY_SETTLE_CURRENT;
+  emergencyRecoveryState.consumed = true;
+  emergencyRecoveryState.triggerReason = reason;
+  emergencyRecoveryState.triggerDetail = detail;
+  emergencyRecoveryState.startedMs = now;
+  emergencyRecoveryState.phaseStartedMs = now;
+  emergencyRecoveryState.startX = robotX;
+  emergencyRecoveryState.startY = robotY;
+  emergencyRecoveryState.lastX = robotX;
+  emergencyRecoveryState.lastY = robotY;
+  emergencyRecoveryState.relocationCheckpointX = robotX;
+  emergencyRecoveryState.relocationCheckpointY = robotY;
+  emergencyRecoveryState.scanLastYawDeg = navigationHeadingDeg();
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; ++i) {
+    emergencyRecoveryState.fanReadBaselineMs[i - RANGE_RIGHT_OUTER] =
+      rangeSensors[i].lastReadMs;
+  }
+  emergencyRecoveryState.rearFrameBaseline =
+    getRearObstacleFrameSequence();
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  plannerTelemetry.reverseRecoveryActive = false;
+  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
+  plannerTelemetry.planReason = "emergency_scan_settle";
   plannerTelemetry.replanReason = detail;
+  plannerTelemetry.safeStopReason = "";
+  sendBluetoothEvent("emergency_scan_start", detail);
+  return true;
+}
+
+static bool handleRecoveryExhaustion(PlannerStopReason reason,
+                                     const char* detail) {
+  plannerTelemetry.replanReason = detail;
+  if (emergencyRecoveryReasonEligible(reason) &&
+      emergencyRecoveryState.consumed &&
+      emergencyRecoveryState.retryActive) {
+    finishNavigationGoal(false,
+      PLANNER_STOP_EMERGENCY_RETRY_EXHAUSTED,
+      "emergency_scan_retry_exhausted");
+    return true;
+  }
+  if (tryBeginEmergencyRecovery(reason, detail)) {
+    return true;
+  }
   finishNavigationGoal(false, reason, detail);
   return true;
 }
 
-static bool updateRecoveryLiveness(float globalGoalDistanceM,
-                                   float localGoalDistanceM,
-                                   bool routeFrameValid,
-                                   float routeUx, float routeUy) {
-  float routeAlongM = routeFrameValid
-    ? routeLineAlongM(robotX, robotY, routeUx, routeUy) : 0.0f;
-  float signedLateralM = routeFrameValid
-    ? routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy) : 0.0f;
+static bool updateReverseRecoveryBudget() {
   unsigned long now = millis();
+  recoveryBudget.cumulativeReverseDistanceM += hypotf(
+    robotX - recoveryBudget.lastReverseX,
+    robotY - recoveryBudget.lastReverseY);
+  recoveryBudget.lastReverseX = robotX;
+  recoveryBudget.lastReverseY = robotY;
+  plannerTelemetry.obstacleProgressAgeS = 0.0f;
+  plannerTelemetry.cumulativeReverseDistanceM =
+    recoveryBudget.cumulativeReverseDistanceM;
+  plannerTelemetry.recoveryCount = recoveryBudget.attemptCount;
 
-  plannerTelemetry.globalGoalDistanceM = globalGoalDistanceM;
-  plannerTelemetry.localGoalDistanceM = localGoalDistanceM;
-  plannerTelemetry.routeAlongProgressM = routeAlongM;
-  plannerTelemetry.routeSignedLateralErrorM = signedLateralM;
+  if (reverseRecoveryStartedMs != 0 &&
+      now - reverseRecoveryStartedMs >
+        PLANNER_REVERSE_RECOVERY_MAX_TIME_MS) {
+    return handleRecoveryExhaustion(
+      PLANNER_STOP_RECOVERY_TIME,
+      "reverse_recovery_time_exhausted");
+  }
+  if (recoveryBudget.cumulativeReverseDistanceM >
+      PLANNER_RECOVERY_MAX_CUMULATIVE_REVERSE_DISTANCE_M) {
+    return handleRecoveryExhaustion(
+      PLANNER_STOP_RECOVERY_DISTANCE,
+      "reverse_recovery_distance_exhausted");
+  }
+  uint8_t maximumAttempts =
+    emergencyRecoveryState.retryActive ? 1 : PLANNER_RECOVERY_MAX_COUNT;
+  if (recoveryBudget.attemptCount > maximumAttempts) {
+    return handleRecoveryExhaustion(
+      PLANNER_STOP_RECOVERY_REPEATED,
+      "recovery_count_exhausted");
+  }
+  return false;
+}
 
-  bool mustSupervise = obstacleBypassPhase != BYPASS_IDLE ||
-                       reverseRecoveryActive ||
-                       recoveryAttemptResetPending;
-  if (!mustSupervise) {
+static bool obstacleProgressStalled(float localGoalX, float localGoalY,
+                                    float localGoalDistanceM) {
+  if (!obstacleContext.active) {
     return false;
   }
 
-  if (!recoveryLivenessActive) {
-    recoveryLivenessActive = true;
-    recoveryLivenessStartX = robotX;
-    recoveryLivenessStartY = robotY;
-    recoveryLivenessLastX = robotX;
-    recoveryLivenessLastY = robotY;
-    recoveryInitialGoalDistanceM = globalGoalDistanceM;
-    recoveryBestGoalDistanceM = globalGoalDistanceM;
-    recoveryStartRouteAlongM = routeAlongM;
-    recoveryBestRouteAlongM = routeAlongM;
-    recoveryProgressCheckpointGoalDistanceM = globalGoalDistanceM;
-    recoveryProgressCheckpointRouteAlongM = routeAlongM;
-    recoveryLastProgressMs = now;
-    if (obstacleBypassPhaseStartedMs == 0) {
-      obstacleBypassPhaseStartedMs = now;
-    }
-    sendBluetoothEvent("recovery_liveness_start", "original_goal_supervision");
+  unsigned long now = millis();
+  float goalShiftM = obstacleContext.progressGoalValid
+    ? hypotf(localGoalX - obstacleContext.progressGoalX,
+             localGoalY - obstacleContext.progressGoalY)
+    : 0.0f;
+  if (!obstacleContext.progressGoalValid ||
+      goalShiftM >= LOCAL_MAP_CELL_M) {
+    obstacleContext.progressGoalValid = true;
+    obstacleContext.progressGoalX = localGoalX;
+    obstacleContext.progressGoalY = localGoalY;
+    obstacleContext.progressStartDistanceM = localGoalDistanceM;
+    obstacleContext.progressBestDistanceM = localGoalDistanceM;
+    obstacleContext.progressLastMs = now;
+  } else if (localGoalDistanceM <=
+             obstacleContext.progressBestDistanceM -
+               PLANNER_OBSTACLE_PROGRESS_EPSILON_M) {
+    obstacleContext.progressBestDistanceM = localGoalDistanceM;
+    obstacleContext.progressLastMs = now;
   }
 
-  recoveryCumulativeDistanceM +=
-    sqrtf((robotX - recoveryLivenessLastX) * (robotX - recoveryLivenessLastX) +
-          (robotY - recoveryLivenessLastY) * (robotY - recoveryLivenessLastY));
-  recoveryLivenessLastX = robotX;
-  recoveryLivenessLastY = robotY;
-  recoveryBestGoalDistanceM = min(recoveryBestGoalDistanceM, globalGoalDistanceM);
-  recoveryBestRouteAlongM = max(recoveryBestRouteAlongM, routeAlongM);
-  recoveryBestProgressM = max(recoveryInitialGoalDistanceM - recoveryBestGoalDistanceM,
-                              recoveryBestRouteAlongM - recoveryStartRouteAlongM);
-
-  if (globalGoalDistanceM <= recoveryProgressCheckpointGoalDistanceM -
-                               PLANNER_RECOVERY_PROGRESS_EPSILON_M ||
-      routeAlongM >= recoveryProgressCheckpointRouteAlongM +
-                       PLANNER_RECOVERY_PROGRESS_EPSILON_M) {
-    recoveryProgressCheckpointGoalDistanceM =
-      min(recoveryProgressCheckpointGoalDistanceM, globalGoalDistanceM);
-    recoveryProgressCheckpointRouteAlongM =
-      max(recoveryProgressCheckpointRouteAlongM, routeAlongM);
-    recoveryLastProgressMs = now;
-  }
-
-  plannerTelemetry.recoveryPhaseElapsedS =
-    obstacleBypassPhaseStartedMs == 0
-      ? 0.0f : (now - obstacleBypassPhaseStartedMs) / 1000.0f;
-  plannerTelemetry.cumulativeRecoveryDistanceM = recoveryCumulativeDistanceM;
-  plannerTelemetry.recoveryBestProgressM = recoveryBestProgressM;
-  plannerTelemetry.recoveryCount = recoveryAttemptCount;
-
-  if (globalGoalDistanceM - recoveryBestGoalDistanceM >
-      PLANNER_RECOVERY_MAX_GOAL_DIVERGENCE_M) {
-    return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_DIVERGENCE,
-                                 "recovery_goal_divergence");
-  }
-  float recoveryLateralM = routeFrameValid
-    ? -(robotX - recoveryLivenessStartX) * routeUy +
-        (robotY - recoveryLivenessStartY) * routeUx : 0.0f;
-  if (fabs(recoveryLateralM) >
-      PLANNER_RECOVERY_MAX_LATERAL_DISPLACEMENT_M) {
-    return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_DISPLACEMENT,
-                                 "recovery_lateral_displacement");
-  }
-  if (obstacleBypassPhaseStartedMs != 0 &&
-      now - obstacleBypassPhaseStartedMs >
-        PLANNER_RECOVERY_MAX_PHASE_TIME_MS) {
-    return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_TIME,
-                                 "recovery_phase_time_exhausted");
-  }
-  if (recoveryCumulativeDistanceM >
-      PLANNER_RECOVERY_MAX_CUMULATIVE_DISTANCE_M) {
-    return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_DISTANCE,
-                                 "recovery_distance_exhausted");
-  }
-  if (recoveryAttemptCount > PLANNER_RECOVERY_MAX_COUNT) {
-    return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_REPEATED,
-                                 "recovery_count_exhausted");
-  }
-  if (recoveryLastProgressMs != 0 &&
-      now - recoveryLastProgressMs >
-        PLANNER_RECOVERY_NO_PROGRESS_TIMEOUT_MS) {
-    return abortRecoveryLiveness(PLANNER_STOP_RECOVERY_NO_PROGRESS,
-                                 "recovery_progress_stalled");
-  }
-  return false;
+  plannerTelemetry.obstacleProgressAgeS =
+    (now - obstacleContext.progressLastMs) / 1000.0f;
+  plannerTelemetry.obstacleBestProgressM = max(
+    0.0f,
+    obstacleContext.progressStartDistanceM -
+      obstacleContext.progressBestDistanceM);
+  return now - obstacleContext.progressLastMs >
+    PLANNER_OBSTACLE_PROGRESS_TIMEOUT_MS;
 }
 
 static bool routeLineGoalReached(float routeLengthM, float routeUx, float routeUy,
@@ -2534,6 +2813,77 @@ static bool routeLineGoalReached(float routeLengthM, float routeUx, float routeU
          alongM <= routeLengthM + PLANNER_LINE_FOLLOW_FINISH_OVERSHOOT_M &&
          lateralErrorM <= PLANNER_LINE_FOLLOW_FINISH_LATERAL_M &&
          headingErrorDeg <= PLANNER_LINE_FOLLOW_FINISH_HEADING_DEG;
+}
+
+enum SafePivotStepResult {
+  SAFE_PIVOT_STEP_PUBLISHED,
+  SAFE_PIVOT_STEP_REVALIDATING,
+  SAFE_PIVOT_STEP_SIDE_INVALID,
+  SAFE_PIVOT_STEP_SWEEP_INVALID,
+  SAFE_PIVOT_STEP_SWEEP_BLOCKED,
+  SAFE_PIVOT_STEP_STUCK,
+  SAFE_PIVOT_STEP_PUBLICATION_VETOED
+};
+
+static SafePivotStepResult commandSafePivotStep(
+    float turnTarget, const char* motionPlanReason,
+    const char* sideRevalidatePlanReason,
+    const char* sweepRevalidatePlanReason) {
+  if (!isTurnDirectionObservable(turnTarget)) {
+    unsigned long now = millis();
+    if (turnSideInvalidSinceMs == 0) {
+      turnSideInvalidSinceMs = now;
+      sendBluetoothEvent("turn_side_revalidate",
+                         "motors_stopped_for_fresh_sample");
+    }
+    motorStopRequested = true;
+    setMotionCommand(0.0, 0.0);
+    if (now - turnSideInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
+      plannerTelemetry.planReason = sideRevalidatePlanReason;
+      return SAFE_PIVOT_STEP_REVALIDATING;
+    }
+    return SAFE_PIVOT_STEP_SIDE_INVALID;
+  }
+  turnSideInvalidSinceMs = 0;
+
+  if (!areTurnSweepSensorsValid()) {
+    unsigned long now = millis();
+    if (turnSweepInvalidSinceMs == 0) {
+      turnSweepInvalidSinceMs = now;
+      sendBluetoothEvent("turn_sweep_revalidate",
+                         "motors_stopped_for_fresh_sample");
+    }
+    motorStopRequested = true;
+    setMotionCommand(0.0, 0.0);
+    if (now - turnSweepInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
+      plannerTelemetry.planReason = sweepRevalidatePlanReason;
+      return SAFE_PIVOT_STEP_REVALIDATING;
+    }
+    return SAFE_PIVOT_STEP_SWEEP_INVALID;
+  }
+  turnSweepInvalidSinceMs = 0;
+
+  if (!isTurnSweepSafe()) {
+    return SAFE_PIVOT_STEP_SWEEP_BLOCKED;
+  }
+
+  updateStuckTurning(navigationHeadingDeg());
+  if (turnStuck) {
+    return SAFE_PIVOT_STEP_STUCK;
+  }
+
+  plannerTelemetry.selectedForwardTicksPerSec = 0.0f;
+  plannerTelemetry.selectedTurnTicksPerSec = turnTarget;
+  plannerTelemetry.selectedCurvature = 0.0f;
+  plannerTelemetry.minimumSweptClearanceMm = minimumFanSweepClearanceMm();
+  plannerTelemetry.speedCapTicksPerSec = 0.0f;
+  plannerTelemetry.candidateCount = 1;
+  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
+  plannerTelemetry.planReason = motionPlanReason;
+  motorStopRequested = false;
+  return publishNavigationMotion(0.0f, turnTarget)
+    ? SAFE_PIVOT_STEP_PUBLISHED
+    : SAFE_PIVOT_STEP_PUBLICATION_VETOED;
 }
 
 static bool routeLineOvershootStopReached(float routeLengthM, float routeUx,
@@ -2962,6 +3312,7 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
       float obstacleLateralProgressScore = 0.0f;
       if (!obstacleRolloutMakesRequiredLateralProgress(
             plannerEpoch.startX, plannerEpoch.startY, finalX, finalY,
+            plannerEpoch.goalX, plannerEpoch.goalY,
             obstacleLateralProgressScore)) {
         continue;
       }
@@ -2982,7 +3333,7 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
         plannerEpoch.lineFollowActive,
         navigationGoal.startX, navigationGoal.startY,
         plannerEpoch.routeHeadingRad, plannerEpoch.finalGoalDistanceM);
-      if (recoveryAttemptResetPending) {
+      if (recoveryBudget.forwardTakeoverPending) {
         // After reverse has deliberately spent route progress, prefer a
         // decisive clearance gain before resuming ordinary goal scoring.
         score += 3.0f * obstacleLateralProgressScore;
@@ -3095,6 +3446,7 @@ static TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
   float obstacleLateralProgressScore = 0.0f;
   if (!obstacleRolloutMakesRequiredLateralProgress(
         plannerEpoch.startX, plannerEpoch.startY, finalX, finalY,
+        plannerEpoch.goalX, plannerEpoch.goalY,
         obstacleLateralProgressScore)) {
     return retryPlannerEpoch(PLANNER_STOP_NO_SAFE_TRAJECTORY,
                              "winner_obstacle_progress_rejected",
@@ -3369,6 +3721,8 @@ static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
   reversePlannerEpoch.startedMs = millis();
   reversePlannerEpoch.goalStartedMs = navigationGoal.startedMs;
   reversePlannerEpoch.authority = navigationGoal.authority;
+  reversePlannerEpoch.emergencyScanObjective =
+    emergencyRecoveryState.phase == EMERGENCY_RECOVERY_RELOCATE;
   reversePlannerEpoch.goalX = goalX;
   reversePlannerEpoch.goalY = goalY;
   reversePlannerEpoch.bestScore = -1000000.0f;
@@ -3503,12 +3857,25 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
       reversePlannerEpoch.acceptedCount++;
       plannerTelemetry.candidateCount =
         reversePlannerEpoch.acceptedCount;
+      float rotationalClearanceM = endpointClearanceM;
+      if (reversePlannerEpoch.emergencyScanObjective) {
+        rotationalClearanceM = rotationalEnvelopeClearanceM(
+          reversePlannerEpoch.collision, finalX, finalY);
+      }
       float score = reverseRecoveryScore(
         reverseTicks, turnTicks,
         reversePlannerEpoch.previousSelectedTurn,
         sweepClearanceM, forwardQuality, unexploredScore);
+      if (reversePlannerEpoch.emergencyScanObjective) {
+        score += constrain(
+          rotationalClearanceM / PLANNER_REVERSE_CLEARANCE_CAP_M,
+          0.0f, 1.0f);
+      }
+      float selectionClearanceM =
+        reversePlannerEpoch.emergencyScanObjective
+          ? rotationalClearanceM : endpointClearanceM;
       int clearanceBand = (int)floorf(
-        min(endpointClearanceM, PLANNER_REVERSE_CLEARANCE_CAP_M) /
+        min(selectionClearanceM, PLANNER_REVERSE_CLEARANCE_CAP_M) /
         PLANNER_REVERSE_CLEARANCE_BAND_M + 0.0001f);
       if (clearanceBand > reversePlannerEpoch.bestClearanceBand ||
           (clearanceBand == reversePlannerEpoch.bestClearanceBand &&
@@ -3519,6 +3886,8 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
         reversePlannerEpoch.bestTurn = turnTicks;
         reversePlannerEpoch.bestRearClearance = rearClearanceMm;
         reversePlannerEpoch.bestEndpointClearanceM = endpointClearanceM;
+        reversePlannerEpoch.bestRotationalClearanceM =
+          rotationalClearanceM;
         reversePlannerEpoch.bestSweepClearanceM = sweepClearanceM;
         reversePlannerEpoch.bestForwardQuality = forwardQuality;
         reversePlannerEpoch.bestUnexploredScore = unexploredScore;
@@ -3612,6 +3981,13 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
   reverseRecoveryState.clearanceGainM = endpointClearanceM -
     reverseRecoveryState.currentClearanceM;
   reverseRecoveryState.unexploredScore = unexploredScore;
+  if (reversePlannerEpoch.emergencyScanObjective) {
+    float rotationalClearanceM = rotationalEnvelopeClearanceM(
+      reversePlannerEpoch.collision, finalX, finalY);
+    emergencyRecoveryState.bestRotationalClearanceM = max(
+      emergencyRecoveryState.bestRotationalClearanceM,
+      rotationalClearanceM);
+  }
   if (reverseRecoveryState.clearanceGainM <=
       PLANNER_REVERSE_CLEARANCE_GAIN_M) {
     if (reverseRecoveryState.plateauCount <
@@ -3661,13 +4037,416 @@ static TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
   return TRAJECTORY_PLAN_SUCCESS;
 }
 
+static void recordEmergencySensorBaselines() {
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; ++i) {
+    emergencyRecoveryState.fanReadBaselineMs[i - RANGE_RIGHT_OUTER] =
+      rangeSensors[i].lastReadMs;
+  }
+  emergencyRecoveryState.rearFrameBaseline =
+    getRearObstacleFrameSequence();
+}
 
-static bool canStartEvidenceDrivenReverse() {
+static bool emergencySensorsAdvancedSinceBaseline() {
+  if (!emergencySensorFramesCurrent()) {
+    return false;
+  }
+  for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; ++i) {
+    if (rangeSensors[i].lastReadMs <=
+        emergencyRecoveryState
+          .fanReadBaselineMs[i - RANGE_RIGHT_OUTER]) {
+      return false;
+    }
+  }
+  uint32_t rearSequence = getRearObstacleFrameSequence();
+  return rearSequence != 0 &&
+         rearSequence != emergencyRecoveryState.rearFrameBaseline;
+}
+
+static void abortEmergencyRecovery(const char* detail) {
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  sendBluetoothEvent("emergency_scan_abort", detail);
+  finishNavigationGoal(false, PLANNER_STOP_EMERGENCY_SCAN_ABORTED, detail);
+}
+
+static int8_t chooseEmergencyScanDirection() {
+  float leftClearanceMm = min(
+    getFanSweepClearanceMm(RANGE_LEFT_INNER),
+    getFanSweepClearanceMm(RANGE_LEFT_OUTER));
+  float rightClearanceMm = min(
+    getFanSweepClearanceMm(RANGE_RIGHT_INNER),
+    getFanSweepClearanceMm(RANGE_RIGHT_OUTER));
+  return leftClearanceMm >= rightClearanceMm ? 1 : -1;
+}
+
+static void startEmergencyScanAtCurrentPose() {
+  resetReversePlannerEpoch();
+  reverseRecoveryActive = false;
+  reverseRecoveryState = {};
+  plannerTelemetry.reverseRecoveryActive = false;
+  emergencyRecoveryState.phase = EMERGENCY_RECOVERY_SCAN_TURN;
+  emergencyRecoveryState.phaseStartedMs = millis();
+  emergencyRecoveryState.scanDirection = chooseEmergencyScanDirection();
+  emergencyRecoveryState.scanSector = 0;
+  emergencyRecoveryState.scanLastYawDeg = navigationHeadingDeg();
+  emergencyRecoveryState.scanAccumulatedDeg = 0.0f;
+  emergencyRecoveryState.scanTargetAccumulatedDeg =
+    PLANNER_EMERGENCY_SCAN_STEP_DEG;
+  turnSideInvalidSinceMs = 0;
+  turnSweepInvalidSinceMs = 0;
+  resetTurnStuckCheck(navigationHeadingDeg());
+  plannerTelemetry.planReason = "emergency_scan_turn";
+  plannerTelemetry.replanReason = "stationary_scan";
+}
+
+static void enterEmergencyRelocation(const char* detail) {
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  resetReversePlannerEpoch();
+  if (emergencyRecoveryState.relocationStartedMs == 0) {
+    emergencyRecoveryState.relocationStartedMs = millis();
+    emergencyRecoveryState.relocationCheckpointX = robotX;
+    emergencyRecoveryState.relocationCheckpointY = robotY;
+    sendBluetoothEvent("emergency_relocation_start", detail);
+  }
+  emergencyRecoveryState.phase = EMERGENCY_RECOVERY_RELOCATE;
+  emergencyRecoveryState.phaseStartedMs = millis();
+  reverseRecoveryActive = true;
+  reverseRecoveryStartedMs = millis();
+  reverseRecoveryStepCount = 0;
+  reverseRecoveryState = {};
+  plannerTelemetry.reverseRecoveryActive = true;
+  plannerTelemetry.planReason = "emergency_relocation";
+  plannerTelemetry.replanReason = detail;
+}
+
+static void enterEmergencyScanUnwind(const char* detail) {
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  resetReversePlannerEpoch();
+  emergencyRecoveryState.phase =
+    EMERGENCY_RECOVERY_SCAN_UNWIND;
+  emergencyRecoveryState.phaseStartedMs = millis();
+  emergencyRecoveryState.scanLastYawDeg =
+    navigationHeadingDeg();
+  turnSideInvalidSinceMs = 0;
+  turnSweepInvalidSinceMs = 0;
+  resetTurnStuckCheck(navigationHeadingDeg());
+  plannerTelemetry.planReason = "emergency_scan_unwind";
+  plannerTelemetry.replanReason = detail;
+  sendBluetoothEvent("emergency_scan_blocked", detail);
+}
+
+static void enterEmergencySensorSettle(EmergencyRecoveryPhase phase,
+                                       const char* planReason) {
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  resetReversePlannerEpoch();
+  reverseRecoveryActive = false;
+  plannerTelemetry.reverseRecoveryActive = false;
+  emergencyRecoveryState.phase = phase;
+  emergencyRecoveryState.phaseStartedMs = millis();
+  recordEmergencySensorBaselines();
+  plannerTelemetry.planReason = planReason;
+}
+
+static void completeEmergencyScanAndPrepareRetry() {
+  motorStopRequested = true;
+  setMotionCommand(0.0, 0.0);
+  reverseRecoveryActive = false;
+  reverseRecoveryState = {};
+  resetPlannerEpoch();
+  resetReversePlannerEpoch();
+  resetGeometricNoPathEvidence();
+  resetRecoveryBudget();
+  resetObstacleContext("emergency_scan_retry");
+  pointAlignTurnActive = false;
+  pointAlignTurnDirection = 0.0f;
+  turnBrakeActive = false;
+  turnSideInvalidSinceMs = 0;
+  turnSweepInvalidSinceMs = 0;
+  resetTurnStuckCheck(navigationHeadingDeg());
+  emergencyRecoveryState.phase = EMERGENCY_RECOVERY_RETRY_ACTIVE;
+  emergencyRecoveryState.retryActive = true;
+  emergencyRecoveryState.phaseStartedMs = millis();
+  lastPlannerUpdateMs = 0;
+  plannerTelemetry.reverseRecoveryActive = false;
+  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
+  plannerTelemetry.planReason = "emergency_retry_ready";
+  plannerTelemetry.replanReason = "scan_complete";
+  plannerTelemetry.safeStopReason = "";
+  sendBluetoothEvent("emergency_scan_complete", "full_revolution");
+  sendBluetoothEvent("emergency_retry_start", "original_goal");
+}
+
+static void updateEmergencyRecovery() {
+  EmergencyRecoveryState &state = emergencyRecoveryState;
+  const unsigned long now = millis();
+  float translationM = hypotf(robotX - state.lastX, robotY - state.lastY);
+  state.lastX = robotX;
+  state.lastY = robotY;
+  state.relocationDistanceM += translationM;
+  plannerTelemetry.cumulativeReverseDistanceM =
+    state.relocationDistanceM;
+
+  if (now - state.startedMs > PLANNER_EMERGENCY_TOTAL_TIMEOUT_MS) {
+    abortEmergencyRecovery("emergency_total_timeout");
+    return;
+  }
+
+  if (state.phase == EMERGENCY_RECOVERY_SETTLE_CURRENT) {
+    motorStopRequested = true;
+    setMotionCommand(0.0, 0.0);
+    if (emergencySensorsAdvancedSinceBaseline()) {
+      startEmergencyScanAtCurrentPose();
+      return;
+    }
+    if (now - state.phaseStartedMs >
+        PLANNER_EMERGENCY_SENSOR_WAIT_MS) {
+      abortEmergencyRecovery("emergency_initial_sensor_timeout");
+    }
+    return;
+  }
+
+  if (state.phase == EMERGENCY_RECOVERY_SCAN_TURN) {
+    if (!emergencySensorFramesCurrent()) {
+      abortEmergencyRecovery("emergency_scan_sensor_unhealthy");
+      return;
+    }
+    if (isRangeSensorBlocked(RANGE_FAKE_REAR)) {
+      enterEmergencyScanUnwind("scan_rear_became_blocked");
+      return;
+    }
+    float headingDeg = navigationHeadingDeg();
+    float yawDeltaDeg = wrapAngle(headingDeg - state.scanLastYawDeg);
+    state.scanLastYawDeg = headingDeg;
+    float directedProgressDeg = yawDeltaDeg * state.scanDirection;
+    if (fabs(yawDeltaDeg) <= PLANNER_EMERGENCY_SCAN_STEP_DEG) {
+      state.scanAccumulatedDeg = max(
+        0.0f, state.scanAccumulatedDeg + directedProgressDeg);
+    }
+    float remainingDeg = state.scanTargetAccumulatedDeg -
+                         state.scanAccumulatedDeg;
+    if (remainingDeg <= TURN_TOLERANCE_DEG) {
+      motorStopRequested = true;
+      setMotionCommand(0.0, 0.0);
+      state.phase = EMERGENCY_RECOVERY_SCAN_DWELL;
+      state.phaseStartedMs = now;
+      recordEmergencySensorBaselines();
+      plannerTelemetry.planReason = "emergency_scan_dwell";
+      return;
+    }
+    if (now - state.phaseStartedMs >
+        PLANNER_EMERGENCY_SECTOR_TIMEOUT_MS) {
+      abortEmergencyRecovery("emergency_scan_sector_timeout");
+      return;
+    }
+
+    PlannerCollisionSnapshot snapshot;
+    capturePlannerCollisionSnapshot(snapshot);
+    if (!turnSegmentFootprintClear(
+          snapshot, robotX, robotY, headingDeg,
+          state.scanDirection, remainingDeg)) {
+      enterEmergencyScanUnwind("scan_segment_map_blocked");
+      return;
+    }
+
+    float turnTarget = state.scanDirection *
+      PLANNER_TURN_SLOW_TARGET_SPEED;
+    SafePivotStepResult pivotResult = commandSafePivotStep(
+      turnTarget,
+      "emergency_scan_turn",
+      "emergency_scan_side_revalidating",
+      "emergency_scan_sweep_revalidating");
+    if (pivotResult == SAFE_PIVOT_STEP_SWEEP_BLOCKED) {
+      enterEmergencyScanUnwind("scan_live_sweep_blocked");
+    } else if (pivotResult == SAFE_PIVOT_STEP_SIDE_INVALID ||
+               pivotResult == SAFE_PIVOT_STEP_SWEEP_INVALID) {
+      abortEmergencyRecovery("emergency_scan_sensor_invalid");
+    } else if (pivotResult == SAFE_PIVOT_STEP_STUCK) {
+      abortEmergencyRecovery("emergency_scan_turn_stalled");
+    } else if (pivotResult ==
+               SAFE_PIVOT_STEP_PUBLICATION_VETOED) {
+      abortEmergencyRecovery("emergency_scan_motion_vetoed");
+    }
+    return;
+  }
+
+  if (state.phase == EMERGENCY_RECOVERY_SCAN_UNWIND) {
+    if (!emergencySensorFramesCurrent()) {
+      abortEmergencyRecovery("emergency_unwind_sensor_unhealthy");
+      return;
+    }
+    float headingDeg = navigationHeadingDeg();
+    float yawDeltaDeg = wrapAngle(headingDeg - state.scanLastYawDeg);
+    state.scanLastYawDeg = headingDeg;
+    float directedProgressDeg = yawDeltaDeg * state.scanDirection;
+    if (fabs(yawDeltaDeg) <= PLANNER_EMERGENCY_SCAN_STEP_DEG) {
+      state.scanAccumulatedDeg = max(
+        0.0f, state.scanAccumulatedDeg + directedProgressDeg);
+    }
+    if (state.scanAccumulatedDeg <= TURN_TOLERANCE_DEG) {
+      if (!emergencyRecoverySensorsHealthy()) {
+        abortEmergencyRecovery("emergency_unwind_rear_blocked");
+        return;
+      }
+      enterEmergencyRelocation("partial_scan_unwound");
+      return;
+    }
+    if (now - state.phaseStartedMs >
+        PLANNER_EMERGENCY_SECTOR_TIMEOUT_MS *
+          PLANNER_EMERGENCY_SCAN_SECTORS) {
+      abortEmergencyRecovery("emergency_scan_unwind_timeout");
+      return;
+    }
+
+    PlannerCollisionSnapshot snapshot;
+    capturePlannerCollisionSnapshot(snapshot);
+    if (!turnSegmentFootprintClear(
+          snapshot, robotX, robotY, headingDeg,
+          -state.scanDirection, state.scanAccumulatedDeg)) {
+      abortEmergencyRecovery("emergency_scan_unwind_map_blocked");
+      return;
+    }
+    float turnTarget = -state.scanDirection *
+      PLANNER_TURN_SLOW_TARGET_SPEED;
+    SafePivotStepResult pivotResult = commandSafePivotStep(
+      turnTarget,
+      "emergency_scan_unwind",
+      "emergency_unwind_side_revalidating",
+      "emergency_unwind_sweep_revalidating");
+    if (pivotResult == SAFE_PIVOT_STEP_SIDE_INVALID ||
+        pivotResult == SAFE_PIVOT_STEP_SWEEP_INVALID) {
+      abortEmergencyRecovery("emergency_scan_unwind_sensor_invalid");
+    } else if (pivotResult == SAFE_PIVOT_STEP_SWEEP_BLOCKED) {
+      abortEmergencyRecovery("emergency_scan_unwind_sweep_blocked");
+    } else if (pivotResult == SAFE_PIVOT_STEP_STUCK) {
+      abortEmergencyRecovery("emergency_scan_unwind_stalled");
+    } else if (pivotResult ==
+               SAFE_PIVOT_STEP_PUBLICATION_VETOED) {
+      abortEmergencyRecovery("emergency_scan_unwind_motion_vetoed");
+    }
+    return;
+  }
+
+  if (state.phase == EMERGENCY_RECOVERY_SCAN_DWELL) {
+    motorStopRequested = true;
+    setMotionCommand(0.0, 0.0);
+    if (emergencySensorsAdvancedSinceBaseline()) {
+      state.scanSector++;
+      char detail[48];
+      snprintf(detail, sizeof(detail), "sector=%u;yaw=%.1f",
+               state.scanSector, state.scanAccumulatedDeg);
+      sendBluetoothEvent("emergency_scan_sector", detail);
+      if (state.scanSector >= PLANNER_EMERGENCY_SCAN_SECTORS) {
+        state.phase = EMERGENCY_RECOVERY_RESET_RETRY;
+        state.phaseStartedMs = now;
+        completeEmergencyScanAndPrepareRetry();
+        return;
+      }
+      state.scanTargetAccumulatedDeg =
+        (state.scanSector + 1) * PLANNER_EMERGENCY_SCAN_STEP_DEG;
+      state.phase = EMERGENCY_RECOVERY_SCAN_TURN;
+      state.phaseStartedMs = now;
+      turnSideInvalidSinceMs = 0;
+      turnSweepInvalidSinceMs = 0;
+      resetTurnStuckCheck(navigationHeadingDeg());
+      plannerTelemetry.planReason = "emergency_scan_turn";
+      return;
+    }
+    if (now - state.phaseStartedMs >
+        PLANNER_EMERGENCY_SENSOR_WAIT_MS) {
+      abortEmergencyRecovery("emergency_scan_dwell_sensor_timeout");
+    }
+    return;
+  }
+
+  if (state.phase == EMERGENCY_RECOVERY_RELOCATE) {
+    if (!emergencyRecoverySensorsHealthy()) {
+      abortEmergencyRecovery("emergency_relocation_sensor_unhealthy");
+      return;
+    }
+    if (state.relocationDistanceM >
+        PLANNER_EMERGENCY_MAX_RELOCATION_M) {
+      abortEmergencyRecovery("emergency_relocation_distance_exhausted");
+      return;
+    }
+    if (state.relocationStartedMs != 0 &&
+        now - state.relocationStartedMs >
+          PLANNER_EMERGENCY_RELOCATE_TIMEOUT_MS) {
+      abortEmergencyRecovery("emergency_relocation_timeout");
+      return;
+    }
+    float checkpointDistanceM = hypotf(
+      robotX - state.relocationCheckpointX,
+      robotY - state.relocationCheckpointY);
+    if (checkpointDistanceM >=
+        PLANNER_EMERGENCY_RECHECK_DISTANCE_M) {
+      state.relocationCheckpointX = robotX;
+      state.relocationCheckpointY = robotY;
+      sendBluetoothEvent("emergency_relocation_checkpoint",
+                         "stationary_reobservation");
+      enterEmergencySensorSettle(
+        EMERGENCY_RECOVERY_SETTLE_RELOCATED,
+        "emergency_relocation_settle");
+      return;
+    }
+
+    float goalDx = navigationGoal.targetX - robotX;
+    float goalDy = navigationGoal.targetY - robotY;
+    float goalDistanceM = hypotf(goalDx, goalDy);
+    float lookaheadM = min(goalDistanceM, WAYPOINT_LOOKAHEAD_M);
+    float recoveryGoalX = goalDistanceM > 0.001f
+      ? robotX + goalDx / goalDistanceM * lookaheadM : robotX;
+    float recoveryGoalY = goalDistanceM > 0.001f
+      ? robotY + goalDy / goalDistanceM * lookaheadM : robotY;
+    TrajectoryPlanResult reverseResult =
+      selectReverseRecoveryTrajectory(recoveryGoalX, recoveryGoalY);
+    if (reverseResult == TRAJECTORY_PLAN_NO_PATH) {
+      abortEmergencyRecovery("emergency_relocation_no_safe_arc");
+    } else if (reverseResult == TRAJECTORY_PLAN_SUCCESS) {
+      plannerTelemetry.planReason = "emergency_relocation_arc";
+      plannerTelemetry.replanReason = "seek_scan_clearance";
+    }
+    return;
+  }
+
+  if (state.phase == EMERGENCY_RECOVERY_SETTLE_RELOCATED) {
+    motorStopRequested = true;
+    setMotionCommand(0.0, 0.0);
+    if (emergencySensorsAdvancedSinceBaseline()) {
+      PlannerCollisionSnapshot snapshot;
+      capturePlannerCollisionSnapshot(snapshot);
+      float rotationalClearanceM = rotationalEnvelopeClearanceM(
+        snapshot, robotX, robotY);
+      state.bestRotationalClearanceM = max(
+        state.bestRotationalClearanceM, rotationalClearanceM);
+      if (rotationalClearanceM >=
+          PLANNER_EMERGENCY_TARGET_CLEARANCE_M) {
+        startEmergencyScanAtCurrentPose();
+      } else {
+        enterEmergencyRelocation("scan_pose_clearance_insufficient");
+      }
+      return;
+    }
+    if (now - state.phaseStartedMs >
+        PLANNER_EMERGENCY_SENSOR_WAIT_MS) {
+      abortEmergencyRecovery("emergency_relocation_sensor_timeout");
+    }
+  }
+}
+
+
+static bool canStartSafeReverse() {
   return navigationGoal.mode == NAV_GOAL_POINT &&
          escapeBacktrackEnabled &&
          hasTrustedRearCoverage() &&
          isRangeSensorCurrent(RANGE_FAKE_REAR) &&
-         !isRangeSensorBlocked(RANGE_FAKE_REAR) &&
+         !isRangeSensorBlocked(RANGE_FAKE_REAR);
+}
+
+static bool canStartEvidenceDrivenReverse() {
+  return canStartSafeReverse() &&
          geometricNoPathEpochCount >=
            PLANNER_REVERSE_MIN_GEOMETRIC_NO_PATH_EPOCHS &&
          noSafeTrajectorySinceMs != 0 &&
@@ -3675,7 +4454,7 @@ static bool canStartEvidenceDrivenReverse() {
            PLANNER_NO_PATH_BACKTRACK_DELAY_MS;
 }
 
-static void startEvidenceDrivenReverse() {
+static void startEvidenceDrivenReverse(const char* trigger) {
   resetPlannerEpoch();
   resetReversePlannerEpoch();
   reverseRecoveryState = {};
@@ -3685,31 +4464,42 @@ static void startEvidenceDrivenReverse() {
   reverseRecoveryState.previousTurn = 0.0f;
   reverseRecoveryActive = true;
   reverseRecoveryStartedMs = millis();
-  reverseRecoveryStartX = robotX;
-  reverseRecoveryStartY = robotY;
   reverseRecoveryStepCount = 0;
-  if (recoveryAttemptCount < 255) {
-    recoveryAttemptCount++;
+  recoveryBudget.forwardTakeoverPending = false;
+  recoveryBudget.lastReverseX = robotX;
+  recoveryBudget.lastReverseY = robotY;
+  if (recoveryBudget.attemptCount < 255) {
+    recoveryBudget.attemptCount++;
   }
-  plannerTelemetry.recoveryCount = recoveryAttemptCount;
+  obstacleContext.progressGoalValid = false;
+  plannerTelemetry.recoveryCount = recoveryBudget.attemptCount;
   plannerTelemetry.reverseRecoveryActive = true;
   plannerTelemetry.recoveryPlateauCount = 0;
   plannerTelemetry.planReason = "reverse_reposition_start";
-  plannerTelemetry.replanReason = "persistent_geometric_no_path";
+  plannerTelemetry.replanReason = trigger;
   plannerTelemetry.safeStopReason = "";
-  sendBluetoothEvent("reverse_recovery_start", "evidence_driven_reposition");
+  sendBluetoothEvent("reverse_recovery_start", trigger);
 }
 
 static void completeEvidenceDrivenReverse() {
   resetReversePlannerEpoch();
   reverseRecoveryState = {};
   reverseRecoveryActive = false;
-  recoveryAttemptResetPending = true;
-  // Repositioning deliberately spends route progress. Give the resulting
-  // forward path its own proof window without clearing cumulative distance,
-  // attempt count, or the original recovery progress baselines.
-  recoveryLastProgressMs = millis();
+  recoveryBudget.forwardTakeoverPending = true;
+  recoveryBudget.takeoverStartGoalDistanceM = hypotf(
+    navigationGoal.targetX - robotX,
+    navigationGoal.targetY - robotY);
+  float routeLengthM;
+  float routeUx;
+  float routeUy;
+  float routeHeadingRad;
+  recoveryBudget.takeoverStartRouteAlongM =
+    routeLineFrame(routeLengthM, routeUx, routeUy, routeHeadingRad)
+      ? routeLineAlongM(robotX, robotY, routeUx, routeUy)
+      : 0.0f;
+  obstacleContext.progressGoalValid = false;
   plannerTelemetry.reverseRecoveryActive = false;
+  plannerTelemetry.obstacleProgressAgeS = 0.0f;
   plannerTelemetry.recoveryPlateauCount = 0;
   resetGeometricNoPathEvidence();
   sendBluetoothEvent("reverse_recovery_end", "forward_takeover");
@@ -3743,12 +4533,18 @@ static void updatePointGoal() {
     return;
   }
 
+  if (emergencyRecoveryState.phase != EMERGENCY_RECOVERY_IDLE &&
+      emergencyRecoveryState.phase !=
+        EMERGENCY_RECOVERY_RETRY_ACTIVE) {
+    updateEmergencyRecovery();
+    return;
+  }
+
   if (reverseRecoveryState.active) {
     float lookaheadM = min(distanceM, WAYPOINT_LOOKAHEAD_M);
     float recoveryGoalX = robotX + (dx / distanceM) * lookaheadM;
     float recoveryGoalY = robotY + (dy / distanceM) * lookaheadM;
-    if (updateRecoveryLiveness(distanceM, lookaheadM,
-                               routeFrameValid, routeUx, routeUy)) {
+    if (updateReverseRecoveryBudget()) {
       return;
     }
 
@@ -3787,7 +4583,7 @@ static void updatePointGoal() {
         return;
       }
       if (!reverseRecoveryState.forwardCheckAfterMovement) {
-        finishNavigationGoal(false,
+        handleRecoveryExhaustion(
           PLANNER_STOP_RECOVERY_NO_USEFUL_OUTCOME,
           "reverse_corridor_without_forward_path");
         return;
@@ -3858,19 +4654,36 @@ static void updatePointGoal() {
     (localGoalY - robotY) * (localGoalY - robotY));
   float routeAlongM = routeFrameValid
     ? routeLineAlongM(robotX, robotY, routeUx, routeUy) : 0.0f;
-  bool madeNetRecoveryProgress =
-    distanceM <= recoveryInitialGoalDistanceM -
-                   PLANNER_RECOVERY_PROGRESS_EPSILON_M ||
+  plannerTelemetry.globalGoalDistanceM = distanceM;
+  plannerTelemetry.localGoalDistanceM = localGoalDistanceM;
+  plannerTelemetry.routeAlongProgressM = routeAlongM;
+  plannerTelemetry.routeSignedLateralErrorM = routeFrameValid
+    ? routeLineSignedLateralErrorM(robotX, robotY, routeUx, routeUy) : 0.0f;
+  plannerTelemetry.cumulativeReverseDistanceM =
+    recoveryBudget.cumulativeReverseDistanceM;
+  plannerTelemetry.recoveryCount = recoveryBudget.attemptCount;
+
+  bool madeNetTakeoverProgress =
+    distanceM <= recoveryBudget.takeoverStartGoalDistanceM -
+                   PLANNER_RECOVERY_TAKEOVER_PROGRESS_M ||
     (routeFrameValid &&
-     routeAlongM >= recoveryStartRouteAlongM +
-                      PLANNER_RECOVERY_PROGRESS_EPSILON_M);
-  if (recoveryAttemptResetPending && !avoidanceActive &&
-      madeNetRecoveryProgress) {
-    resetRecoveryLivenessState();
-    recoveryAttemptResetPending = false;
-  } else if (recoveryLivenessActive &&
-             updateRecoveryLiveness(distanceM, localGoalDistanceM,
-                                    routeFrameValid, routeUx, routeUy)) {
+     routeAlongM >= recoveryBudget.takeoverStartRouteAlongM +
+                      PLANNER_RECOVERY_TAKEOVER_PROGRESS_M);
+  if (recoveryBudget.forwardTakeoverPending && !avoidanceActive &&
+      madeNetTakeoverProgress) {
+    resetRecoveryBudget();
+  }
+  if (avoidanceActive &&
+      obstacleProgressStalled(localGoalX, localGoalY, localGoalDistanceM)) {
+    motorStopRequested = true;
+    setMotionCommand(PLANNER_DEFAULT_SAFE_STOP_SPEED_MPS, 0.0);
+    if (canStartSafeReverse()) {
+      startEvidenceDrivenReverse("obstacle_local_goal_stalled");
+    } else {
+      handleRecoveryExhaustion(
+        PLANNER_STOP_RECOVERY_NO_PROGRESS,
+        "obstacle_local_goal_progress_stalled");
+    }
     return;
   }
 
@@ -3932,14 +4745,15 @@ static void updatePointGoal() {
   }
   noteGeometricNoPathEpoch();
   if (canStartEvidenceDrivenReverse()) {
-    startEvidenceDrivenReverse();
+    startEvidenceDrivenReverse("persistent_geometric_no_path");
     return;
   }
   if (millis() - noSafeTrajectorySinceMs >= PLANNER_NO_PATH_ABORT_MS) {
-    finishNavigationGoal(false, PLANNER_STOP_NO_SAFE_TRAJECTORY,
-                         avoidanceActive
-                           ? "obstacle_has_no_safe_forward_bypass"
-                           : "no_safe_forward_trajectory");
+    handleRecoveryExhaustion(
+      PLANNER_STOP_NO_SAFE_TRAJECTORY,
+      avoidanceActive
+        ? "obstacle_has_no_safe_forward_bypass"
+        : "no_safe_forward_trajectory");
   }
 }
 
@@ -3994,65 +4808,24 @@ static void updateTurnGoal() {
   turnLastCommandDirection = error > 0.0 ? 1.0 : -1.0;
   float turnTarget = (error > 0.0 ? 1.0 : -1.0) *
                      (slowTurn ? PLANNER_TURN_SLOW_TARGET_SPEED : PLANNER_TURN_TARGET_SPEED);
-  if (!isTurnDirectionObservable(turnTarget)) {
-    // A missing ray could be a single bad sample. Stop before turning and give
-    // the fan a short stationary revalidation window rather than guessing.
-    unsigned long now = millis();
-    if (turnSideInvalidSinceMs == 0) {
-      turnSideInvalidSinceMs = now;
-      sendBluetoothEvent("turn_side_revalidate", "motors_stopped_for_fresh_sample");
-    }
-    motorStopRequested = true;
-    setMotionCommand(0.0, 0.0);
-    if (now - turnSideInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
-      plannerTelemetry.planReason = "turn_side_revalidating";
-      return;
-    }
-    finishNavigationGoal(false, PLANNER_STOP_TURN_SIDE_INVALID, "turn_side_sensor_invalid");
-    return;
+  SafePivotStepResult pivotResult = commandSafePivotStep(
+    turnTarget,
+    slowTurn ? "calibrated_turn_slow" : "calibrated_turn_fast",
+    "turn_side_revalidating",
+    "turn_sweep_revalidating");
+  if (pivotResult == SAFE_PIVOT_STEP_SIDE_INVALID) {
+    finishNavigationGoal(false, PLANNER_STOP_TURN_SIDE_INVALID,
+                         "turn_side_sensor_invalid");
+  } else if (pivotResult == SAFE_PIVOT_STEP_SWEEP_INVALID) {
+    finishNavigationGoal(false, PLANNER_STOP_TURN_CLEARANCE,
+                         "turn_sweep_sensor_invalid");
+  } else if (pivotResult == SAFE_PIVOT_STEP_SWEEP_BLOCKED) {
+    finishNavigationGoal(false, PLANNER_STOP_TURN_CLEARANCE,
+                         "turn_sweep_not_clear");
+  } else if (pivotResult == SAFE_PIVOT_STEP_STUCK) {
+    finishNavigationGoal(false, PLANNER_STOP_STUCK,
+                         "turn_progress_stalled");
   }
-  turnSideInvalidSinceMs = 0;
-
-  if (!areTurnSweepSensorsValid()) {
-    // Direction sensing proves the chosen side, while this all-fan check proves
-    // the complete rotating chassis envelope. Both are needed for a pivot.
-    unsigned long now = millis();
-    if (turnSweepInvalidSinceMs == 0) {
-      turnSweepInvalidSinceMs = now;
-      sendBluetoothEvent("turn_sweep_revalidate", "motors_stopped_for_fresh_sample");
-    }
-    motorStopRequested = true;
-    setMotionCommand(0.0, 0.0);
-    if (now - turnSweepInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
-      plannerTelemetry.planReason = "turn_sweep_revalidating";
-      return;
-    }
-    finishNavigationGoal(false, PLANNER_STOP_TURN_CLEARANCE, "turn_sweep_sensor_invalid");
-    return;
-  }
-  turnSweepInvalidSinceMs = 0;
-
-  if (!isTurnSweepSafe()) {
-    finishNavigationGoal(false, PLANNER_STOP_TURN_CLEARANCE, "turn_sweep_not_clear");
-    return;
-  }
-
-  updateStuckTurning(navigationHeadingDeg());
-  if (turnStuck) {
-    finishNavigationGoal(false, PLANNER_STOP_STUCK, "turn_progress_stalled");
-    return;
-  }
-
-  plannerTelemetry.selectedForwardTicksPerSec = 0.0;
-  plannerTelemetry.selectedTurnTicksPerSec = turnTarget;
-  plannerTelemetry.selectedCurvature = 0.0;
-  plannerTelemetry.minimumSweptClearanceMm = minimumFanSweepClearanceMm();
-  plannerTelemetry.speedCapTicksPerSec = 0.0;
-  plannerTelemetry.candidateCount = 1;
-  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
-  plannerTelemetry.planReason = slowTurn ? "calibrated_turn_slow" : "calibrated_turn_fast";
-  motorStopRequested = false;
-  publishNavigationMotion(0.0, turnTarget);
 }
 
 void updateNavigationController() {

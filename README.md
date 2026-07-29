@@ -109,8 +109,11 @@ Available commands:
 - `FBASE <left_us> <right_us>` - set temporary forward motor base pulses.
 - `FBASE RESET` - restore the default forward motor base pulses.
 - `ESCAPE ON` / `ESCAPE OFF` / `ESCAPE STATUS` - enable, disable, or report
-  reverse-repositioning policy. Physical motion still requires trusted rear
-  coverage, which the current installation does not provide.
+  reverse-repositioning policy. Physical motion still requires the SEN0628
+  rear sensor to be initialized, valid, fresh, and non-blocked.
+- `EMERGENCY ON` / `EMERGENCY OFF` / `EMERGENCY STATUS` - enable, disable,
+  or report the ultimate scan/relocate/retry recovery policy for this boot.
+  Policy changes are rejected while a navigation goal is active.
 - `TEST ARM` / `TEST DISARM` - enable or disable manual test motion commands.
 - `TEST DRIVE <metres>` - drive a fixed distance at the current heading.
 - `TEST GOTO <x> <y>` - go to one temporary absolute waypoint using normal
@@ -192,10 +195,27 @@ efficiency. There is no fixed retreat, route-rejoin phase, side memory, or
 post-reverse escape. When clearance gain plateaus, the robot stops and gives
 the normal forward planner one freshly revalidated takeover attempt.
 
+An opt-in ultimate recovery layer is available behind
+`PLANNER_EMERGENCY_SCAN_ENABLED`, which defaults to `false`. After an eligible
+ordinary-recovery exhaustion, it stops for fresh fan and rear frames, attempts
+a slow 12-sector scan, unwinds any incomplete scan before movement, and may
+reverse at most 0.8 m through the existing trusted-rear and known-clear
+rollout. From a sufficiently clear pose it performs one full scan, preserves
+all map evidence, resets only temporary planner context, and retries the
+original point goal once. Sensor, authority, turn-sweep, footprint, relocation,
+and time failures remain neutral terminal failures.
+
+The physical firmware and WASM simulator use the same runtime policy setter.
+Use `EMERGENCY ON` before `START` or a test goal on the robot; Visual Lab
+scenario imports use `emergencyScanEnabled`. Both reject changes during an
+active goal, and both default to the shared `PLANNER_EMERGENCY_SCAN_ENABLED`
+value.
+
 The WASM simulator supplies a raycast rear channel and exercises this exact
-RobotCode policy. Production `hasTrustedRearCoverage()` remains false until a
-real rear sensor is installed and validated, so fake rear distance cannot
-authorize a physical reverse command or paint map cells free.
+RobotCode policy. Production rear motion now depends on the installed SEN0628
+matrix being connected, initialized, valid, fresh within its tighter timeout,
+and non-blocked. The legacy `RANGE_FAKE_REAR` name is only the compatibility
+slot used to publish that real sensor state.
 
 Use the smallest test that exercises the feature being changed:
 
