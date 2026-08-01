@@ -98,6 +98,10 @@ The follow-up isolation and organization plan is implemented:
   interfaces without including `NavigationInternal.h`.
 - Python source-contract tests enforce the new boundary and recursive folder
   layout.
+- The temporary forwarding headers inside subsystem folders were removed.
+  Subsystem sources now include root public/shared headers explicitly, and a
+  source-contract test rejects duplicate `Robot.h`, `RobotTypes.h`, or
+  `Navigation.h` files under `src/`.
 
 Verification for the follow-up:
 
@@ -105,7 +109,7 @@ Verification for the follow-up:
   30,904 bytes data, 201,824 bytes RAM1 variables, and 12,416 bytes RAM2
   variables;
 - firmware/WASM and simulator suite: 47/47 PASS;
-- Python suite: 140 PASS, one intentional skip;
+- Python suite: 141 PASS, one intentional skip;
 - exact custom and `heading-back` cases under clean and website-default
   sensing: PASS;
 - rebuilt-WASM Visual Lab clear GOTO: PASS, `waypoint_reached`, neutral, no
@@ -114,6 +118,11 @@ Verification for the follow-up:
 No planner geometry, recovery policy, speed ceiling, or safety threshold was
 tuned during this architecture refactor. No upload, serial connection, or
 physical movement was performed.
+
+The remaining audit tables and patch plan below are retained as historical
+evidence from the cleanup process. They may mention pre-split files such as
+`LocalPlanner.cpp` and `StateMachine.cpp`; use the implementation result above
+and `CURRENT_STATE_AND_NEXT_STEPS.md` for the active layout.
 
 ## Audit scope and evidence
 

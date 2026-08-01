@@ -1,5 +1,11 @@
 ﻿# P0 Obstacle Failure Remediation Workstream
 
+Archived status, 2026-07-30: this is a historical physical-validation
+workstream and evidence record. It is not the current architecture guide and
+does not authorize upload, serial access, arming, or movement. Use
+`../CURRENT_STATE_AND_NEXT_STEPS.md`, `../ROBOT_CODEBASE_AUDIT.md`, and
+`../../README.md` for current guidance.
+
 ## Purpose
 
 This document turns the failed 2026-07-14 `TEST AVOID 1.20` physical run into

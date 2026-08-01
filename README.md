@@ -336,7 +336,7 @@ offset inside the sensor, which is exactly what the clearance maths needs.
 
 1. Square the robot to a long flat front wall and record each raw fan range at
    three known gaps from the robot's front face (for example 300, 500, and
-   700 mm). Use `CSV ON`, `MARK`, and `FAN`; the Â±60 degree outer rays need a
+   700 mm). Use `CSV ON`, `MARK`, and `FAN`; the +/-60 degree outer rays need a
    wall wide enough to intercept them at every gap.
 2. With `D = front_extent + front_face_gap` and readings `r1`, `r2` from two
    positions, fit the beam angle using

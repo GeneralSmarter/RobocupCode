@@ -5,6 +5,11 @@ Date: 2026-07-29
 Scope: `RobotCode`, estimator-specific simulator support, telemetry, and tests  
 Physical status: no upload, serial connection, arming, or movement was performed
 
+Current note, 2026-07-30: this is still a research plan, not implemented
+firmware behavior. File paths below have been updated for the post-cleanup
+folder layout where practical; source hashes in the repository-finding section
+remain historical evidence from the original research pass.
+
 ## Decision
 
 Do not implement position by double-integrating the BNO055 accelerometer.
@@ -147,7 +152,7 @@ Ownership:
 - `MotorControl.cpp`: remain the only periodic motor-output owner.
 - `Bluetooth.cpp`: diagnostics and telemetry only; no estimator side effects
   except an explicit stopped/disarmed `ZERO`.
-- `LocalPlanner.cpp`: consume the published pose and health; do not contain
+- `src/navigation/`: consume the published pose and health; do not contain
   estimator math.
 
 ## Estimator design
@@ -503,15 +508,16 @@ Expected changes, one phase at a time:
   records.
 - `RobotConfig.h`: sample/freshness bounds, measured wheel scales, track width,
   noise values, and innovation gates.
-- `Globals.cpp` / `Robot.h`: owned cached sample and estimator declarations.
-- `Imu.cpp`: bounded initialization, cached sampling, axis transform, status,
-  calibration, and health.
-- `Odometry.cpp`: pure estimator update and pose publication.
-- `Helpers.cpp`: cached navigation heading only; no direct I2C read.
-- `MotorControl.cpp`: final fail-closed check for estimator health when motion
-  depends on it.
-- `Bluetooth.cpp`: versioned diagnostic/status/CSV output and no-motion IMU
-  diagnostic.
+- `src/core/Globals.cpp` / `Robot.h`: owned cached sample and estimator
+  declarations.
+- `src/sensors/Imu.cpp`: bounded initialization, cached sampling, axis
+  transform, status, calibration, and health.
+- `src/motion/Odometry.cpp`: pure estimator update and pose publication.
+- `src/core/Helpers.cpp`: cached navigation heading only; no direct I2C read.
+- `src/motion/MotorControl.cpp`: final fail-closed check for estimator health
+  when motion depends on it.
+- `src/operator/Bluetooth.cpp`: versioned diagnostic/status/CSV output and
+  no-motion IMU diagnostic.
 - `RobotCode.ino` / controller schedule: explicit IMU sample before estimator
   update without adding another motor writer.
 - `RobocupSimulator/firmware-wasm/firmware_bridge.cpp`: sensor/encoder injection,

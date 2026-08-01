@@ -2,6 +2,12 @@
 
 Full audit report for the RoboCup robot workspace. Generated 2026-07-14 from the completed Codex audit goal.
 
+Current note, 2026-07-30: this remains the safety audit and historical defect
+record, but several file paths and line counts below describe the pre-cleanup
+layout. The active firmware is now split under `RobotCode/src/`, navigation is
+a black-box service through `Navigation.h`, and the latest software baseline is
+recorded in `CURRENT_STATE_AND_NEXT_STEPS.md`.
+
 ## Bottom Line
 
 This is a serious local-navigation prototype, but it is not competition-ready. The current system is mostly a set of methods that worked in selected cases, not yet the best verified architecture for the 2026 task.
@@ -51,27 +57,27 @@ The current default `START` route is still a small rectangle ending `HOME`. Full
 
 ### Current P0 remediation disposition (2026-07-14 review)
 
-- **P0-01 â€” fixed in software.** The canonical turn contract and offline
+- **P0-01 - fixed in software.** The canonical turn contract and offline
   invariants are aligned; physical sign validation remains required.
-- **P0-02 â€” fixed in software.** Authority, revoke-before-cancel transitions,
+- **P0-02 - fixed in software.** Authority, revoke-before-cancel transitions,
   final-writer checks, and disarm paths are covered by compile/contract tests;
   runtime/HIL and physical transition validation remain required.
-- **P0-03 â€” partially fixed.** Continuous direction-aware supervision,
+- **P0-03 - partially fixed.** Continuous direction-aware supervision,
   command lease, and manual/test coverage are implemented, but the supervisor
   still depends on real rear/side/central sensor coverage.
-- **P0-04 â€” intentionally deferred.** `RANGE_FAKE_REAR` remains test
+- **P0-04 - intentionally deferred.** `RANGE_FAKE_REAR` remains test
   scaffolding. Operator decision, 2026-07-14: it may be used for current
   obstacle testing, but it is not proof of rear clearance, competition
   readiness, or closure of P0-04/P0-05.
-- **P0-05 â€” still open.** Low central/rear/side coverage, status-aware
+- **P0-05 - still open.** Low central/rear/side coverage, status-aware
   tri-state evidence, and the unknown-blocked safety proof are incomplete.
-- **P0-06 â€” partially fixed.** Phase 1 runtime polling, loop telemetry,
+- **P0-06 - partially fixed.** Phase 1 runtime polling, loop telemetry,
   disabled blocking turn-ladder, and motor lease/watchdog are implemented;
   coherent sensor snapshots and physical watchdog timing remain follow-ups.
-- **P0-07 â€” fixed in software.** The hard collision fallback and reverse grace
+- **P0-07 - fixed in software.** The hard collision fallback and reverse grace
   are removed; strict footprint rejection now stops. Physical navigation
   acceptance remains separate from this code-level closure.
-- **P0-08 â€” fixed by disabling the unsafe path.** The field UI is preview-only
+- **P0-08 - fixed by disabling the unsafe path.** The field UI is preview-only
   and sends neither `TEST ARM` nor `TEST GOTO`; SE(2) command support remains
   intentionally unimplemented.
 
