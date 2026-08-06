@@ -373,7 +373,7 @@ const float PLANNER_ROLLOUT_MAX_HEADING_STEP_RAD = 0.174533f;
 const float PLANNER_MAX_TURN_RATIO = 0.65;
 // One forward ceiling applies to every point-planner context. Each sampled
 // curve derives a lower safe speed from braking, wheel and swept-path limits.
-const float PLANNER_FORWARD_MAX_SPEED_TPS = 3000.0f;
+const float PLANNER_FORWARD_MAX_SPEED_TPS = 2600.0f;
 // Lowest speed at which the current drivetrain has demonstrated sustained
 // motion.  Below this, stopping is safer and more truthful than planning a
 // trajectory the motors cannot execute.
