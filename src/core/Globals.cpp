@@ -10,7 +10,7 @@
 // Interacts with:
 //   All modules read or update some of this state. The main ownership pattern
 //   is: Encoders.cpp owns raw counts, TofSensors.cpp owns rangeSensors and
-//   legacy ToF globals, ObjectDetection.cpp owns object candidate state,
+//   fan, rear-array, and front-matrix sensor state,
 //   Odometry.cpp owns robotX/robotY/robotTheta updates; Navigation owns
 //   navigationGoal/plannerTelemetry, MotorControl.cpp owns desired command and
 //   motor authority/output diagnostics, and RouteMission.cpp owns route
@@ -66,6 +66,8 @@ float lastRightError = 0.0;
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 
 float yawOffset = 0.0;
+float latestImuPitchDeg = 0.0f;
+float latestImuRollDeg = 0.0f;
 
 SX1509 io;
 
@@ -73,10 +75,23 @@ VL53L0X rightOuterTOF;
 VL53L0X rightInnerTOF;
 VL53L0X leftInnerTOF;
 VL53L0X leftOuterTOF;
-VL53L1X objectLeftLowTOF;
-VL53L1X objectLeftUpperTOF;
-VL53L1X objectRightLowTOF;
-VL53L1X objectRightUpperTOF;
+VL53L1X rearTofs[REAR_TOF_COUNT];
+
+RearTofState rearTofStates[REAR_TOF_COUNT] = {
+  {false, false, true, true, RANGE_NO_READING_MM,
+   SENSOR_RANGE_STATUS_UNKNOWN, 0.0f, 0.0f, 0, 0, 0, 0},
+  {false, false, true, true, RANGE_NO_READING_MM,
+   SENSOR_RANGE_STATUS_UNKNOWN, 0.0f, 0.0f, 0, 0, 0, 0},
+  {false, false, true, true, RANGE_NO_READING_MM,
+   SENSOR_RANGE_STATUS_UNKNOWN, 0.0f, 0.0f, 0, 0, 0, 0}
+};
+
+FrontMatrixFrame frontMatrixFrame = {};
+MatrixTargetObservation matrixTargetObservation = {
+  false, false, 0, 0, 0, 0, MATRIX_EVIDENCE_NONE,
+  0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 3.5f, 0.0f,
+  0.0f, 0.0f
+};
 
 RangeSensorState rangeSensors[RANGE_SENSOR_COUNT] = {
   // Physical fan sensors are listed right-to-left to match RANGE_* enum
@@ -89,46 +104,8 @@ RangeSensorState rangeSensors[RANGE_SENSOR_COUNT] = {
   {"front_virtual", 0, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
   {"right_fan", -30, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
   {"left_fan", 30, RANGE_NO_READING_MM, false, false, false, 0, 0, 0},
-  {"rear_matrix_tof", (int)REAR_MATRIX_TOF_GEOMETRY.angleDeg, RANGE_NO_READING_MM, false, true, true, 0, 0, 0}
-};
-
-const ObjectSensorGeometry OBJECT_SENSOR_GEOMETRY[OBJECT_TOF_COUNT] = {
-  // Object sensor geometry is robot-frame millimetres. The LOW/UPPER pairs
-  // help distinguish short weight-sized objects from taller obstacles, but do
-  // not provide navigation safety clearance.
-  {91.4,  60.6, 55.0, -20.0, 0.0, OBJECT_ROLE_LOW},    // object_left_low, XSHUT7
-  {91.4,  60.6, 120.0, -20.0, 0.0, OBJECT_ROLE_UPPER}, // object_left_upper, XSHUT5
-  {91.4, -60.6, 55.0,  20.0, 0.0, OBJECT_ROLE_LOW},    // object_right_low, XSHUT6
-  {91.4, -60.6, 120.0,  20.0, 0.0, OBJECT_ROLE_UPPER}  // object_right_upper, XSHUT4
-};
-
-ObjectSensorState objectSensors[OBJECT_TOF_COUNT] = {
-  {"object_left_low", OBJECT_ROLE_LOW, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0},
-  {"object_left_upper", OBJECT_ROLE_UPPER, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0},
-  {"object_right_low", OBJECT_ROLE_LOW, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0},
-  {"object_right_upper", OBJECT_ROLE_UPPER, OBJECT_NO_READING_MM, false, false, false, 0, 0, 0, SENSOR_RANGE_STATUS_UNKNOWN, 0.0, 0.0}
-};
-
-ObjectCandidateState objectCandidate = {
-  OBJECT_CANDIDATE_DISABLED,
-  "object_tof_disabled",
-  false,
-  0,
-  OBJECT_NO_READING_MM,
-  0,
-  0
-};
-
-ObjectTargetEstimate objectTargetEstimate = {
-  false,
-  0.0,
-  0.0,
-  0.0,
-  0.0,
-  OBJECT_NO_READING_MM,
-  0,
-  "not_estimated",
-  0
+  {"rear_aggregate", 180, RANGE_NO_READING_MM, false, true, true, 0, 0, 0},
+  {"front_matrix_aggregate", 0, RANGE_NO_READING_MM, false, true, true, 0, 0, 0}
 };
 
 bool frontBlocked = false;

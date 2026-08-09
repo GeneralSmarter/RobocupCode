@@ -33,7 +33,7 @@ Implementation ownership:
   read-only planner diagnostics.
 - `src/motion/` owns odometry, encoder/progress helpers, and
   `MotorControl.cpp`, the only periodic motor-output writer.
-- `src/sensors/` owns navigation ToF, object ToF, rear obstacle, and IMU
+- `src/sensors/` owns the front fan, three rear ToFs, front matrix, and IMU
   sampling.
 - `src/operator/` owns Bluetooth commands, telemetry, and stationary
   diagnostics.
@@ -64,7 +64,8 @@ evidence only.
 ## Current Capability
 
 - `START` runs the onboard calibration route from `RouteMission.cpp`.
-- `navigationGoTo()`, `navigationGoToPickup()`, `navigationTurnBy()`, and
+- `navigationGoTo()`, `navigationStartPickupTracking()`,
+  `navigationUpdatePickupTracking()`, `navigationTurnBy()`, and
   `navigationScanTurnBy()` are the supported mission-facing driving commands.
 - Bluetooth test/admin commands use `NavigationTest.h` and
   `NavigationAdmin.h`; those headers are not for normal mission code.
@@ -72,8 +73,7 @@ evidence only.
   JavaScript planner has been removed, so there is one current planner
   implementation.
 - Weight search can run explicit search scans, route search actions, and
-  route-only opportunistic interrupts for fresh confirmed `weight_sized`
-  targets.
+  route-only opportunistic interrupts for fresh confirmed static matrix tracks.
 
 ## Current Safety Boundaries
 
@@ -84,9 +84,8 @@ evidence only.
   be treated as clear.
 - The front fan has no true side or low central coverage. Physical clearance
   remains an uncertainty even when software tests pass.
-- Physical reverse requires trusted SEN0628 rear coverage through
-  `hasTrustedRearCoverage()`. The legacy name `RANGE_FAKE_REAR` is now only a
-  compatibility slot for that rear obstacle state.
+- Physical reverse requires trusted, coherent three-channel rear VL53L1X
+  coverage through `hasTrustedRearCoverage()`.
 - Field GOTO in the desktop UI is preview-only. It must not send `TEST ARM` or
   `TEST GOTO` until an arena-to-odom `SE(2)` transform, bounds preview, status
   checks, and explicit confirmation flow exist.

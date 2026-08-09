@@ -6,7 +6,8 @@
 enum NavigationGoalMode {
   NAV_GOAL_NONE,
   NAV_GOAL_POINT,
-  NAV_GOAL_TURN
+  NAV_GOAL_TURN,
+  NAV_GOAL_PICKUP_TRACK
 };
 
 enum NavigationGoalOwner {
@@ -19,7 +20,7 @@ enum NavigationGoalOwner {
   NAV_OWNER_TEST_TURN,
   NAV_OWNER_TEST_HUNT,
   NAV_OWNER_WEIGHT_SCAN,
-  NAV_OWNER_OBJECT_HUNT
+  NAV_OWNER_PICKUP_TRACK
 };
 
 struct NavigationGoal {
@@ -49,14 +50,33 @@ struct NavigationInternalStatus {
   const char* detail;
 };
 
+struct PickupTrackingRuntime {
+  PickupTrackingStatus status;
+  MatrixTargetObservation observation;
+  RouteResumeContext resume;
+  bool finalApproachArmed;
+  float lastDirectGapMm;
+  float predictedTargetWorldX;
+  float predictedTargetWorldY;
+  float handoffX;
+  float handoffY;
+  float feedProgressMm;
+  float feedLastX;
+  float feedLastY;
+  float captureHeadingDeg;
+  unsigned long phaseStartedMs;
+};
+
 // Mutable goal storage and lifecycle helpers are private to navigation.
 extern NavigationGoal navigationGoal;
+extern PickupTrackingRuntime pickupTrackingRuntime;
 
 void initializeNavigationController();
 void updateNavigationController();
 bool startNavigationPoint(float targetX, float targetY,
                           NavigationGoalOwner owner);
 bool startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner);
+void updatePickupTrackingGoal();
 void cancelNavigationGoal(PlannerStopReason reason, const char* detail);
 NavigationInternalStatus getNavigationInternalStatus();
 void clearNavigationGoalResult();

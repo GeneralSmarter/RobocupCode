@@ -193,7 +193,8 @@ static MotionSafetyReason evaluateMotionSafety(MotionAuthority claimant,
   const bool plannerGenerated =
     motionCommandMode == MOTION_COMMAND_NAV_DRIVE ||
     motionCommandMode == MOTION_COMMAND_NAV_TURN ||
-    motionCommandMode == MOTION_COMMAND_NAV_SCAN_TURN;
+    motionCommandMode == MOTION_COMMAND_NAV_SCAN_TURN ||
+    motionCommandMode == MOTION_COMMAND_NAV_PICKUP_TRACK;
   const bool needsTurnSweep = needsTurnSide &&
     (fabs(forwardSpeed) <= 1.0f || !plannerGenerated);
 
@@ -207,14 +208,15 @@ static MotionSafetyReason evaluateMotionSafety(MotionAuthority claimant,
     isRangeSensorCurrent(RANGE_RIGHT_INNER) &&
       isRangeSensorCurrent(RANGE_LEFT_INNER) &&
       isRangeSensorCurrent(RANGE_FRONT),
-    !isRangeSensorBlocked(RANGE_FRONT),
+    !isRangeSensorBlocked(RANGE_FRONT) &&
+      (!isRangeSensorCurrent(RANGE_FRONT_MATRIX_AGGREGATE) ||
+       !isRangeSensorBlocked(RANGE_FRONT_MATRIX_AGGREGATE)),
     !isTofCloseReadingRevalidating(),
     diagonalClear,
-    // RANGE_FAKE_REAR is the compatibility slot published by the physical
-    // rear obstacle module. Its capability gate applies the tighter 250 ms
-    // freshness contract before either straight or curved reverse is allowed.
-    hasTrustedRearCoverage() && isRangeSensorCurrent(RANGE_FAKE_REAR),
-    hasTrustedRearCoverage() && !isRangeSensorBlocked(RANGE_FAKE_REAR),
+    hasTrustedRearCoverage() &&
+      isRangeSensorCurrent(RANGE_REAR_AGGREGATE),
+    hasTrustedRearCoverage() &&
+      !isRangeSensorBlocked(RANGE_REAR_AGGREGATE),
     turnSideCurrent(turnSpeed) && isTurnDirectionObservable(turnSpeed),
     allFanSensorsCurrent() && isTurnSweepSafe()
   };

@@ -343,24 +343,18 @@ static void updateRearObstacleMapEvidence(float headingRad) {
   }
   plannerContext.lastRearEvidenceFrameSequence = frameSequence;
 
-  float sensorWorldX;
-  float sensorWorldY;
-  transformRobotPoint(REAR_MATRIX_TOF_GEOMETRY.xMm / 1000.0f,
-                      REAR_MATRIX_TOF_GEOMETRY.yMm / 1000.0f,
-                      headingRad, sensorWorldX, sensorWorldY);
-  const float halfColumnAngleRad =
-    (REAR_MATRIX_TOF_HORIZONTAL_FOV_DEG /
-     REAR_MATRIX_TOF_COLUMN_COUNT * 0.5f) * DEG_TO_RAD;
-
-  for (uint8_t column = 0; column < REAR_MATRIX_TOF_COLUMN_COUNT; column++) {
-    uint16_t distanceMm;
-    float robotAngleDeg;
-    if (!getRearObstacleRay(column, distanceMm, robotAngleDeg)) {
+  for (uint8_t index = 0; index < REAR_TOF_COUNT; index++) {
+    RangeRayObservation observation;
+    if (!getRearTofRay((RearTofId)index, observation)) {
       continue;
     }
-
-    const float rangeM = distanceMm / 1000.0f;
-    const float rayHeadingRad = headingRad + robotAngleDeg * DEG_TO_RAD;
+    float sensorWorldX;
+    float sensorWorldY;
+    transformRobotPoint(observation.originXmm / 1000.0f,
+                        observation.originYmm / 1000.0f,
+                        headingRad, sensorWorldX, sensorWorldY);
+    const float rangeM = observation.distanceMm / 1000.0f;
+    const float rayHeadingRad = headingRad + observation.yawDeg * DEG_TO_RAD;
     const float rangeUncertaintyM = max(
       MAP_REAR_ENDPOINT_MIN_RANGE_UNCERTAINTY_M,
       rangeM * MAP_REAR_ENDPOINT_RANGE_UNCERTAINTY_RATIO);
@@ -369,6 +363,49 @@ static void updateRearObstacleMapEvidence(float headingRad) {
                         freeLengthM, MAP_REAR_FREE_RAY_HALF_WIDTH_M,
                         MAP_REAR_FREE_EVIDENCE);
 
+    const float endpointX = sensorWorldX + cosf(rayHeadingRad) * rangeM;
+    const float endpointY = sensorWorldY + sinf(rayHeadingRad) * rangeM;
+    const float lateralUncertaintyM = max(
+      MAP_REAR_ENDPOINT_MIN_LATERAL_UNCERTAINTY_M,
+      rangeM * tanf(REAR_TOF_CONFIG[index].horizontalFovDeg *
+                    0.5f * DEG_TO_RAD));
+    markDirectionalEndpointEvidence(
+      endpointX, endpointY, rayHeadingRad,
+      rangeUncertaintyM, rangeUncertaintyM, lateralUncertaintyM,
+      MAP_REAR_ENDPOINT_DYNAMIC_EVIDENCE,
+      MAP_REAR_ENDPOINT_STATIC_EVIDENCE);
+  }
+}
+
+static void updateFrontMatrixMapEvidence(float headingRad) {
+  FrontMatrixFrame frame;
+  if (!getFrontMatrixFrame(frame) || frame.sequence == 0 ||
+      frame.sequence == plannerContext.lastFrontMatrixEvidenceFrameSequence) {
+    return;
+  }
+  plannerContext.lastFrontMatrixEvidenceFrameSequence = frame.sequence;
+  // Matrix evidence is transformed from its immutable acquisition pose, not
+  // the robot's current pose after a potentially delayed cooperative read.
+  headingRad = frame.robotHeadingDeg * DEG_TO_RAD;
+  const float halfColumnAngleRad =
+    FRONT_MATRIX_CONFIG.horizontalFovDeg / 16.0f * DEG_TO_RAD;
+  for (uint8_t column = 0; column < 8; column++) {
+    if ((FRONT_MATRIX_MAP_COLUMN_MASK & (1u << column)) == 0) continue;
+    RangeRayObservation observation;
+    if (!getFrontMatrixRay(column, observation)) continue;
+    const float localX = observation.originXmm / 1000.0f;
+    const float localY = observation.originYmm / 1000.0f;
+    const float sensorWorldX = frame.robotX +
+      localX * cosf(headingRad) - localY * sinf(headingRad);
+    const float sensorWorldY = frame.robotY +
+      localX * sinf(headingRad) + localY * cosf(headingRad);
+    const float rangeM = observation.distanceMm / 1000.0f;
+    const float rayHeadingRad = headingRad + observation.yawDeg * DEG_TO_RAD;
+    const float rangeUncertaintyM = max(
+      MAP_REAR_ENDPOINT_MIN_RANGE_UNCERTAINTY_M,
+      rangeM * MAP_REAR_ENDPOINT_RANGE_UNCERTAINTY_RATIO);
+    // Matrix rays are supplemental obstacle evidence only. Do not paint free
+    // space from them until physical status semantics prove known-clear.
     const float endpointX = sensorWorldX + cosf(rayHeadingRad) * rangeM;
     const float endpointY = sensorWorldY + sinf(rayHeadingRad) * rangeM;
     const float lateralUncertaintyM = max(
@@ -388,12 +425,13 @@ void clearLocalMap() {
   initialiseMapAtRobot();
   initialiseArenaMemoryAtRobot();
   plannerContext.lastRearEvidenceFrameSequence = 0;
+  plannerContext.lastFrontMatrixEvidenceFrameSequence = 0;
   plannerTelemetry.replanReason = "map_cleared";
 }
 
 void updateLocalMapFromSensors() {
   // This is perception, not planning. It converts the latest forward fan and
-  // rear matrix rays into short-lived evidence before planning asks whether
+  // rear and front-matrix rays into short-lived evidence before planning asks whether
   // arcs are safe.
   recenterLocalMapIfNeeded();
   decayLocalMap();
@@ -435,6 +473,7 @@ void updateLocalMapFromSensors() {
   }
 
   updateRearObstacleMapEvidence(headingRad);
+  updateFrontMatrixMapEvidence(headingRad);
 
 }
 

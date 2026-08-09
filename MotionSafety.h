@@ -56,6 +56,16 @@ struct MotionSafetyEvidence {
   bool turnSweepClear;
 };
 
+constexpr bool contradictoryFrontFanPinchPolicy(
+    float rightOuterClearanceMm, float leftOuterClearanceMm,
+    float rightInnerRangeMm, float leftInnerRangeMm,
+    float outerClearanceLimitMm, float innerOpenRangeMm) {
+  return rightOuterClearanceMm < outerClearanceLimitMm &&
+         leftOuterClearanceMm < outerClearanceLimitMm &&
+         rightInnerRangeMm > innerOpenRangeMm &&
+         leftInnerRangeMm > innerOpenRangeMm;
+}
+
 // Pure policy kept separate from sensor access so the direction contract is
 // compile-time checkable. Compound motion must satisfy every relevant branch.
 //
@@ -125,6 +135,12 @@ static_assert(motionSafetyPolicy(true, false, true, false,
                                  MOTION_SAFETY_ALL_CLEAR) ==
                 MOTION_SAFETY_CLEAR,
               "A fully evidenced forward arc must remain allowed");
+static_assert(contradictoryFrontFanPinchPolicy(
+                70.0f, 75.0f, 900.0f, 850.0f, 80.0f, 600.0f),
+              "Two close outer endpoints plus open inner rays must block");
+static_assert(!contradictoryFrontFanPinchPolicy(
+                70.0f, 120.0f, 900.0f, 850.0f, 80.0f, 600.0f),
+              "One distant outer endpoint is not the pinch signature");
 static_assert(motorLeasePolicy(false, false, false) == MOTION_SAFETY_CLEAR,
               "Neutral output must remain available without a watchdog");
 static_assert(motorLeasePolicy(true, false, false) ==

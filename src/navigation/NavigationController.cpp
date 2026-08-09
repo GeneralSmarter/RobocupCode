@@ -131,6 +131,8 @@ bool publishNavigationMotion(float forwardSpeed, float turnSpeed) {
     mode = navigationGoal.owner == NAV_OWNER_WEIGHT_SCAN
       ? MOTION_COMMAND_NAV_SCAN_TURN
       : MOTION_COMMAND_NAV_TURN;
+  } else if (navigationGoal.mode == NAV_GOAL_PICKUP_TRACK) {
+    mode = MOTION_COMMAND_NAV_PICKUP_TRACK;
   }
   if (setAuthorizedMotionCommand(navigationGoal.authority,
                                  forwardSpeed, turnSpeed, mode)) {
@@ -183,6 +185,212 @@ static bool obstacleProgressStalled(float localGoalX, float localGoalY,
       plannerContext.obstacleContext.progressBestDistanceM);
   return now - plannerContext.obstacleContext.progressLastMs >
     PLANNER_OBSTACLE_PROGRESS_TIMEOUT_MS;
+}
+
+static void transitionPickupToSavedRoute(PickupTrackingOutcome outcome,
+                                         const char* detail) {
+  pickupTrackingRuntime.status.phase =
+    PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED;
+  pickupTrackingRuntime.status.outcome = outcome;
+  pickupTrackingRuntime.status.remainingFeedMm = 0.0f;
+  pickupTrackingRuntime.status.detail = detail;
+  setMatrixPickupTrackId(0);
+  sendBluetoothEvent("pickup_feed_end", detail);
+  if (!pickupTrackingRuntime.resume.valid) {
+    finishNavigationGoal(true, PLANNER_STOP_NONE, detail);
+    return;
+  }
+
+  navigationGoal.mode = NAV_GOAL_POINT;
+  navigationGoal.owner = NAV_OWNER_ROUTE;
+  navigationGoal.targetX = pickupTrackingRuntime.resume.segmentEndX;
+  navigationGoal.targetY = pickupTrackingRuntime.resume.segmentEndY;
+  navigationGoal.startX = pickupTrackingRuntime.resume.segmentStartX;
+  navigationGoal.startY = pickupTrackingRuntime.resume.segmentStartY;
+  navigationGoal.startedMs = millis();
+  resetPlannerEpoch();
+  resetReversePlannerEpoch();
+  resetObstacleContext("pickup_feed_route_resume");
+  resetRecoveryBudget();
+  resetGeometricNoPathEvidence();
+  plannerContext.lastPlannerCommandPublishedMs = millis();
+  lastPlannerUpdateMs = 0;
+  plannerTelemetry.planReason = "pickup_feed_route_resume";
+  plannerTelemetry.replanReason = detail;
+  plannerTelemetry.safeStopReason = "";
+}
+
+static void failPickupTracking(PickupTrackingOutcome outcome,
+                               const char* detail) {
+  pickupTrackingRuntime.status.phase = PICKUP_TRACKING_FAILED;
+  pickupTrackingRuntime.status.outcome = outcome;
+  pickupTrackingRuntime.status.detail = detail;
+  finishNavigationGoal(false, PLANNER_STOP_ABORTED, detail);
+}
+
+static float predictedPickupGapMm() {
+  const float headingRad = navigationHeadingDeg() * DEG_TO_RAD;
+  const float dx = pickupTrackingRuntime.predictedTargetWorldX - robotX;
+  const float dy = pickupTrackingRuntime.predictedTargetWorldY - robotY;
+  const float localXmm =
+    (dx * cosf(headingRad) + dy * sinf(headingRad)) * 1000.0f;
+  return localXmm - ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm;
+}
+
+void updatePickupTrackingGoal() {
+  PickupTrackingRuntime &runtime = pickupTrackingRuntime;
+  const unsigned long now = millis();
+  MatrixTargetObservation latestObservation;
+  if (getMatrixTargetObservation(latestObservation) &&
+      latestObservation.trackId == runtime.status.trackId &&
+      latestObservation.frameSequence > runtime.observation.frameSequence) {
+    navigationUpdatePickupTracking(latestObservation);
+  }
+
+  if (runtime.status.phase == PICKUP_TRACKING_FEEDING_UNCONFIRMED ||
+      runtime.status.phase == PICKUP_TRACKING_HANDOFF_ASSUMED) {
+    const float captureHeadingRad = runtime.captureHeadingDeg * DEG_TO_RAD;
+    const float stepX = robotX - runtime.feedLastX;
+    const float stepY = robotY - runtime.feedLastY;
+    const float forwardStepMm =
+      (stepX * cosf(captureHeadingRad) +
+       stepY * sinf(captureHeadingRad)) * 1000.0f;
+    if (forwardStepMm > 0.0f) runtime.feedProgressMm += forwardStepMm;
+    runtime.feedLastX = robotX;
+    runtime.feedLastY = robotY;
+    runtime.status.phase = PICKUP_TRACKING_FEEDING_UNCONFIRMED;
+    runtime.status.remainingFeedMm = max(
+      0.0f, PICKUP_MIN_FORWARD_FEED_DISTANCE_MM - runtime.feedProgressMm);
+
+    if (runtime.feedProgressMm >= PICKUP_MIN_FORWARD_FEED_DISTANCE_MM) {
+      transitionPickupToSavedRoute(
+        PICKUP_OUTCOME_FEED_COMPLETE_UNCONFIRMED,
+        "feed_distance_complete_unconfirmed");
+      return;
+    }
+    if (now - runtime.phaseStartedMs > PICKUP_FEED_TIMEOUT_MS) {
+      transitionPickupToSavedRoute(
+        PICKUP_OUTCOME_FEED_INTERRUPTED,
+        "feed_timeout_payload_unknown");
+      return;
+    }
+
+    float turn = 0.0f;
+    if (runtime.resume.valid) {
+      const float desiredHeadingDeg = atan2f(
+        runtime.resume.segmentEndY - robotY,
+        runtime.resume.segmentEndX - robotX) * RAD_TO_DEG;
+      const float headingErrorDeg = wrapAngle(
+        desiredHeadingDeg - navigationHeadingDeg());
+      turn = constrain(headingErrorDeg * 20.0f,
+                       -PICKUP_FEED_MAX_TURN_TPS,
+                       PICKUP_FEED_MAX_TURN_TPS);
+    }
+    plannerTelemetry.selectedForwardTicksPerSec = WEIGHT_HUNT_MAX_SPEED_TPS;
+    plannerTelemetry.selectedTurnTicksPerSec = turn;
+    plannerTelemetry.planReason = "pickup_feeding_unconfirmed";
+    if (!pickupTrajectoryCommandSafe(
+          WEIGHT_HUNT_MAX_SPEED_TPS, turn, runtime.observation)) {
+      motorStopRequested = true;
+      requestMotionStop();
+      plannerTelemetry.replanReason = "pickup_feed_corridor_veto";
+      return;
+    }
+    motorStopRequested = false;
+    publishNavigationMotion(WEIGHT_HUNT_MAX_SPEED_TPS, turn);
+    return;
+  }
+
+  MatrixTargetObservation &observation = runtime.observation;
+  const unsigned long observationAgeMs = now - observation.acquiredMs;
+  const bool newerTrackLossFrame =
+    matrixTargetObservation.trackId == runtime.status.trackId &&
+    matrixTargetObservation.frameSequence > observation.frameSequence &&
+    !matrixTargetObservation.valid;
+  const bool directFresh = observation.valid &&
+    observation.confirmedStatic &&
+    observation.trackId == runtime.status.trackId &&
+    !newerTrackLossFrame &&
+    observationAgeMs <= MATRIX_TRACK_STALE_TIMEOUT_MS;
+  float gapMm = 0.0f;
+  bool usingPrediction = false;
+
+  if (directFresh) {
+    gapMm = observation.directGapMm;
+    const bool closing = runtime.lastDirectGapMm <= 0.0f ||
+      gapMm <= runtime.lastDirectGapMm + 5.0f;
+    runtime.predictedTargetWorldX = observation.worldX;
+    runtime.predictedTargetWorldY = observation.worldY;
+    if (!runtime.finalApproachArmed && closing &&
+        gapMm <= MATRIX_FINAL_APPROACH_ARM_GAP_MM &&
+        fabs(observation.columnError) <=
+          MATRIX_HANDOFF_MAX_ERROR_COLUMNS) {
+      runtime.finalApproachArmed = true;
+      runtime.status.phase = PICKUP_TRACKING_FINAL_APPROACH_PREDICT;
+      runtime.phaseStartedMs = now;
+      sendBluetoothEvent("pickup_final_approach_armed", "fresh_static_track");
+    }
+    runtime.lastDirectGapMm = gapMm;
+  } else if (runtime.finalApproachArmed) {
+    gapMm = predictedPickupGapMm();
+    const float projectedDistanceMm = runtime.lastDirectGapMm - gapMm;
+    usingPrediction = true;
+    if (observationAgeMs > MATRIX_FINAL_APPROACH_MAX_PREDICTION_MS ||
+        projectedDistanceMm < 0.0f ||
+        projectedDistanceMm > MATRIX_FINAL_APPROACH_MAX_PREDICTION_MM) {
+      failPickupTracking(PICKUP_OUTCOME_FINAL_APPROACH_ESTIMATE_EXPIRED,
+                         "final_approach_estimate_expired");
+      return;
+    }
+  } else {
+    failPickupTracking(PICKUP_OUTCOME_TARGET_LOST,
+                       "target_lost_before_final_approach");
+    return;
+  }
+
+  runtime.status.bestGapMm = gapMm;
+  runtime.status.columnError = observation.columnError;
+  runtime.status.usingPredictedGap = usingPrediction;
+  const float turn = fabs(observation.columnError) <=
+      WEIGHT_HUNT_CENTER_DEADBAND_COLUMNS
+    ? 0.0f
+    : constrain(observation.columnError *
+                  WEIGHT_HUNT_STEERING_GAIN_TPS_PER_COLUMN,
+                -WEIGHT_HUNT_MAX_TURN_TPS,
+                WEIGHT_HUNT_MAX_TURN_TPS);
+  plannerTelemetry.selectedForwardTicksPerSec = WEIGHT_HUNT_MAX_SPEED_TPS;
+  plannerTelemetry.selectedTurnTicksPerSec = turn;
+  plannerTelemetry.speedCapTicksPerSec = WEIGHT_HUNT_MAX_SPEED_TPS;
+  plannerTelemetry.planReason = usingPrediction
+    ? "pickup_final_approach_predict" : "pickup_track_full_speed";
+  if (!pickupTrajectoryCommandSafe(
+        WEIGHT_HUNT_MAX_SPEED_TPS, turn, observation)) {
+    failPickupTracking(PICKUP_OUTCOME_INACCESSIBLE_TARGET,
+                       "pickup_capture_corridor_infeasible");
+    return;
+  }
+  motorStopRequested = false;
+  const bool authorized = publishNavigationMotion(
+    WEIGHT_HUNT_MAX_SPEED_TPS, turn);
+
+  if (authorized && runtime.finalApproachArmed &&
+      gapMm <= MATRIX_PICKUP_HANDOFF_GAP_MM &&
+      fabs(observation.columnError) <=
+        MATRIX_HANDOFF_MAX_ERROR_COLUMNS &&
+      desiredForwardSpeed > 0.0f) {
+    runtime.status.phase = PICKUP_TRACKING_HANDOFF_ASSUMED;
+    runtime.status.outcome = PICKUP_OUTCOME_WEIGHT_FUNNEL_HANDOFF_ASSUMED;
+    runtime.status.detail = "matrix_30mm_handoff_assumed";
+    runtime.handoffX = robotX;
+    runtime.handoffY = robotY;
+    runtime.feedProgressMm = 0.0f;
+    runtime.feedLastX = robotX;
+    runtime.feedLastY = robotY;
+    runtime.captureHeadingDeg = navigationHeadingDeg();
+    runtime.phaseStartedMs = now;
+    sendBluetoothEvent("weight_funnel_handoff_assumed",
+                       "matrix_30mm_no_payload_confirmation");
+  }
 }
 
 static bool routeLineGoalReached(float routeLengthM, float routeUx, float routeUy,
@@ -277,33 +485,6 @@ static bool routeLineClearlyMissed(float routeLengthM, float routeUx, float rout
          lateralErrorM <= PLANNER_LINE_FOLLOW_LATERAL_TOLERANCE_M;
 }
 
-
-static bool huntPickupCarryThroughActive(float routeLengthM, float routeUx,
-                                         float routeUy) {
-  if (!ownerIsObjectHunt(navigationGoal.owner)) {
-    return false;
-  }
-
-  float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
-  float lateralErrorM = routeLineLateralErrorM(robotX, robotY, routeUx, routeUy);
-  return alongM >= routeLengthM - PLANNER_HUNT_PICKUP_CARRY_ZONE_M &&
-         alongM <= routeLengthM + PLANNER_HUNT_FINISH_OVERSHOOT_M &&
-         lateralErrorM <= PLANNER_HUNT_FINISH_LATERAL_M;
-}
-
-
-
-static bool huntPickupZoneReached(float routeLengthM, float routeUx, float routeUy) {
-  if (!ownerIsObjectHunt(navigationGoal.owner)) {
-    return false;
-  }
-
-  float alongM = routeLineAlongM(robotX, robotY, routeUx, routeUy);
-  float lateralErrorM = routeLineLateralErrorM(robotX, robotY, routeUx, routeUy);
-  return alongM >= routeLengthM - PLANNER_HUNT_FINISH_TARGET_TOLERANCE_M &&
-         alongM <= routeLengthM + PLANNER_HUNT_FINISH_OVERSHOOT_M &&
-         lateralErrorM <= PLANNER_HUNT_FINISH_LATERAL_M;
-}
 
 static float pointAlignmentTurnErrorDeg(float headingErrorDeg) {
   return headingErrorDeg;
@@ -400,13 +581,29 @@ static void updatePointGoal() {
   float dx = navigationGoal.targetX - robotX;
   float dy = navigationGoal.targetY - robotY;
   float distanceM = sqrtf(dx * dx + dy * dy);
-  float arrivalToleranceM = ownerIsObjectHunt(navigationGoal.owner)
-                              ? PLANNER_HUNT_FINISH_TARGET_TOLERANCE_M
-                              : WAYPOINT_TOLERANCE_M;
-  if (distanceM <= arrivalToleranceM) {
+  if (distanceM <= WAYPOINT_TOLERANCE_M) {
     finishNavigationGoal(true, PLANNER_STOP_NONE, "waypoint_reached");
     return;
   }
+
+  if (!isRangeSensorCurrent(RANGE_FRONT)) {
+    const unsigned long now = millis();
+    if (plannerContext.frontInvalidSinceMs == 0) {
+      plannerContext.frontInvalidSinceMs = now;
+    }
+    motorStopRequested = true;
+    requestMotionStop();
+    plannerTelemetry.stopReason = PLANNER_STOP_FRONT_INVALID;
+    plannerTelemetry.safeStopReason = "front_sensor_invalid";
+    plannerTelemetry.replanReason = "front_sensor_revalidate";
+    if (now - plannerContext.frontInvalidSinceMs >=
+        PLANNER_FRONT_INVALID_ABORT_MS) {
+      finishNavigationGoal(false, PLANNER_STOP_FRONT_INVALID,
+                           "front_sensor_invalid_timeout");
+    }
+    return;
+  }
+  plannerContext.frontInvalidSinceMs = 0;
 
   float routeLengthM = 0.0f;
   float routeUx = 1.0f;
@@ -418,11 +615,6 @@ static void updatePointGoal() {
     routeFrameValid &&
     fabs(wrapAngle(routeHeadingRad * RAD_TO_DEG - navigationHeadingDeg())) <=
       PLANNER_LINE_FOLLOW_ENABLE_HEADING_DEG;
-
-  if (routeFrameValid && huntPickupZoneReached(routeLengthM, routeUx, routeUy)) {
-    finishNavigationGoal(true, PLANNER_STOP_NONE, "hunt_pickup_zone_reached");
-    return;
-  }
 
   if (plannerContext.emergencyRecoveryState.phase != EMERGENCY_RECOVERY_IDLE &&
       plannerContext.emergencyRecoveryState.phase !=
@@ -459,11 +651,11 @@ static void updatePointGoal() {
     if (plannerContext.reverseRecoveryState.checkingForward) {
       bool takeoverAvoidance = updateObstacleContext(
         navigationGoal.targetX, navigationGoal.targetY);
-      if (takeoverAvoidance) {
+      bool recoveryGoalValid = !takeoverAvoidance ||
         buildObstacleLocalGoal(recoveryGoalX, recoveryGoalY);
-      }
-      TrajectoryPlanResult forwardResult =
-        selectTrajectory(recoveryGoalX, recoveryGoalY);
+      TrajectoryPlanResult forwardResult = recoveryGoalValid
+        ? selectTrajectory(recoveryGoalX, recoveryGoalY)
+        : TRAJECTORY_PLAN_NO_PATH;
       if (forwardResult == TRAJECTORY_PLAN_PENDING ||
           forwardResult == TRAJECTORY_PLAN_ABORTED ||
           forwardResult == TRAJECTORY_PLAN_RETRY) {
@@ -512,14 +704,11 @@ static void updatePointGoal() {
     return;
   }
 
-  bool huntCarryThroughActive =
-    routeLineEligible && huntPickupCarryThroughActive(routeLengthM, routeUx, routeUy);
-  bool avoidanceActive = updateObstacleContext(navigationGoal.targetX,
-                                               navigationGoal.targetY);
   float targetHeadingDeg = atan2f(dy, dx) * RAD_TO_DEG;
   float targetHeadingErrorDeg = wrapAngle(targetHeadingDeg - navigationHeadingDeg());
+  bool avoidanceActive = updateObstacleContext(navigationGoal.targetX,
+                                               navigationGoal.targetY);
   if (!plannerContext.plannerEpoch.active && !avoidanceActive &&
-      !huntCarryThroughActive &&
       distanceM > PLANNER_FINAL_BLOCKED_ACCEPTANCE_M &&
       fabs(targetHeadingErrorDeg) > PLANNER_POINT_ALIGN_START_DEG) {
     commandPointAlignmentTurn(targetHeadingErrorDeg);
@@ -531,7 +720,27 @@ static void updatePointGoal() {
   float localGoalX = 0.0f;
   float localGoalY = 0.0f;
   if (avoidanceActive) {
-    buildObstacleLocalGoal(localGoalX, localGoalY);
+    if (!buildObstacleLocalGoal(localGoalX, localGoalY)) {
+      motorStopRequested = true;
+      requestMotionStop();
+      resetPlannerEpoch();
+      plannerContext.lastForwardNoPathWasGeometric = true;
+      plannerTelemetry.stopReason = PLANNER_STOP_NO_SAFE_TRAJECTORY;
+      plannerTelemetry.planReason = "obstacle_local_goal_invalid";
+      plannerTelemetry.replanReason = "obstacle_target_pose_infeasible";
+      plannerTelemetry.safeStopReason = "obstacle_local_goal_infeasible";
+      reportPlannerStopIfChanged();
+      noteGeometricNoPathEpoch();
+      if (canStartEvidenceDrivenReverse()) {
+        startEvidenceDrivenReverse("obstacle_local_goal_infeasible");
+      } else if (millis() - plannerContext.noSafeTrajectorySinceMs >=
+                 PLANNER_NO_PATH_ABORT_MS) {
+        handleRecoveryExhaustion(
+          PLANNER_STOP_NO_SAFE_TRAJECTORY,
+          "obstacle_has_no_safe_local_target");
+      }
+      return;
+    }
     plannerTelemetry.planReason = "obstacle_local_bypass";
   } else {
     float lookaheadM = min(distanceM, WAYPOINT_LOOKAHEAD_M);
@@ -619,6 +828,28 @@ static void updatePointGoal() {
   requestMotionStop();
   reportPlannerStopIfChanged();
   if (!currentPlannerFailureIsGeometricNoPath()) {
+    resetGeometricNoPathEvidence();
+    return;
+  }
+  if (avoidanceActive &&
+      localGoalDistanceM > PLANNER_FINAL_BLOCKED_ACCEPTANCE_M) {
+    float localGoalHeadingDeg = atan2f(localGoalY - robotY,
+                                       localGoalX - robotX) * RAD_TO_DEG;
+    float localGoalHeadingErrorDeg = wrapAngle(
+      localGoalHeadingDeg - navigationHeadingDeg());
+    float alignmentTurn = localGoalHeadingErrorDeg >= 0.0f
+      ? PLANNER_TURN_TARGET_SPEED : -PLANNER_TURN_TARGET_SPEED;
+    if (fabs(localGoalHeadingErrorDeg) >
+          PLANNER_OBSTACLE_ALIGN_FALLBACK_DEG &&
+        areTurnSweepSensorsValid() &&
+        isTurnDirectionObservable(alignmentTurn) &&
+        isTurnSweepSafe()) {
+      resetGeometricNoPathEvidence();
+      commandPointAlignmentTurn(localGoalHeadingErrorDeg);
+      return;
+    }
+  }
+  if (avoidanceActive && commitObstacleAlongStageAfterNoPath()) {
     resetGeometricNoPathEvidence();
     return;
   }
@@ -738,6 +969,8 @@ void updateNavigationController() {
   // to reduce overshoot at the tolerance boundary.
   unsigned long updateIntervalMs = navigationGoal.mode == NAV_GOAL_TURN
     ? MOTOR_CONTROL_INTERVAL_MS
+    : navigationGoal.mode == NAV_GOAL_PICKUP_TRACK
+      ? MOTOR_CONTROL_INTERVAL_MS
     : PLANNER_UPDATE_INTERVAL_MS;
   bool plannerEpochPending =
     navigationGoal.mode == NAV_GOAL_POINT &&
@@ -755,6 +988,8 @@ void updateNavigationController() {
     updatePointGoal();
   } else if (navigationGoal.mode == NAV_GOAL_TURN) {
     updateTurnGoal();
+  } else if (navigationGoal.mode == NAV_GOAL_PICKUP_TRACK) {
+    updatePickupTrackingGoal();
   }
 }
 

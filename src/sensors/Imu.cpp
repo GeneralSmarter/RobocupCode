@@ -64,5 +64,12 @@ float readImuClockwiseYawDeg() {
   bno.getEvent(&event);
 
   float rawYaw = event.orientation.x;
+  latestImuRollDeg = event.orientation.z;
+  latestImuPitchDeg = event.orientation.y;
   return wrapAngle(rawYaw - yawOffset);
+}
+
+void getLatestImuAttitude(float &pitchDeg, float &rollDeg) {
+  pitchDeg = latestImuPitchDeg;
+  rollDeg = latestImuRollDeg;
 }

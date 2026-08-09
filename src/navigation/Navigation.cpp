@@ -27,6 +27,13 @@ NavigationGoal navigationGoal = {
   0
 };
 
+PickupTrackingRuntime pickupTrackingRuntime = {
+  {PICKUP_TRACKING_IDLE, PICKUP_OUTCOME_NONE, 0, 0.0f, 0.0f, 0.0f,
+   false, "idle"},
+  {}, {}, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+  0.0f, 0.0f, 0.0f, 0
+};
+
 static const char* ownerEventName(NavigationGoalOwner owner, bool success) {
   switch (owner) {
     case NAV_OWNER_TEST_DRIVE: return success ? "test_drive_end" : "test_drive_abort";
@@ -36,13 +43,9 @@ static const char* ownerEventName(NavigationGoalOwner owner, bool success) {
     case NAV_OWNER_TEST_TURN: return success ? "test_turn_end" : "test_turn_abort";
     case NAV_OWNER_TEST_HUNT: return success ? "test_hunt_end" : "test_hunt_abort";
     case NAV_OWNER_WEIGHT_SCAN: return success ? "weight_scan_end" : "weight_scan_abort";
-    case NAV_OWNER_OBJECT_HUNT: return success ? "object_hunt_end" : "object_hunt_abort";
+    case NAV_OWNER_PICKUP_TRACK: return success ? "pickup_track_end" : "pickup_track_abort";
     default: return success ? "navigation_goal_complete" : "navigation_goal_stop";
   }
-}
-
-bool ownerIsObjectHunt(NavigationGoalOwner owner) {
-  return owner == NAV_OWNER_TEST_HUNT || owner == NAV_OWNER_OBJECT_HUNT;
 }
 
 void finishNavigationGoal(bool success, PlannerStopReason reason,
@@ -50,6 +53,7 @@ void finishNavigationGoal(bool success, PlannerStopReason reason,
   // This is the one exit path for both route goals and test goals. It removes
   // any pending motion command before publishing the completion/abort event.
   NavigationGoalOwner owner = navigationGoal.owner;
+  const bool pickupWasActive = navigationGoal.mode == NAV_GOAL_PICKUP_TRACK;
   if (plannerContext.plannerEpoch.active) {
     closePlannerEpoch();
   }
@@ -60,6 +64,7 @@ void finishNavigationGoal(bool success, PlannerStopReason reason,
   plannerContext.emergencyRecoveryState = {};
   plannerTelemetry.reverseRecoveryActive = false;
   resetGeometricNoPathEvidence();
+  plannerContext.frontInvalidSinceMs = 0;
   plannerContext.reverseRecoveryRejectsReported = false;
   resetObstacleContext(success ? "goal_complete" : "goal_abort");
   motorStopRequested = true;
@@ -76,6 +81,13 @@ void finishNavigationGoal(bool success, PlannerStopReason reason,
   plannerTelemetry.plannerEpochActive = false;
   plannerTelemetry.plannerCommandAgeMs = 0;
   sendBluetoothEvent(ownerEventName(owner, success), detail);
+  setMatrixPickupTrackId(0);
+  if (pickupWasActive && !success &&
+      pickupTrackingRuntime.status.outcome == PICKUP_OUTCOME_RUNNING) {
+    pickupTrackingRuntime.status.phase = PICKUP_TRACKING_FAILED;
+    pickupTrackingRuntime.status.outcome = PICKUP_OUTCOME_NAVIGATION_FAILED;
+    pickupTrackingRuntime.status.detail = detail;
+  }
 
 }
 
@@ -168,6 +180,7 @@ bool startNavigationPoint(float targetX, float targetY,
   resetTurnStuckCheck(navigationHeadingDeg());
   plannerContext.pointAlignTurnActive = false;
   plannerContext.pointAlignTurnDirection = 0.0;
+  plannerContext.frontInvalidSinceMs = 0;
   plannerContext.turnSideInvalidSinceMs = 0;
   plannerContext.turnSweepInvalidSinceMs = 0;
   sendBluetoothEvent("navigation_goal_start", "point");
@@ -274,8 +287,80 @@ bool navigationGoTo(float worldX, float worldY) {
   return startNavigationPoint(worldX, worldY, NAV_OWNER_ROUTE);
 }
 
-bool navigationGoToPickup(float worldX, float worldY) {
-  return startNavigationPoint(worldX, worldY, NAV_OWNER_OBJECT_HUNT);
+bool navigationStartPickupTracking(const MatrixTargetObservation &target,
+                                   const RouteResumeContext &resume) {
+  if (!target.valid || !target.confirmedStatic || target.trackId == 0 ||
+      navigationGoal.active ||
+      (motionAuthority != MOTION_AUTHORITY_MISSION &&
+       motionAuthority != MOTION_AUTHORITY_TEST)) {
+    return false;
+  }
+  resetPlannerEpoch();
+  resetReversePlannerEpoch();
+  resetObstacleContext("pickup_tracking_start");
+  resetRecoveryBudget();
+  resetGeometricNoPathEvidence();
+  navigationGoal = {
+    NAV_GOAL_PICKUP_TRACK,
+    motionAuthority == MOTION_AUTHORITY_TEST
+      ? NAV_OWNER_TEST_HUNT : NAV_OWNER_PICKUP_TRACK,
+    motionAuthority,
+    true, false, false,
+    resume.valid ? resume.segmentEndX : target.worldX,
+    resume.valid ? resume.segmentEndY : target.worldY,
+    0.0f,
+    robotX, robotY, navigationHeadingDeg(), millis()
+  };
+  pickupTrackingRuntime = {
+    {PICKUP_TRACKING_FULL_SPEED, PICKUP_OUTCOME_RUNNING, target.trackId,
+     target.directGapMm, target.columnError,
+     PICKUP_MIN_FORWARD_FEED_DISTANCE_MM, false, "tracking"},
+    target, resume, false, target.directGapMm,
+    target.worldX, target.worldY,
+    0.0f, 0.0f, 0.0f, robotX, robotY,
+    navigationHeadingDeg(), millis()
+  };
+  setMatrixPickupTrackId(target.trackId);
+  resetEncodersAndPID();
+  lastPlannerUpdateMs = 0;
+  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
+  plannerTelemetry.planReason = "pickup_tracking_start";
+  plannerTelemetry.replanReason = "pickup_tracking_start";
+  plannerTelemetry.safeStopReason = "";
+  motorStopRequested = true;
+  requestMotionStop();
+  motorStopRequested = false;
+  sendBluetoothEvent("pickup_tracking_start", "latched_static_track");
+  return true;
+}
+
+bool navigationUpdatePickupTracking(const MatrixTargetObservation &target) {
+  if (!navigationGoal.active ||
+      navigationGoal.mode != NAV_GOAL_PICKUP_TRACK ||
+      target.trackId != pickupTrackingRuntime.status.trackId ||
+      target.frameSequence <=
+        pickupTrackingRuntime.observation.frameSequence) {
+    return false;
+  }
+  pickupTrackingRuntime.observation = target;
+  pickupTrackingRuntime.status.columnError = target.columnError;
+  pickupTrackingRuntime.status.bestGapMm = target.directGapMm;
+  return true;
+}
+
+PickupTrackingStatus navigationGetPickupTrackingStatus() {
+  return pickupTrackingRuntime.status;
+}
+
+bool navigationRetargetDiagnosticPoint(float worldX, float worldY) {
+  if (!navigationGoal.active || navigationGoal.mode != NAV_GOAL_POINT ||
+      navigationGoal.authority != MOTION_AUTHORITY_TEST ||
+      navigationGoal.owner != NAV_OWNER_TEST_GOTO) return false;
+  navigationGoal.targetX = worldX;
+  navigationGoal.targetY = worldY;
+  resetPlannerEpoch();
+  lastPlannerUpdateMs = 0;
+  return true;
 }
 
 bool navigationTurnBy(float relativeDegrees) {
@@ -348,7 +433,7 @@ bool navigationStartPointForSimulator(float worldX, float worldY,
                                       int ownerCode) {
   NavigationGoalOwner owner =
     ownerCode >= static_cast<int>(NAV_OWNER_ROUTE) &&
-    ownerCode <= static_cast<int>(NAV_OWNER_OBJECT_HUNT)
+    ownerCode <= static_cast<int>(NAV_OWNER_PICKUP_TRACK)
       ? static_cast<NavigationGoalOwner>(ownerCode)
       : NAV_OWNER_TEST_AVOID;
   return startNavigationPoint(worldX, worldY, owner);
@@ -361,6 +446,7 @@ bool navigationSimulatorOwnerUsesMissionAuthority(int ownerCode) {
 
 void navigationResetForSimulator() {
   navigationGoal = {};
+  pickupTrackingRuntime = {};
   initializeNavigationController();
 }
 

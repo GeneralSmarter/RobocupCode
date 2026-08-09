@@ -5,6 +5,7 @@
 
 void resetObstacleContext(const char* reason);
 bool updateObstacleContext(float targetX, float targetY);
-void buildObstacleLocalGoal(float &localGoalX, float &localGoalY);
+bool buildObstacleLocalGoal(float &localGoalX, float &localGoalY);
+bool commitObstacleAlongStageAfterNoPath();
 
 #endif

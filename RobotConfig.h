@@ -11,7 +11,7 @@
 //   and recovery limits.
 // Interacts with:
 //   All behavior modules read this file through Robot.h. MotorControl.cpp uses
-//   motor/PID/timing values, TofSensors.cpp and ObjectDetection.cpp use sensor
+//   motor/PID/timing values, and the fan/rear/matrix modules use sensor
 //   configuration, navigation modules use geometry/planner/recovery values,
 //   and Bluetooth.cpp exposes selected tuning knobs at runtime.
 // Control flow:
@@ -113,13 +113,12 @@ const float EFFECTIVE_TRACK_WIDTH_M = 0.224;
 // =====================================================
 // Wheel speed PID
 // =====================================================
-const float DEFAULT_BASE_TARGET_SPEED = 3000.0f;
+const float DEFAULT_BASE_TARGET_SPEED = 2600.0f;
 
 // =====================================================
 // TOF sensors
 // =====================================================
 const uint16_t RANGE_NO_READING_MM = 9999;
-const uint16_t OBJECT_NO_READING_MM = RANGE_NO_READING_MM;
 const unsigned long SENSOR_AGE_NOT_REPORTED_MS = 999999;
 const uint8_t SENSOR_RANGE_STATUS_UNKNOWN = 255;
 const byte INVALID_XSHUT_PIN = 255;
@@ -137,36 +136,6 @@ const uint8_t RIGHT_INNER_ADDRESS = 0x31;
 const uint8_t LEFT_INNER_ADDRESS  = 0x32;
 const uint8_t LEFT_OUTER_ADDRESS  = 0x33;
 
-// Object/weight ToF scaffold. The physical VL53L1X layout is now measured and
-// enabled for bring-up. When disabled, keep the reserved XSHUT pins low so
-// unconfigured object sensors stay off the shared I2C bus.
-const bool OBJECT_TOF_ENABLED = true;
-const bool OBJECT_TOF_HOLD_DISABLED_IN_RESET = true;
-const byte OBJECT_LEFT_UPPER_XSHUT  = 5;
-const byte OBJECT_RIGHT_UPPER_XSHUT = 4;
-const byte OBJECT_LEFT_LOW_XSHUT    = 7;
-const byte OBJECT_RIGHT_LOW_XSHUT   = 6;
-const uint8_t OBJECT_LEFT_LOW_ADDRESS    = 0x34;
-const uint8_t OBJECT_LEFT_UPPER_ADDRESS  = 0x35;
-const uint8_t OBJECT_RIGHT_LOW_ADDRESS   = 0x36;
-const uint8_t OBJECT_RIGHT_UPPER_ADDRESS = 0x37;
-const uint32_t OBJECT_TOF_TIMING_BUDGET_US = 50000;
-const unsigned long OBJECT_TOF_SAMPLE_PERIOD_MS = 60;
-const uint8_t OBJECT_TOF_ROI_WIDTH = 16;
-const uint8_t OBJECT_TOF_ROI_HEIGHT = 10;
-const uint8_t OBJECT_TOF_ROI_CENTER_SPAD = 199;
-const int OBJECT_TOF_VALID_MIN_MM = 40;
-const int OBJECT_TOF_VALID_MAX_MM = 2000;
-const unsigned long OBJECT_TOF_STALE_TIMEOUT_MS = 750;
-const uint16_t OBJECT_CANDIDATE_MIN_MM = 60;
-const uint16_t OBJECT_CANDIDATE_MAX_MM = 800;
-const uint16_t OBJECT_UPPER_CLEAR_DELTA_MM = 80;
-const float OBJECT_UPPER_STRONG_SIGNAL_MCPS = 4.0;
-const uint8_t OBJECT_CANDIDATE_CONFIRM_READS = 3;
-const unsigned long OBJECT_TARGET_STALE_TIMEOUT_MS = 1000;
-const uint8_t OBJECT_TARGET_SOURCE_LEFT_LOW = 0x01;
-const uint8_t OBJECT_TARGET_SOURCE_RIGHT_LOW = 0x02;
-const float OBJECT_PICKUP_OVERSHOOT_MM = 150.0;
 const float WEIGHT_SEARCH_SWEEP_DEG = 30.0;
 const float WEIGHT_SEARCH_CONFIRM_TURN_MIN_DEG = 5.0;
 const float WEIGHT_SEARCH_CONFIRM_TURN_MAX_DEG = 35.0;
@@ -176,6 +145,93 @@ const unsigned long WEIGHT_SEARCH_CONFIRM_MS = 300;
 const unsigned long WEIGHT_SEARCH_HUNT_TIMEOUT_MS = 5000;
 const unsigned long WEIGHT_INTERRUPT_COOLDOWN_MS = 1000;
 const float WEIGHT_SEARCH_MAX_ROUTE_DEVIATION_M = 0.85;
+const float MATRIX_FOLLOW_SCAN_DEG = 30.0f;
+const float MATRIX_FOLLOW_MAX_TARGET_TRAVEL_M = 0.50f;
+const unsigned long MATRIX_FOLLOW_LOSS_STOP_MS = 300;
+const unsigned long MATRIX_FOLLOW_REACQUIRE_TIMEOUT_MS = 2500;
+
+// Three rear VL53L1X sensors replace the former four-channel object array.
+// Wiring reuses the measured harness allocation: XSHUT7/5/6 are
+// left/centre/right and XSHUT4 remains held in reset and reserved.
+const bool REAR_TOF_ENABLED = true;
+const byte REAR_TOF_RESERVED_XSHUT = 4;
+const uint8_t REAR_TOF_RESERVED_ADDRESS = 0x37;
+const uint8_t REAR_TOF_ROI_WIDTH = 16;
+const uint8_t REAR_TOF_ROI_HEIGHT = 16;
+const uint32_t REAR_TOF_TIMING_BUDGET_US = 50000;
+const unsigned long REAR_TOF_SAMPLE_PERIOD_MS = 60;
+const unsigned long REAR_TOF_STALE_TIMEOUT_MS = 250;
+const unsigned long REAR_TOF_RECONNECT_INTERVAL_MS = 1000;
+const unsigned long REAR_TOF_MAX_SAMPLE_SKEW_MS = 140;
+const uint8_t REAR_TOF_CLEAR_CONFIRM_SAMPLES = 3;
+const uint16_t REAR_TOF_VALID_MIN_MM = 40;
+const uint16_t REAR_TOF_VALID_MAX_MM = 2000;
+// Provisional software thresholds retained only as an initial conservative
+// starting point; physical acceptance must replace them from saved stopping
+// distance and uncertainty evidence.
+const uint16_t REAR_TOF_STOP_DISTANCE_MM = 250;
+const uint16_t REAR_TOF_CLEAR_DISTANCE_MM = 300;
+
+constexpr RearTofConfig REAR_TOF_CONFIG[REAR_TOF_COUNT] = {
+  {"rear_left", {-107.860f, 95.340f, 180.000f, 150.0f, 0.0f, 0.0f},
+   SENSOR_I2C_PRIMARY, 7, 0x34, 16, 16, 27.0f, 27.0f,
+   REAR_TOF_TIMING_BUDGET_US,
+   REAR_TOF_SAMPLE_PERIOD_MS, REAR_TOF_VALID_MIN_MM, REAR_TOF_VALID_MAX_MM,
+   REAR_TOF_STOP_DISTANCE_MM, REAR_TOF_CLEAR_DISTANCE_MM},
+  {"rear_centre", {-112.860f, 0.000f, 180.000f, 180.0f, 0.0f, 0.0f},
+   SENSOR_I2C_PRIMARY, 5, 0x35, 16, 16, 27.0f, 27.0f,
+   REAR_TOF_TIMING_BUDGET_US,
+   REAR_TOF_SAMPLE_PERIOD_MS, REAR_TOF_VALID_MIN_MM, REAR_TOF_VALID_MAX_MM,
+   REAR_TOF_STOP_DISTANCE_MM, REAR_TOF_CLEAR_DISTANCE_MM},
+  {"rear_right", {-107.860f, -95.340f, 180.000f, 210.0f, 0.0f, 0.0f},
+   SENSOR_I2C_PRIMARY, 6, 0x36, 16, 16, 27.0f, 27.0f,
+   REAR_TOF_TIMING_BUDGET_US,
+   REAR_TOF_SAMPLE_PERIOD_MS, REAR_TOF_VALID_MIN_MM, REAR_TOF_VALID_MAX_MM,
+   REAR_TOF_STOP_DISTANCE_MM, REAR_TOF_CLEAR_DISTANCE_MM}
+};
+
+static_assert(REAR_TOF_COUNT == 3, "Exactly three rear ToFs are required");
+static_assert(REAR_TOF_ROI_WIDTH == 16 && REAR_TOF_ROI_HEIGHT == 16,
+              "Rear VL53L1X sensors must use their full 16x16 ROI");
+static_assert(REAR_TOF_CONFIG[0].xshutChannel !=
+                REAR_TOF_CONFIG[1].xshutChannel &&
+              REAR_TOF_CONFIG[0].xshutChannel !=
+                REAR_TOF_CONFIG[2].xshutChannel &&
+              REAR_TOF_CONFIG[1].xshutChannel !=
+                REAR_TOF_CONFIG[2].xshutChannel,
+              "Rear XSHUT channels must be unique");
+static_assert(REAR_TOF_CONFIG[0].i2cAddress !=
+                REAR_TOF_CONFIG[1].i2cAddress &&
+              REAR_TOF_CONFIG[0].i2cAddress !=
+                REAR_TOF_CONFIG[2].i2cAddress &&
+              REAR_TOF_CONFIG[1].i2cAddress !=
+                REAR_TOF_CONFIG[2].i2cAddress,
+              "Rear I2C addresses must be unique on the primary bus");
+constexpr bool sensorGeometryFinite(float value) {
+  return value == value && value > -100000.0f && value < 100000.0f;
+}
+static_assert(REAR_TOF_CONFIG[0].bus == SENSOR_I2C_PRIMARY &&
+                REAR_TOF_CONFIG[1].bus == SENSOR_I2C_PRIMARY &&
+                REAR_TOF_CONFIG[2].bus == SENSOR_I2C_PRIMARY,
+              "All rear VL53L1X sensors must remain on the primary bus");
+static_assert(REAR_TOF_CONFIG[0].xshutChannel != REAR_TOF_RESERVED_XSHUT &&
+                REAR_TOF_CONFIG[1].xshutChannel != REAR_TOF_RESERVED_XSHUT &&
+                REAR_TOF_CONFIG[2].xshutChannel != REAR_TOF_RESERVED_XSHUT &&
+                REAR_TOF_CONFIG[0].i2cAddress != REAR_TOF_RESERVED_ADDRESS &&
+                REAR_TOF_CONFIG[1].i2cAddress != REAR_TOF_RESERVED_ADDRESS &&
+                REAR_TOF_CONFIG[2].i2cAddress != REAR_TOF_RESERVED_ADDRESS,
+              "Reserved rear XSHUT/address must remain unused");
+static_assert(REAR_TOF_CONFIG[0].mount.xMm == REAR_TOF_CONFIG[2].mount.xMm &&
+                REAR_TOF_CONFIG[0].mount.yMm ==
+                  -REAR_TOF_CONFIG[2].mount.yMm &&
+                REAR_TOF_CONFIG[0].mount.yawDeg +
+                  REAR_TOF_CONFIG[2].mount.yawDeg == 360.0f,
+              "Rear left/right geometry must remain mirrored");
+static_assert(sensorGeometryFinite(REAR_TOF_CONFIG[0].mount.xMm) &&
+                sensorGeometryFinite(REAR_TOF_CONFIG[0].mount.yMm) &&
+                sensorGeometryFinite(REAR_TOF_CONFIG[1].mount.xMm) &&
+                sensorGeometryFinite(REAR_TOF_CONFIG[2].mount.yMm),
+              "Rear geometry must be finite");
 
 const int FRONT_STOP_DISTANCE_MM  = 180;
 const int FRONT_CLEAR_DISTANCE_MM = 230;
@@ -187,55 +243,139 @@ const unsigned long TOF_STALE_TIMEOUT_MS = 750;
 const int FRONT_BLOCK_CONFIRM_READS = 2;
 const int FRONT_CLEAR_CONFIRM_READS = 3;
 
-// SEN0628 8x8 rear obstacle sensor. RANGE_FAKE_REAR remains the temporary
-// range-slot identifier, but its runtime value now comes from this sensor.
-const uint8_t REAR_MATRIX_TOF_I2C_ADDRESS = 0x33;
-const uint16_t REAR_MATRIX_TOF_VALID_MIN_MM = 20;
-const uint16_t REAR_MATRIX_TOF_VALID_MAX_MM = 3999;
-const uint16_t REAR_MATRIX_TOF_STOP_DISTANCE_MM = 250;
-const uint16_t REAR_MATRIX_TOF_CLEAR_DISTANCE_MM = 300;
-const uint8_t REAR_MATRIX_TOF_CLEAR_CONFIRM_FRAMES = 3;
-// Rows are logical after the 180-degree mounting correction. Rows 0-3 are the
-// visible top half of the displayed matrix; rows 4-7 do not affect clearance.
-const uint8_t REAR_MATRIX_TOF_ACTIVE_FIRST_ROW = 0;
-const uint8_t REAR_MATRIX_TOF_ACTIVE_ROW_COUNT = 4;
-const uint8_t REAR_MATRIX_TOF_COLUMN_COUNT = 8;
-const float REAR_MATRIX_TOF_HORIZONTAL_FOV_DEG = 60.0f;
-const float REAR_MATRIX_TOF_VERTICAL_FOV_DEG = 60.0f;
-const unsigned long REAR_MATRIX_TOF_FRAME_INTERVAL_MS = 100;
-const unsigned long REAR_MATRIX_TOF_STALE_TIMEOUT_MS = 250;
-const unsigned long REAR_MATRIX_TOF_RESPONSE_TIMEOUT_MS = 200;
-const unsigned long REAR_MATRIX_TOF_MODE_TIMEOUT_MS = 1000;
-const unsigned long REAR_MATRIX_TOF_MODE_SETTLE_MS = 5000;
-const unsigned long REAR_MATRIX_TOF_RECONNECT_INTERVAL_MS = 1000;
-static_assert(REAR_MATRIX_TOF_ACTIVE_FIRST_ROW +
-                REAR_MATRIX_TOF_ACTIVE_ROW_COUNT <= 8,
-              "Rear matrix active rows must fit inside the 8x8 frame");
-static_assert(REAR_MATRIX_TOF_COLUMN_COUNT == 8,
-              "Rear matrix ray policy expects eight columns");
+// Front SEN0628 configuration. The explicit identity transform replaces the
+// old implicit 180-degree rear-mount correction. The matrix begins as
+// supplemental blocking evidence: valid close cells can veto motion, while
+// unknown/no-return cells never establish known-clear space.
+const uint8_t FRONT_MATRIX_TOF_I2C_ADDRESS = 0x33;
+const uint16_t FRONT_MATRIX_TOF_VALID_MIN_MM = 20;
+const uint16_t FRONT_MATRIX_TOF_VALID_MAX_MM = 3999;
+const uint16_t FRONT_MATRIX_TOF_STOP_DISTANCE_MM = 180;
+const uint16_t FRONT_MATRIX_TOF_CLEAR_DISTANCE_MM = 230;
+const uint8_t FRONT_MATRIX_TOF_CLEAR_CONFIRM_FRAMES = 3;
+const unsigned long FRONT_MATRIX_TOF_FRAME_INTERVAL_MS = 100;
+const unsigned long FRONT_MATRIX_TOF_STALE_TIMEOUT_MS = 250;
+const unsigned long FRONT_MATRIX_TOF_RESPONSE_TIMEOUT_MS = 200;
+const unsigned long FRONT_MATRIX_TOF_MODE_TIMEOUT_MS = 1000;
+const unsigned long FRONT_MATRIX_TOF_MODE_SETTLE_MS = 5000;
+const unsigned long FRONT_MATRIX_TOF_RECONNECT_INTERVAL_MS = 1000;
+constexpr uint64_t FRONT_MATRIX_ALL_CELLS_MASK = UINT64_MAX;
+// Each column contributes one selected, height-filtered ray to the planner.
+// The independent safety and perception consumers continue to inspect all
+// 64 cells rather than reducing the frame to these eight map observations.
+constexpr uint8_t FRONT_MATRIX_MAP_COLUMN_MASK = 0xFF;
+constexpr FrontMatrixConfig FRONT_MATRIX_CONFIG = {
+  "front_matrix", {67.140f, 0.0f, 96.0f, 0.0f, 0.0f, 0.0f},
+  SENSOR_I2C_SECONDARY, FRONT_MATRIX_TOF_I2C_ADDRESS,
+  8, 8, 60.0f, 60.0f, 0, false, false,
+  FRONT_MATRIX_ALL_CELLS_MASK, FRONT_MATRIX_ALL_CELLS_MASK
+};
+static_assert(FRONT_MATRIX_CONFIG.rows == 8 &&
+                FRONT_MATRIX_CONFIG.columns == 8,
+              "Front matrix must publish an 8x8 frame");
+static_assert(FRONT_MATRIX_CONFIG.gridRotationQuarterTurns < 4,
+              "Front matrix grid rotation must be 0/90/180/270 degrees");
+static_assert(FRONT_MATRIX_CONFIG.bus == SENSOR_I2C_SECONDARY,
+              "Front matrix must remain on Wire1/secondary bus");
+static_assert(FRONT_MATRIX_CONFIG.safetyCellMask == UINT64_MAX &&
+                FRONT_MATRIX_CONFIG.perceptionCellMask == UINT64_MAX,
+              "Initial front matrix safety/perception masks cover all cells");
+static_assert(FRONT_MATRIX_MAP_COLUMN_MASK != 0,
+              "At least one front matrix column must seed obstacle endpoints");
+static_assert(sensorGeometryFinite(FRONT_MATRIX_CONFIG.mount.xMm) &&
+                sensorGeometryFinite(FRONT_MATRIX_CONFIG.mount.yMm) &&
+                sensorGeometryFinite(FRONT_MATRIX_CONFIG.mount.zMm),
+              "Front matrix geometry must be finite");
+
+// Matrix perception/hunt starting values. Geometry-derived values are narrow
+// enough to reject broad walls and ramps in deterministic fixtures; physical
+// characterization must tune them before motion acceptance.
+const float MATRIX_WEIGHT_MIN_WIDTH_MM = 25.0f;
+const float MATRIX_WEIGHT_MAX_WIDTH_MM = 85.0f;
+const float MATRIX_WEIGHT_MIN_HEIGHT_MM = 35.0f;
+const float MATRIX_WEIGHT_MAX_HEIGHT_MM = 95.0f;
+const float MATRIX_WEIGHT_MIN_DEPTH_STEP_MM = 80.0f;
+// A returned zone is a cone, not a pencil ray. Adjacent supporting cells
+// overlap; this provisional factor avoids counting both complete cones as
+// independent target width until stationary calibration supplies a fit.
+const float MATRIX_CELL_EFFECTIVE_WIDTH_FRACTION = 0.67f;
+const float MATRIX_MAX_STATIC_TARGET_SPEED_MPS = 0.08f;
+const float MATRIX_TRACK_POSITION_NOISE_MM = 50.0f;
+const float MATRIX_TRACK_ASSOCIATION_DISTANCE_MM = 180.0f;
+const unsigned long MATRIX_TRACK_STALE_TIMEOUT_MS = 500;
+const uint8_t MATRIX_STATIC_CONFIRM_FRAMES = 3;
+const uint8_t MATRIX_MOVING_CONFIRM_FRAMES = 2;
+const uint8_t MATRIX_TARGET_LOSS_CONFIRM_FRAMES = 2;
+const float WEIGHT_HUNT_CENTER_DEADBAND_COLUMNS = 1.25f;
+const float WEIGHT_HUNT_STEERING_GAIN_TPS_PER_COLUMN = 500.0f;
+const float WEIGHT_HUNT_MAX_SPEED_TPS = 2600.0f;
+const float WEIGHT_HUNT_MAX_TURN_TPS = 1000.0f;
+constexpr float MATRIX_PICKUP_HANDOFF_GAP_MM = 30.0f;
+const float MATRIX_FINAL_APPROACH_ARM_GAP_MM = 80.0f;
+const float MATRIX_FINAL_APPROACH_MAX_PREDICTION_MM = 100.0f;
+const unsigned long MATRIX_FINAL_APPROACH_MAX_PREDICTION_MS = 600;
+const float MATRIX_HANDOFF_MAX_ERROR_COLUMNS = 1.5f;
+const float PICKUP_MIN_FORWARD_FEED_DISTANCE_MM = 150.0f;
+const unsigned long PICKUP_FEED_TIMEOUT_MS = 2500;
+const float PICKUP_FEED_MAX_TURN_TPS = 600.0f;
+const float WEIGHT_INTERRUPT_MAX_CROSSTRACK_M = 0.85f;
+const float WEIGHT_INTERRUPT_MAX_ADDED_DISTANCE_M = 1.70f;
+static_assert(MATRIX_PICKUP_HANDOFF_GAP_MM > 0.0f,
+              "Matrix handoff gap must be positive");
 
 // Robot-centred geometry in millimetres. The origin is the midpoint between
 // the drive wheels: +X forward, +Y left. Keep future physical measurements in
 // this one block so clearance logic stays relative to the chassis.
-const RobotFootprintGeometry ROBOT_FOOTPRINT_GEOMETRY = {
-  123.0,  // front extent
-  138.0,  // rear extent
-  90.5,   // left extent
-  90.5    // right extent
+constexpr RobotFootprintGeometry ROBOT_FOOTPRINT_GEOMETRY = {
+  122.850f,  // front extent
+  122.850f,  // rear extent
+  114.000f,  // left extent
+  114.000f   // right extent
 };
 
-const FanSensorGeometry FAN_SENSOR_GEOMETRY[4] = {
-  {95.0,  -67.0, -60.0},  // right outer
-  {115.0, -30.0, -20.0},  // right inner
-  {115.0,  30.0,  20.0},  // left inner
-  {95.0,   67.0,  60.0}   // left outer
+constexpr FrontFanSensorConfig FRONT_FAN_CONFIG[4] = {
+  {"right_outer", {66.453f, -103.571f, 180.0f, -60.0f, 0.0f, 0.0f},
+   RIGHT_OUTER_XSHUT, RIGHT_OUTER_ADDRESS},
+  {"right_inner", {109.298f, -29.063f, 180.0f, -20.0f, 0.0f, 0.0f},
+   RIGHT_INNER_XSHUT, RIGHT_INNER_ADDRESS},
+  {"left_inner", {109.298f, 29.063f, 180.0f, 20.0f, 0.0f, 0.0f},
+   LEFT_INNER_XSHUT, LEFT_INNER_ADDRESS},
+  {"left_outer", {66.453f, 103.571f, 180.0f, 60.0f, 0.0f, 0.0f},
+   LEFT_OUTER_XSHUT, LEFT_OUTER_ADDRESS}
+};
+static_assert(FRONT_FAN_CONFIG[0].mount.xMm ==
+                FRONT_FAN_CONFIG[3].mount.xMm &&
+              FRONT_FAN_CONFIG[0].mount.yMm ==
+                -FRONT_FAN_CONFIG[3].mount.yMm &&
+              FRONT_FAN_CONFIG[1].mount.xMm ==
+                FRONT_FAN_CONFIG[2].mount.xMm &&
+              FRONT_FAN_CONFIG[1].mount.yMm ==
+                -FRONT_FAN_CONFIG[2].mount.yMm,
+              "Front fan mounts must remain mirrored");
+static_assert(FRONT_FAN_CONFIG[0].xshutChannel !=
+                FRONT_FAN_CONFIG[1].xshutChannel &&
+              FRONT_FAN_CONFIG[1].xshutChannel !=
+                FRONT_FAN_CONFIG[2].xshutChannel &&
+              FRONT_FAN_CONFIG[2].xshutChannel !=
+                FRONT_FAN_CONFIG[3].xshutChannel,
+              "Front fan XSHUT channels must remain unique");
+
+constexpr FanSensorGeometry FAN_SENSOR_GEOMETRY[4] = {
+  {FRONT_FAN_CONFIG[0].mount.xMm, FRONT_FAN_CONFIG[0].mount.yMm,
+   FRONT_FAN_CONFIG[0].mount.yawDeg},
+  {FRONT_FAN_CONFIG[1].mount.xMm, FRONT_FAN_CONFIG[1].mount.yMm,
+   FRONT_FAN_CONFIG[1].mount.yawDeg},
+  {FRONT_FAN_CONFIG[2].mount.xMm, FRONT_FAN_CONFIG[2].mount.yMm,
+   FRONT_FAN_CONFIG[2].mount.yawDeg},
+  {FRONT_FAN_CONFIG[3].mount.xMm, FRONT_FAN_CONFIG[3].mount.yMm,
+   FRONT_FAN_CONFIG[3].mount.yawDeg}
 };
 
-const FanSensorGeometry REAR_MATRIX_TOF_GEOMETRY = {
-  -ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm,
-  0.0,
-  180.0
-};
+static_assert(ROBOT_FOOTPRINT_GEOMETRY.frontExtentMm == 122.850f &&
+                ROBOT_FOOTPRINT_GEOMETRY.rearExtentMm == 122.850f &&
+                ROBOT_FOOTPRINT_GEOMETRY.leftExtentMm == 114.000f &&
+                ROBOT_FOOTPRINT_GEOMETRY.rightExtentMm == 114.000f,
+              "Declared chassis footprint must remain 228.0 x 245.7 mm");
 
 // =====================================================
 // Obstacle avoidance
@@ -283,7 +423,11 @@ const int DEFAULT_WEIGHT_SCAN_TURN_OFFSET_US = 280;
 // =====================================================
 // Waypoints
 // =====================================================
-const float WAYPOINT_TOLERANCE_M = 0.06;
+// Leave a small discrete-control allowance around the 60 mm arrival circle.
+// Without it a minimum-drivable-speed arc can miss the sampled boundary by a
+// few millimetres, overshoot, and perform a full turn-back despite having
+// already passed safely through the intended waypoint region.
+const float WAYPOINT_TOLERANCE_M = 0.065;
 const float WAYPOINT_LOOKAHEAD_M = 0.35;
 const unsigned long WAYPOINT_ACTION_PAUSE_MS = 250;
 
@@ -387,11 +531,21 @@ const float PLANNER_COLLISION_CLEARANCE_M = 0.020;
 const float PLANNER_MODEL_UNCERTAINTY_M = 0.010;
 const float PLANNER_TOTAL_HARD_CLEARANCE_M =
   PLANNER_COLLISION_CLEARANCE_M + PLANNER_MODEL_UNCERTAINTY_M;
+// If both outer fan endpoints are close to the body while both inner rays see
+// a long clear centre, the returns contradict a safely open forward corridor:
+// an edge can occupy the blind wedge between rays. Treat only that paired
+// signature as a pinch instead of inflating every endpoint clearance.
+const float PLANNER_FAN_PINCH_OUTER_CLEARANCE_M = 0.080f;
+const float PLANNER_FAN_PINCH_INNER_OPEN_RANGE_M = 0.600f;
 const float PLANNER_PREFERRED_CLEARANCE_M = 0.050;
 const float PLANNER_MIN_PROGRESS_M = 0.03;
 const float PLANNER_FRONT_SPEED_BUFFER_M = 0.06;
 const float PLANNER_MAX_DECELERATION_MPS2 = 0.60;
 const float PLANNER_SENSING_LATENCY_S = 0.12;
+// A transient invalid frame remains fail-closed and may recover. A required
+// front aggregate that stays invalid beyond this bound terminates the active
+// point goal neutral instead of leaving navigation running forever.
+const unsigned long PLANNER_FRONT_INVALID_ABORT_MS = 2500;
 const float PLANNER_TURN_TARGET_SPEED = 1050.0;
 // This marker selects the original, physically calibrated slow-turn pulse
 // pair inside the single motor-output path.
@@ -429,17 +583,6 @@ const float PLANNER_LINE_FOLLOW_FINISH_HEADING_DEG = 10.0;
 // the robot has overshot and later re-aligned. Finish only in this bounded
 // along-track window around the target plane.
 const float PLANNER_LINE_FOLLOW_FINISH_OVERSHOOT_M = 0.20;
-// Object pickup is not a precision waypoint. TEST HUNT should still drive
-// through almost all of the 150 mm carry distance, then finish without doing a
-// tidy point-goal heading cleanup.
-const float PLANNER_HUNT_FINISH_TARGET_TOLERANCE_M = 0.025;
-const float PLANNER_HUNT_FINISH_LATERAL_M = 0.22;
-const float PLANNER_HUNT_FINISH_OVERSHOOT_M = 0.35;
-// Once the robot reaches the estimated weight point, add a small hunt-only
-// forward carry-through region. The curve planner's single forward ceiling
-// and its computed safe speed still govern motion through this region.
-const float PLANNER_HUNT_PICKUP_CARRY_ZONE_M =
-  OBJECT_PICKUP_OVERSHOOT_MM / 1000.0;
 // If a gap traverse crosses the target plane while still a little too angled
 // for the strict finish gate, stop in this short post-window instead of
 // chasing the clamped lookahead point indefinitely. Beyond this window, abort
@@ -465,6 +608,26 @@ const unsigned long PLANNER_NO_PATH_ABORT_MS = 1200;
 const float PLANNER_OBSTACLE_TURN_ROOM_M = 0.12;
 const float PLANNER_OBSTACLE_COUNTERSTEER_LEAD_M = 0.10;
 const float PLANNER_OBSTACLE_RECONSIDERED_COUNTERSTEER_LEAD_M = 0.20;
+const float PLANNER_OBSTACLE_SIDE_COST_TIE_M = LOCAL_MAP_CELL_M * 0.25f;
+// Outer-fan ranges are directly comparable as opposite route-side evidence
+// only close to route alignment, or once the chassis is clearly anti-aligned
+// and each ray has been transformed into the route frame.
+const float PLANNER_SIDE_RANGE_COMPARABLE_HEADING_DEG = 10.0f;
+const float PLANNER_SIDE_RANGE_ANTI_ALIGNED_DEG = 120.0f;
+// Reconsider a latched side only after the chassis is at least facing the
+// route half-plane; earlier sparse-map growth is orientation-biased.
+const float PLANNER_SIDE_RECONSIDER_HEADING_DEG = 90.0f;
+const float PLANNER_OBSTACLE_STAGE_TRANSITION_TOLERANCE_M = LOCAL_MAP_CELL_M;
+// If the normal outward stage has no geometric path, one noisy occupied-cell
+// shift must not trap the robot just short of the along-wall stage. This only
+// changes the local target; the complete swept-footprint proof remains intact.
+const float PLANNER_OBSTACLE_STAGE_NO_PATH_TOLERANCE_M =
+  LOCAL_MAP_CELL_M * 1.5f;
+const float PLANNER_OBSTACLE_ALIGN_FALLBACK_DEG =
+  PLANNER_POINT_ALIGN_START_DEG * 0.5f;
+const float PLANNER_BROAD_OBSTACLE_WIDTH_MULTIPLIER = 2.0f;
+const float PLANNER_BROAD_OBSTACLE_EXTRA_CLEARANCE_M =
+  PLANNER_COLLISION_CLEARANCE_M * 0.5f;
 // The normal local-goal turn policy remains the first planner pass. Only when
 // it finds no trajectory may a gentle opposite-sign rollout qualify by making
 // a measured fraction of the remaining outward clearance.

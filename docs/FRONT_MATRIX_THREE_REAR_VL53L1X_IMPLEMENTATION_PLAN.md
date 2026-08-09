@@ -1,7 +1,8 @@
 # Front Matrix and Three-Rear-VL53L1X Implementation Plan
 
-Status: proposed implementation plan; no firmware changes or physical validation
-have been completed.
+Status: proposed sensor-migration and hunt plan. The simulator already contains
+partial upper-sensor height-filtering work, but this sensor migration and hunt
+firmware have not been implemented or physically validated.
 
 ## 1. Outcome
 
@@ -20,12 +21,21 @@ embedding mount measurements or angles.
 Weight hunting uses the matrix to classify and steer toward the closest
 confirmed static weight at the normal full forward ceiling. Once the weight is
 within a configurable physical gap of the matrix, initially `30 mm`, visual
-steering ends and chassis control blends directly into the next route goal
-without stopping. The pickup mechanism continues feeding the weight in the
-background while the robot maintains forward progress. Because this version
-has no internal ToF, the event is an assumed funnel handoff, not proof that the
-weight is secured or permission to increment a payload count. Material and
-inductive classification are intentionally not part of this implementation.
+steering ends and chassis control blends directly into the saved route
+continuation without stopping. The pickup mechanism continues feeding the
+weight in the background while the robot maintains forward progress. Because
+this version has no internal ToF, the event is an assumed funnel handoff, not
+proof that the weight is secured or permission to increment a payload count.
+Material and inductive classification are intentionally not part of this
+implementation.
+
+In this document, **matrix-proximity handoff** means only the control transition
+from visual hunting to route-plus-feed motion. **Saved route continuation**
+means the same pending waypoint when a route leg was interrupted, or the
+following waypoint when the robot had already completed a search waypoint.
+Neither term implies that collection succeeded. The active implementation also
+does not include an internal/chamber ToF, inductive classification, payload
+counting, or the later pickup/rejection subsystem.
 
 Add a separate `MatrixWeightFollowTest` program for perception/controller
 development. It slowly scans in place until it confirms a weight, latches that
@@ -321,11 +331,12 @@ Create two consumers of the immutable front-matrix frame:
 
 The matrix has a dual role. Normal valid returns remain obstacle evidence. An
 active, confirmed weight may be designated as the one collectible target
-inside the configured funnel corridor; this is not a general rule
-that lower returns are clear. Side obstacles, unselected clusters, upper/tall
-evidence, and the wall behind a weight remain in the collision model. The
-capture trajectory may approach a head-on wall closely enough to collect a
-weight placed against it, but it must still stop before the physical robot or
+inside the configured funnel corridor; this is not a general rule that lower
+returns are clear. Side obstacles, unselected clusters, upper/tall evidence,
+and the wall behind a weight remain in the collision model. A weight against a
+wall may be hunted only when the capture approach and required post-handoff
+feed corridor remain geometrically feasible, for example through a measured
+oblique or tangential approach. The robot must still stop before its body or
 funnel violates the configured wall-contact envelope. Do not override a
 rejected footprint merely because a hunt is active.
 
@@ -545,19 +556,27 @@ project the locked surface through the `30 mm` handoff plane.
 At the handoff:
 
 - stop matrix steering and publish `WEIGHT_FUNNEL_HANDOFF_ASSUMED`;
-- atomically blend chassis control into the saved route goal without a neutral
-  command, navigation cancellation, encoder/PID reset, or route pause;
+- atomically blend chassis control into the saved route continuation without a
+  neutral command, navigation cancellation, encoder/PID reset, or route pause;
 - maintain positive forward progress and bounded curvature for at least
   `PICKUP_MIN_FORWARD_FEED_DISTANCE_MM`, initially the existing `150 mm` final
   push distance, while ordinary route navigation continues; and
-- run the future pickup/rejection mechanism state concurrently with chassis
-  navigation.
+- allow the pickup mechanism to keep operating without taking chassis control;
+  publish the handoff/feed state for the future pickup/rejection subsystem to
+  consume when that separate subsystem is implemented.
 
 The `150 mm` feed distance is a minimum forward-feed contract, not a maximum
-post-loss carry, payload confirmation, or reason to stop. If live obstacle
-evidence temporarily vetoes forward motion, stop as required but keep the
-pickup state `FEEDING_UNCONFIRMED`; resume its remaining feed distance when
-forward motion becomes available. A bounded timeout may report
+post-loss carry, payload confirmation, or reason to stop. During that distance,
+route navigation is active but its requested motion is constrained to positive
+forward progress and the configured feed-curvature bound. If the saved route
+would immediately require reverse, an in-place pivot, or a sharper turn, retain
+that route goal and first follow a short capture-aligned feed corridor; then
+release unrestricted route steering after the feed contract is complete. This
+temporary corridor is not a waypoint and must not advance the route index.
+
+If live obstacle evidence temporarily vetoes forward motion, stop as required
+but keep the pickup state `FEEDING_UNCONFIRMED`; resume its remaining feed
+distance when forward motion becomes available. A bounded timeout may report
 `PICKUP_FEED_INTERRUPTED` or `PICKUP_STATE_UNKNOWN`, but must not fabricate a
 secured payload.
 
@@ -592,9 +611,10 @@ Required failure behavior:
 - target dynamic: abandon it as a distraction;
 - ramp/wall evidence without a compact target: do not hunt;
 - side obstacle or unsafe swept footprint: safety veto and neutral failure;
-- head-on wall reached before the `30 mm` matrix-gap handoff or before enough
-  bounded forward feed is available: neutral inaccessible-target result rather
-  than a collision bypass;
+- no collision-free capture approach and post-handoff feed corridor exists,
+  including a head-on wall reached before the `30 mm` handoff or before the
+  required feed: neutral inaccessible-target result rather than a collision
+  bypass;
 - matrix loss after the `30 mm` handoff: expected; continue the configured
   positive-forward feed while route navigation runs; and
 - feed interrupted beyond its distance/time bound: keep payload state unknown
@@ -633,7 +653,8 @@ When a fresh, confirmed static weight is seen during an ordinary route leg:
    full-speed visual hunt used at a search waypoint;
 4. at `WEIGHT_FUNNEL_HANDOFF_ASSUMED`, atomically blend into the same pending
    route waypoint while the pickup mechanism continues feeding in parallel;
-   and
+   constrain route motion to the capture-aligned feed contract before allowing
+   reverse, a pivot, or sharper route curvature; and
 5. preserve the route index. An en-route assumed handoff does not advance the
    pending waypoint or increment a payload count.
 
@@ -854,7 +875,7 @@ a full-height rectangular wall.
 Add:
 
 - one raycast per rear VL53L1X optical axis, with configurable full FoV only
-  for visualization/target interception—not as invented free cone evidence;
+  for visualization/target interception, not as invented free-cone evidence;
 - front matrix columns/cells at the configured matrix pose;
 - independent rear-left, rear-centre, rear-right, and matrix fault injection;
 - stale, dropout, invalid-status, repeated-frame, and sample-skew cases; and
@@ -1039,7 +1060,7 @@ moving distractions are rejected, and the direct/predicted gap transition is
 characterized against measured physical gaps without claiming payload
 confirmation.
 
-### Phase I - Physical characterization
+### Phase I - Motion and pickup characterization
 
 This phase separately requires explicit permission, confirmed safe setup,
 `END_MATCH`, disarmed state, neutral `1500/1500` outputs, valid required
@@ -1089,7 +1110,7 @@ Add or update contracts covering:
 - compact weight, weight-against-wall, broad side-wall, and ramp evidence;
 - world-frame static/moving target tracking and closest-target latching;
 - en-route interruption, route-segment detour accounting, pre-handoff route
-  resumption, and same-waypoint continuation after successful handoff;
+  resumption, and same-waypoint continuation after an assumed handoff;
 - weighted centre coordinate `3.5`, deadband, and reachable-wheel turn bounds;
 - spin-and-follow diagnostic scan/acquire/latch/follow/reacquire transitions;
 - no range-based hunt slowdown below the normal planner safety ceiling;
@@ -1098,6 +1119,8 @@ Add or update contracts covering:
 - no neutral command, route pause, PID reset, or payload-confirmed result at the
   matrix proximity handoff;
 - route-blended positive-forward feed distance and interrupted-feed state;
+- capture-aligned feed-corridor constraint when the saved route initially asks
+  for reverse, a pivot, or excessive curvature;
 - unexpected matrix disappearance cannot trigger handoff, while expected
   close-range disappearance can only use bounded armed prediction;
 - presence and required sections of
@@ -1132,7 +1155,8 @@ Add or update contracts covering:
    maximum prediction time, and odometry uncertainty.
 10. Measure the maximum acceptable centre error and minimum uninterrupted
     forward-feed distance, initially `150 mm`, then characterize whether the
-    funnel retains the weight during route-blended curvature.
+    funnel retains the weight during route-blended curvature and whether a
+    weight against a wall has a collision-free approach/feed corridor.
 11. Calibrate weight width/height, lower-to-upper depth separation, ramp-plane,
     static-motion, centre-deadband, prediction, forward-feed, and hunt timeout
     thresholds from saved raw frames and pickup runs.

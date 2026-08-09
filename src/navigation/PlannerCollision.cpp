@@ -423,5 +423,11 @@ bool isTurnSweepSafe() {
       return false;
     }
   }
+  // The matrix is supplemental: an unavailable frame cannot establish clear
+  // space, but a current close obstacle cell is an additional pivot veto.
+  if (isRangeSensorCurrent(RANGE_FRONT_MATRIX_AGGREGATE) &&
+      isRangeSensorBlocked(RANGE_FRONT_MATRIX_AGGREGATE)) {
+    return false;
+  }
   return true;
 }

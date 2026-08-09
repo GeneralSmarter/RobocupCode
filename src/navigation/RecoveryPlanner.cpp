@@ -37,19 +37,20 @@ static bool emergencyRecoveryReasonEligible(PlannerStopReason reason) {
          reason == PLANNER_STOP_NO_SAFE_TRAJECTORY;
 }
 
-static bool emergencySensorFramesCurrent() {
+static bool emergencyScanFramesCurrent() {
   for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; ++i) {
     if (!isRangeSensorCurrent((RangeSensorId)i)) {
       return false;
     }
   }
-  return hasTrustedRearCoverage() &&
-         isRangeSensorCurrent(RANGE_FAKE_REAR);
+  return true;
 }
 
 static bool emergencyRecoverySensorsHealthy() {
-  return emergencySensorFramesCurrent() &&
-         !isRangeSensorBlocked(RANGE_FAKE_REAR);
+  return emergencyScanFramesCurrent() &&
+         hasTrustedRearCoverage() &&
+         isRangeSensorCurrent(RANGE_REAR_AGGREGATE) &&
+         !isRangeSensorBlocked(RANGE_REAR_AGGREGATE);
 }
 
 static bool tryBeginEmergencyRecovery(PlannerStopReason reason,
@@ -214,12 +215,12 @@ static float forwardContinuationQuality(
 
 static float calculateReverseRecoverySpeedCapTicksPerSec() {
   if (!hasTrustedRearCoverage() ||
-      !isRangeSensorCurrent(RANGE_FAKE_REAR) ||
-      isRangeSensorBlocked(RANGE_FAKE_REAR)) {
+      !isRangeSensorCurrent(RANGE_REAR_AGGREGATE) ||
+      isRangeSensorBlocked(RANGE_REAR_AGGREGATE)) {
     return 0.0f;
   }
 
-  float availableM = getRangeSensorDistance(RANGE_FAKE_REAR) / 1000.0f -
+  float availableM = getRangeSensorDistance(RANGE_REAR_AGGREGATE) / 1000.0f -
                      PLANNER_TOTAL_HARD_CLEARANCE_M -
                      PLANNER_REVERSE_RECOVERY_REAR_BUFFER_M;
   availableM = max(0.0f, availableM);
@@ -341,10 +342,10 @@ static void captureReversePlannerEpochView(ReversePlannerEpoch &epoch) {
   epoch.startY = robotY;
   epoch.startHeadingRad = plannerNavigationHeadingRad();
   epoch.rearValid = hasTrustedRearCoverage() &&
-                    isRangeSensorCurrent(RANGE_FAKE_REAR);
-  epoch.rearBlocked = isRangeSensorBlocked(RANGE_FAKE_REAR);
+                    isRangeSensorCurrent(RANGE_REAR_AGGREGATE);
+  epoch.rearBlocked = isRangeSensorBlocked(RANGE_REAR_AGGREGATE);
   epoch.observedRearM = epoch.rearValid
-    ? getRangeSensorDistance(RANGE_FAKE_REAR) / 1000.0f : 0.0f;
+    ? getRangeSensorDistance(RANGE_REAR_AGGREGATE) / 1000.0f : 0.0f;
   epoch.allowedUnknownFraction = currentReverseUnknownAllowance();
   plannerMapCaptureCollisionSnapshot(epoch.collision);
 }
@@ -702,7 +703,7 @@ static void recordEmergencySensorBaselines() {
 }
 
 static bool emergencySensorsAdvancedSinceBaseline() {
-  if (!emergencySensorFramesCurrent()) {
+  if (!emergencyScanFramesCurrent()) {
     return false;
   }
   for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; ++i) {
@@ -712,9 +713,7 @@ static bool emergencySensorsAdvancedSinceBaseline() {
       return false;
     }
   }
-  uint32_t rearSequence = getRearObstacleFrameSequence();
-  return rearSequence != 0 &&
-         rearSequence != plannerContext.emergencyRecoveryState.rearFrameBaseline;
+  return true;
 }
 
 static void abortEmergencyRecovery(const char* detail) {
@@ -864,12 +863,8 @@ void updateEmergencyRecovery() {
   }
 
   if (state.phase == EMERGENCY_RECOVERY_SCAN_TURN) {
-    if (!emergencySensorFramesCurrent()) {
+    if (!emergencyScanFramesCurrent()) {
       abortEmergencyRecovery("emergency_scan_sensor_unhealthy");
-      return;
-    }
-    if (isRangeSensorBlocked(RANGE_FAKE_REAR)) {
-      enterEmergencyScanUnwind("scan_rear_became_blocked");
       return;
     }
     float headingDeg = navigationHeadingDeg();
@@ -928,7 +923,7 @@ void updateEmergencyRecovery() {
   }
 
   if (state.phase == EMERGENCY_RECOVERY_SCAN_UNWIND) {
-    if (!emergencySensorFramesCurrent()) {
+    if (!emergencyScanFramesCurrent()) {
       abortEmergencyRecovery("emergency_unwind_sensor_unhealthy");
       return;
     }
@@ -1096,8 +1091,8 @@ bool canStartSafeReverse() {
   return navigationGoal.mode == NAV_GOAL_POINT &&
          escapeBacktrackEnabled &&
          hasTrustedRearCoverage() &&
-         isRangeSensorCurrent(RANGE_FAKE_REAR) &&
-         !isRangeSensorBlocked(RANGE_FAKE_REAR);
+         isRangeSensorCurrent(RANGE_REAR_AGGREGATE) &&
+         !isRangeSensorBlocked(RANGE_REAR_AGGREGATE);
 }
 
 bool canStartEvidenceDrivenReverse() {

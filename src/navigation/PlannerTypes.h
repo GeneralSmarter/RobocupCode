@@ -89,6 +89,7 @@ struct ObstacleContext {
   float routeUy;
   float routeLengthM;
   float approachNearAlongM;
+  bool approachNearLatched;
   float nearAlongM;
   float farAlongM;
   float minLateralM;
@@ -96,6 +97,7 @@ struct ObstacleContext {
   float sideSign;
   float sideEscapeAlongM;
   bool sideReconsidered;
+  bool alongStageCommitted;
   bool progressGoalValid;
   float progressGoalX;
   float progressGoalY;

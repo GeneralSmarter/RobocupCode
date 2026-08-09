@@ -159,9 +159,8 @@ void printCalibrationSummary() {
   Serial.println("  3 left_outer  +60 deg VL53L0X XSHUT3 addr 0x33");
   Serial.println("  front safety is virtual: nearest valid +/-20 deg inner beam");
   Serial.println("  outer fan beams are clearance sensors, not side-wall followers");
-  Serial.print("Object VL53L1X subsystem enabled: ");
-  Serial.println(OBJECT_TOF_ENABLED ? "yes" : "no");
-  Serial.println("  planned object ToFs: left/right LOW+UPPER on XSHUT4-7, addr 0x34-0x37");
+  Serial.println("Rear VL53L1X array: left/centre/right on XSHUT7/5/6, addr 0x34-0x36");
+  Serial.println("Front SEN0628 matrix: Wire1 addr 0x33, supplemental collision veto");
   Serial.println("Use Bluetooth command CSV ON for maximum-rate machine-readable telemetry.");
 }
 

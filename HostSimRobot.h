@@ -49,6 +49,7 @@ public:
 
 extern HostSimSerial hostSimSerial;
 #define Serial hostSimSerial
+#define Serial2 hostSimSerial
 
 extern float robotX;
 extern float robotY;
@@ -70,8 +71,8 @@ extern RobotState currentState;
 extern MotionAuthority motionAuthority;
 extern MotionAuthority motionCommandAuthority;
 extern RangeSensorState rangeSensors[RANGE_SENSOR_COUNT];
-extern ObjectCandidateState objectCandidate;
-extern ObjectTargetEstimate objectTargetEstimate;
+extern FrontMatrixFrame frontMatrixFrame;
+extern MatrixTargetObservation matrixTargetObservation;
 extern unsigned long lastSensorUpdateMs;
 extern unsigned long lastOdometryUpdateMs;
 extern unsigned long lastMotorControlUpdateMs;
@@ -104,8 +105,13 @@ bool isRangeSensorCurrent(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 bool hasTrustedRearCoverage();
 uint16_t getRangeSensorDistance(RangeSensorId id);
-bool getRearObstacleRay(uint8_t column, uint16_t &distanceMm,
-                        float &robotAngleDeg);
+bool getRearTofRay(RearTofId id, RangeRayObservation &observation);
+bool getFrontMatrixRay(uint8_t column, RangeRayObservation &observation);
+bool getFrontMatrixFrame(FrontMatrixFrame &frame);
+bool getMatrixTargetObservation(MatrixTargetObservation &observation);
+void setMatrixPickupTrackId(uint32_t trackId);
+bool matrixCellBelongsToActivePickup(uint8_t cellIndex);
+void updateMatrixWeightDetection();
 uint32_t getRearObstacleFrameSequence();
 bool isTofCloseReadingRevalidating();
 float getFanSweepClearanceMm(RangeSensorId id);

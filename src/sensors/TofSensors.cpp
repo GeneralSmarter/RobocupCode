@@ -6,12 +6,11 @@
 // Responsibility:
 //   Owns the high forward VL53L0X navigation fan, derived legacy aggregate
 //   readings, front-block debounce, and stale/timeout handling. The physical
-//   rear matrix sensor is owned by RearObstacleSensor.cpp.
+//   rear VL53L1X array and front matrix are owned by their focused modules.
 // Interacts with:
 //   RobotCode.ino calls connectTOFSensors() during setup. Navigation modules and
 //   MotorControl.cpp read rangeSensors through the accessor functions.
-//   Bluetooth.cpp prints raw fan/aggregate telemetry. ObjectDetection.cpp owns
-//   the separate VL53L1X object sensors.
+//   Bluetooth.cpp prints raw fan/aggregate telemetry.
 // Control flow:
 //   updateRobotController() calls updateTOFSensors() on a 20 ms schedule.
 //   Sensor reads are polled for readiness before using the library read call
@@ -139,8 +138,8 @@ static void syncLegacyTofGlobals() {
 
 static void setRangeSensorReading(RangeSensorId id, uint16_t distanceMm, bool valid) {
   // Inputs:
-  //   distanceMm is a raw millimetre range from a ToF channel or synthetic
-  //   fake rear source. valid means it falls inside that sensor's calibrated
+  //   distanceMm is a raw millimetre range from a fan ToF channel. valid means
+  //   it falls inside that sensor's calibrated
   //   usable range, not necessarily that the path is safe.
   //
   // Global effects:
@@ -294,7 +293,7 @@ void connectTOFSensors() {
     io.pinMode(fanXshutPins[i], OUTPUT);
     io.digitalWrite(fanXshutPins[i], LOW);
   }
-  prepareObjectTOFPinsForStartup();
+  prepareRearTofPinsForStartup();
 
   delay(100);
 
@@ -302,8 +301,8 @@ void connectTOFSensors() {
   connectRightInnerTOF();
   connectLeftInnerTOF();
   connectLeftOuterTOF();
-  connectObjectTOFSensors();
-  connectRearObstacleSensor();
+  connectRearTofArray();
+  connectFrontMatrixSensor();
 }
 
 void connectRightOuterTOF() {
@@ -395,10 +394,8 @@ static void updateL0XFanSensor(RangeSensorId id, VL53L0X &sensor) {
 }
 
 void updateTOFSensors() {
-  // Full range update used by the controller. Object ToFs are updated here as
-  // well so object candidates are based on the same main-loop schedule.
+  // Full range update used by the controller.
   updateFanTOFSensors();
-  updateObjectTOFSensors();
   updateTofStaleFlags();
 }
 
@@ -411,7 +408,8 @@ void updateFanTOFSensors() {
   updateL0XFanSensor(RANGE_RIGHT_INNER, rightInnerTOF);
   updateL0XFanSensor(RANGE_LEFT_INNER, leftInnerTOF);
   updateL0XFanSensor(RANGE_LEFT_OUTER, leftOuterTOF);
-  updateRearObstacleSensor();
+  updateRearTofArray();
+  updateFrontMatrixSensor();
   updateFrontBlockState();
 }
 
@@ -427,8 +425,13 @@ bool isRangeSensorCurrent(RangeSensorId id) {
   // "Current" means valid, not stale, and younger than the stale timeout.
   // MotorControl.cpp uses this stricter check before allowing motion.
   const RangeSensorState &sensor = rangeSensors[id];
+  const unsigned long staleLimit = id == RANGE_REAR_AGGREGATE
+    ? REAR_TOF_STALE_TIMEOUT_MS
+    : id == RANGE_FRONT_MATRIX_AGGREGATE
+      ? FRONT_MATRIX_TOF_STALE_TIMEOUT_MS
+      : TOF_STALE_TIMEOUT_MS;
   return sensor.valid && !sensor.stale &&
-         millis() - sensor.lastReadMs <= TOF_STALE_TIMEOUT_MS;
+         millis() - sensor.lastReadMs <= staleLimit;
 }
 
 bool isTofCloseReadingRevalidating() {
@@ -512,6 +515,8 @@ bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
   // the safety supervisor before the planner has time to roll out a new arc.
   sensorId = RANGE_SENSOR_COUNT;
   clearanceMm = 1000000.0;
+  float rightOuterClearanceMm = 1000000.0f;
+  float leftOuterClearanceMm = 1000000.0f;
 
   for (int i = RANGE_RIGHT_OUTER; i <= RANGE_LEFT_OUTER; i++) {
     RangeSensorId id = (RangeSensorId)i;
@@ -531,14 +536,23 @@ bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm) {
     // evaluated separately by isTurnSweepSafe(); using the turn envelope here
     // would falsely reject a straight, pre-aligned 400 mm corridor.
     const float clearance = getFanFootprintClearanceMm(id);
+    if (id == RANGE_RIGHT_OUTER) rightOuterClearanceMm = clearance;
+    if (id == RANGE_LEFT_OUTER) leftOuterClearanceMm = clearance;
     if (clearance < clearanceMm) {
       clearanceMm = clearance;
       sensorId = id;
     }
   }
 
+  const bool contradictoryOuterPinch = contradictoryFrontFanPinchPolicy(
+    rightOuterClearanceMm, leftOuterClearanceMm,
+    getRangeSensorDistance(RANGE_RIGHT_INNER),
+    getRangeSensorDistance(RANGE_LEFT_INNER),
+    PLANNER_FAN_PINCH_OUTER_CLEARANCE_M * 1000.0f,
+    PLANNER_FAN_PINCH_INNER_OPEN_RANGE_M * 1000.0f);
   return sensorId != RANGE_SENSOR_COUNT &&
-         clearanceMm < PLANNER_TOTAL_HARD_CLEARANCE_M * 1000.0f;
+         (clearanceMm < PLANNER_TOTAL_HARD_CLEARANCE_M * 1000.0f ||
+          contradictoryOuterPinch);
 }
 
 void printFanTelemetry() {
@@ -590,11 +604,16 @@ void printFanTelemetry() {
   Serial2.print(getRangeSensorDistance(RANGE_LEFT));
   Serial2.print(",left_valid=");
   Serial2.print(isRangeSensorValid(RANGE_LEFT) ? 1 : 0);
-  Serial2.print(",rear_matrix_mm=");
-  Serial2.print(getRangeSensorDistance(RANGE_FAKE_REAR));
-  Serial2.print(",rear_matrix_valid=");
-  Serial2.print(isRangeSensorValid(RANGE_FAKE_REAR) ? 1 : 0);
-  Serial2.print(",rear_matrix_blocked=");
-  Serial2.println(isRangeSensorBlocked(RANGE_FAKE_REAR) ? 1 : 0);
-  printRearObstacleStatus();
+  Serial2.print(",rear_aggregate_mm=");
+  Serial2.print(getRangeSensorDistance(RANGE_REAR_AGGREGATE));
+  Serial2.print(",rear_aggregate_valid=");
+  Serial2.print(isRangeSensorValid(RANGE_REAR_AGGREGATE) ? 1 : 0);
+  Serial2.print(",rear_aggregate_blocked=");
+  Serial2.print(isRangeSensorBlocked(RANGE_REAR_AGGREGATE) ? 1 : 0);
+  Serial2.print(",front_matrix_mm=");
+  Serial2.print(getRangeSensorDistance(RANGE_FRONT_MATRIX_AGGREGATE));
+  Serial2.print(",front_matrix_blocked=");
+  Serial2.println(isRangeSensorBlocked(RANGE_FRONT_MATRIX_AGGREGATE) ? 1 : 0);
+  printRearTofStatus();
+  printFrontMatrixStatus();
 }

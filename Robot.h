@@ -16,7 +16,7 @@
 //   Every RobotCode module includes this file. Globals are defined in
 //   Globals.cpp, while behavior is implemented by Bluetooth.cpp,
 //   MissionController.cpp, navigation modules, MotorControl.cpp, TofSensors.cpp,
-//   Odometry.cpp, Imu.cpp, Encoders.cpp, ObjectDetection.cpp, and helpers.
+//   Odometry.cpp, Imu.cpp, Encoders.cpp, matrix/rear sensors, and helpers.
 // Control flow:
 //   This file does not execute code, but it exposes the contracts that let
 //   RobotCode.ino schedule the system and let modules call each other without
@@ -143,6 +143,8 @@ extern float lastRightError;
 
 extern Adafruit_BNO055 bno;
 extern float yawOffset;
+extern float latestImuPitchDeg;
+extern float latestImuRollDeg;
 
 extern SX1509 io;
 
@@ -150,17 +152,12 @@ extern VL53L0X rightOuterTOF;
 extern VL53L0X rightInnerTOF;
 extern VL53L0X leftInnerTOF;
 extern VL53L0X leftOuterTOF;
-extern VL53L1X objectLeftLowTOF;
-extern VL53L1X objectLeftUpperTOF;
-extern VL53L1X objectRightLowTOF;
-extern VL53L1X objectRightUpperTOF;
+extern VL53L1X rearTofs[REAR_TOF_COUNT];
+extern RearTofState rearTofStates[REAR_TOF_COUNT];
+extern FrontMatrixFrame frontMatrixFrame;
+extern MatrixTargetObservation matrixTargetObservation;
 
 extern RangeSensorState rangeSensors[RANGE_SENSOR_COUNT];
-
-extern const ObjectSensorGeometry OBJECT_SENSOR_GEOMETRY[OBJECT_TOF_COUNT];
-extern ObjectSensorState objectSensors[OBJECT_TOF_COUNT];
-extern ObjectCandidateState objectCandidate;
-extern ObjectTargetEstimate objectTargetEstimate;
 
 extern bool frontBlocked;
 extern uint16_t frontDistance;
@@ -242,6 +239,7 @@ void connectIMU();
 void zeroYaw();
 float readImuClockwiseYawDeg();
 float navigationHeadingDeg();
+void getLatestImuAttitude(float &pitchDeg, float &rollDeg);
 
 void connectTOFSensors();
 void connectRightOuterTOF();
@@ -250,18 +248,22 @@ void connectLeftInnerTOF();
 void connectLeftOuterTOF();
 void updateTOFSensors();
 void updateFanTOFSensors();
-void connectRearObstacleSensor();
-void updateRearObstacleSensor();
-void printRearObstacleStatus();
-bool getRearObstacleRay(uint8_t column, uint16_t &distanceMm,
-                        float &robotAngleDeg);
+void prepareRearTofPinsForStartup();
+void connectRearTofArray();
+void updateRearTofArray();
+void printRearTofStatus();
+bool getRearTofRay(RearTofId id, RangeRayObservation &observation);
 uint32_t getRearObstacleFrameSequence();
-void prepareObjectTOFPinsForStartup();
-void connectObjectTOFSensors();
-void updateObjectTOFSensors();
-void refreshObjectTargetEstimate();
-void printObjectTelemetry();
-bool isObjectTargetFresh();
+void connectFrontMatrixSensor();
+void updateFrontMatrixSensor();
+void printFrontMatrixStatus();
+bool getFrontMatrixRay(uint8_t column, RangeRayObservation &observation);
+bool getFrontMatrixFrame(FrontMatrixFrame &frame);
+void updateMatrixWeightDetection();
+bool getMatrixTargetObservation(MatrixTargetObservation &observation);
+void setMatrixPickupTrackId(uint32_t trackId);
+bool matrixCellBelongsToActivePickup(uint8_t cellIndex);
+void printMatrixTelemetry();
 bool isRangeSensorValid(RangeSensorId id);
 bool isRangeSensorBlocked(RangeSensorId id);
 bool isRangeSensorCurrent(RangeSensorId id);
@@ -271,8 +273,12 @@ bool isTofCloseReadingRevalidating();
 float getFanSweepClearanceMm(RangeSensorId id);
 bool getDiagonalClearanceWarning(RangeSensorId &sensorId, float &clearanceMm);
 void printFanTelemetry();
-const char* objectCandidateKindName(ObjectCandidateKind kind);
-const char* objectSensorRoleName(ObjectTofRole role);
+const char* matrixEvidenceKindName(MatrixEvidenceKind kind);
+bool startMatrixFollowDiagnostic();
+void stopMatrixFollowDiagnostic(const char* detail);
+void updateMatrixFollowDiagnostic();
+MatrixFollowDiagnosticStatus getMatrixFollowDiagnosticStatus();
+bool isMatrixFollowDiagnosticActive();
 
 void stopMotors();
 void initializeMotorSafetyWatchdog();

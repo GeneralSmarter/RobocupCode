@@ -20,7 +20,7 @@
 //   MissionController.cpp is started/stopped by START/STOP/HOME and test commands.
 //   Navigation.h receives navigation/test goals. MotorControl.cpp provides
 //   motion authority, safety, PID/output diagnostics, and manual/test command
-//   acceptance. TofSensors.cpp/ObjectDetection.cpp provide diagnostics.
+//   acceptance. Fan, rear-array, and front-matrix modules provide diagnostics.
 // Control flow:
 //   RobotCode.ino calls handleBluetoothCommands() every loop and
 //   serviceBluetoothTelemetryTx() after the controller update. Commands are
@@ -423,9 +423,11 @@ static void printBluetoothHelp() {
   Serial2.println("  TEST AVOID <m> run one straight-ahead avoidance scenario");
   Serial2.println("  TEST ESCAPE <m> front-blocked reverse-recovery test");
   Serial2.println("  TEST FAN       print high fan ToF sector readings");
-  Serial2.println("  TEST OBJECT    print object ToF and candidate telemetry");
-  Serial2.println("  TEST HUNT TARGET  print estimated pickup target without moving");
-  Serial2.println("  TEST HUNT      drive to confirmed object target after TEST ARM");
+  Serial2.println("  TEST REAR      print three-rear-VL53L1X safety telemetry");
+  Serial2.println("  TEST MATRIX    print front matrix and weight evidence");
+  Serial2.println("  TEST HUNT TARGET  print latched matrix target without moving");
+  Serial2.println("  TEST HUNT      track a confirmed matrix target after TEST ARM");
+  Serial2.println("  TEST FOLLOW START|STOP|STATUS  bounded matrix follow diagnostic");
   Serial2.println("  TEST SEARCH    run waypoint-style weight scan/search after TEST ARM");
   Serial2.println("  TEST SIDE <s>  sample avoidance side choice without moving");
   Serial2.println("  TEST TURN <d>  signed angle; positive is CCW/left");
@@ -554,20 +556,20 @@ void sendBluetoothStatus() {
   Serial2.print(isRangeSensorValid(RANGE_LEFT_OUTER) ? 1 : 0);
   Serial2.print(" frontVirtualValid=");
   Serial2.print(isRangeSensorValid(RANGE_FRONT) ? 1 : 0);
-  Serial2.print(" fakeRear=");
-  Serial2.print(getRangeSensorDistance(RANGE_FAKE_REAR));
+  Serial2.print(" rearAggregate=");
+  Serial2.print(getRangeSensorDistance(RANGE_REAR_AGGREGATE));
   Serial2.print("/");
-  Serial2.print(isRangeSensorValid(RANGE_FAKE_REAR) ? 1 : 0);
+  Serial2.print(isRangeSensorValid(RANGE_REAR_AGGREGATE) ? 1 : 0);
   Serial2.print("/");
-  Serial2.print(isRangeSensorBlocked(RANGE_FAKE_REAR) ? 1 : 0);
-  Serial2.print(" object=");
-  Serial2.print(objectCandidateKindName(objectCandidate.kind));
+  Serial2.print(isRangeSensorBlocked(RANGE_REAR_AGGREGATE) ? 1 : 0);
+  Serial2.print(" matrixTarget=");
+  Serial2.print(matrixEvidenceKindName(matrixTargetObservation.evidence));
   Serial2.print("/");
-  Serial2.print(objectCandidate.confirmed ? 1 : 0);
+  Serial2.print(matrixTargetObservation.confirmedStatic ? 1 : 0);
   Serial2.print("/");
-  Serial2.print(objectCandidate.directionHint);
+  Serial2.print(matrixTargetObservation.trackId);
   Serial2.print("/");
-  Serial2.print(objectCandidate.rangeMm);
+  Serial2.print(matrixTargetObservation.directGapMm, 1);
   Serial2.print(" fanAgeMs=");
   unsigned long statusNow = millis();
   Serial2.print(statusNow - rangeSensors[RANGE_RIGHT_OUTER].lastReadMs);
@@ -667,20 +669,20 @@ void sendBluetoothStatus() {
   Serial2.print(plannerTelemetry.recoveryCount);
   Serial2.print("/");
   Serial2.print(plannerTelemetry.obstacleBestProgressM, 2);
-  Serial2.print(" objectTarget=");
-  Serial2.print(objectTargetEstimate.valid ? 1 : 0);
+  Serial2.print(" matrixTarget=");
+  Serial2.print(matrixTargetObservation.valid ? 1 : 0);
   Serial2.print("/");
-  Serial2.print(isObjectTargetFresh() ? 1 : 0);
+  Serial2.print(matrixTargetObservation.confirmedStatic ? 1 : 0);
   Serial2.print("/");
-  Serial2.print(objectTargetEstimate.worldX, 3);
+  Serial2.print(matrixTargetObservation.worldX, 3);
   Serial2.print("/");
-  Serial2.print(objectTargetEstimate.worldY, 3);
+  Serial2.print(matrixTargetObservation.worldY, 3);
   Serial2.print("/");
-  Serial2.print(objectTargetEstimate.robotXmm, 1);
+  Serial2.print(matrixTargetObservation.robotXmm, 1);
   Serial2.print("/");
-  Serial2.print(objectTargetEstimate.robotYmm, 1);
+  Serial2.print(matrixTargetObservation.robotYmm, 1);
   Serial2.print("/");
-  Serial2.println(objectTargetEstimate.sourceMask);
+  Serial2.println(matrixTargetObservation.trackId);
   commitTelemetryRow();
 }
 
@@ -1119,37 +1121,29 @@ static void runBluetoothTestGoto(float targetX, float targetY) {
     "test_goto");
 }
 
-static void refreshObjectTargetEstimateForCommand() {
-  refreshObjectTargetEstimate();
-}
-
-static void printObjectHuntTarget() {
-  refreshObjectTargetEstimateForCommand();
-
-  Serial2.print("object_hunt_target,valid=");
-  Serial2.print(objectTargetEstimate.valid ? 1 : 0);
-  Serial2.print(",fresh=");
-  Serial2.print(isObjectTargetFresh() ? 1 : 0);
-  Serial2.print(",candidate=");
-  Serial2.print(objectCandidateKindName(objectCandidate.kind));
+static void printMatrixHuntTarget() {
+  MatrixTargetObservation target;
+  const bool fresh = getMatrixTargetObservation(target);
+  Serial2.print("matrix_hunt_target,valid=");
+  Serial2.print(fresh ? 1 : 0);
+  Serial2.print(",evidence=");
+  Serial2.print(matrixEvidenceKindName(matrixTargetObservation.evidence));
   Serial2.print(",confirmed=");
-  Serial2.print(objectCandidate.confirmed ? 1 : 0);
-  Serial2.print(",direction_hint=");
-  Serial2.print(objectCandidate.directionHint);
-  Serial2.print(",range_mm=");
-  Serial2.print(objectTargetEstimate.rangeMm);
+  Serial2.print(matrixTargetObservation.confirmedStatic ? 1 : 0);
+  Serial2.print(",track_id=");
+  Serial2.print(matrixTargetObservation.trackId);
+  Serial2.print(",gap_mm=");
+  Serial2.print(matrixTargetObservation.directGapMm, 1);
   Serial2.print(",robot_x_mm=");
-  Serial2.print(objectTargetEstimate.robotXmm, 1);
+  Serial2.print(matrixTargetObservation.robotXmm, 1);
   Serial2.print(",robot_y_mm=");
-  Serial2.print(objectTargetEstimate.robotYmm, 1);
+  Serial2.print(matrixTargetObservation.robotYmm, 1);
   Serial2.print(",world_x_m=");
-  Serial2.print(objectTargetEstimate.worldX, 3);
+  Serial2.print(matrixTargetObservation.worldX, 3);
   Serial2.print(",world_y_m=");
-  Serial2.print(objectTargetEstimate.worldY, 3);
-  Serial2.print(",sources=");
-  Serial2.print(objectTargetEstimate.sourceMask);
-  Serial2.print(",reason=");
-  Serial2.println(objectTargetEstimate.reason);
+  Serial2.print(matrixTargetObservation.worldY, 3);
+  Serial2.print(",column=");
+  Serial2.println(matrixTargetObservation.column, 2);
 }
 
 static void runBluetoothTestHunt() {
@@ -1157,31 +1151,29 @@ static void runBluetoothTestHunt() {
     return;
   }
 
-  refreshObjectTargetEstimateForCommand();
-  if (!isObjectTargetFresh()) {
-    Serial2.println("ERROR no fresh confirmed weight target. Use TEST OBJECT or TEST HUNT TARGET first.");
+  MatrixTargetObservation target;
+  if (!getMatrixTargetObservation(target)) {
+    Serial2.println("ERROR no fresh confirmed static matrix target. Use TEST MATRIX or TEST HUNT TARGET first.");
     return;
   }
 
   Serial2.print("OK test hunt target x=");
-  Serial2.print(objectTargetEstimate.worldX, 3);
+  Serial2.print(target.worldX, 3);
   Serial2.print(" y=");
-  Serial2.print(objectTargetEstimate.worldY, 3);
+  Serial2.print(target.worldY, 3);
   Serial2.print(" robot_mm=");
-  Serial2.print(objectTargetEstimate.robotXmm, 1);
+  Serial2.print(target.robotXmm, 1);
   Serial2.print("/");
-  Serial2.print(objectTargetEstimate.robotYmm, 1);
-  Serial2.print(" sources=");
-  Serial2.print(objectTargetEstimate.sourceMask);
+  Serial2.print(target.robotYmm, 1);
+  Serial2.print(" track=");
+  Serial2.print(target.trackId);
   Serial2.println(".");
 
   beginBluetoothTestMotion();
-  sendBluetoothEvent("test_hunt_start", "object_target");
+  sendBluetoothEvent("test_hunt_start", "matrix_static_track");
+  RouteResumeContext noRoute = {};
   recordBluetoothNavigationSubmission(
-    navigationStartTestPoint(
-      objectTargetEstimate.worldX,
-      objectTargetEstimate.worldY,
-      NAVIGATION_TEST_PICKUP),
+    navigationStartPickupTracking(target, noRoute),
     "test_hunt");
 }
 
@@ -1337,6 +1329,36 @@ static void runBluetoothTestTurn(float angleDeg) {
   recordBluetoothNavigationSubmission(
     navigationStartTestTurn(angleDeg),
     "test_turn");
+}
+
+static const char* matrixFollowPhaseName(MatrixFollowDiagnosticPhase phase) {
+  switch (phase) {
+    case MATRIX_FOLLOW_IDLE: return "IDLE";
+    case MATRIX_FOLLOW_SLOW_SCAN: return "SLOW_SCAN";
+    case MATRIX_FOLLOW_ACQUIRE_STATIC_WEIGHT: return "ACQUIRE_STATIC_WEIGHT";
+    case MATRIX_FOLLOW_LOCKED_TRACK: return "FOLLOW_LOCKED_TRACK";
+    case MATRIX_FOLLOW_BOUNDED_REACQUIRE: return "BOUNDED_REACQUIRE";
+    case MATRIX_FOLLOW_STOPPED: return "STOPPED";
+  }
+  return "UNKNOWN";
+}
+
+static void printMatrixFollowStatus() {
+  MatrixFollowDiagnosticStatus status = getMatrixFollowDiagnosticStatus();
+  Serial2.print("matrix_follow,phase=");
+  Serial2.print(matrixFollowPhaseName(status.phase));
+  Serial2.print(",track=");
+  Serial2.print(status.trackId);
+  Serial2.print(",detail=");
+  Serial2.println(status.detail);
+}
+
+static void runBluetoothMatrixFollowStart() {
+  if (!requireBluetoothTestArm()) return;
+  beginBluetoothTestMotion();
+  const bool accepted = startMatrixFollowDiagnostic();
+  recordBluetoothNavigationSubmission(accepted, "matrix_follow");
+  if (accepted) printMatrixFollowStatus();
 }
 
 static void printBluetoothTurnTruth(const char* phase) {
@@ -2230,18 +2252,45 @@ static bool handleTestMotionBluetoothCommand(const char* command) {
     return true;
   }
 
-  if (commandEquals(command, "TEST OBJECT") || commandEquals(command, "OBJECT")) {
-    printObjectTelemetry();
+  if (commandEquals(command, "TEST MATRIX") || commandEquals(command, "MATRIX") ||
+      commandEquals(command, "TEST OBJECT") || commandEquals(command, "OBJECT")) {
+    printMatrixTelemetry();
+    return true;
+  }
+
+  if (commandEquals(command, "TEST REAR") || commandEquals(command, "REAR")) {
+    printRearTofStatus();
     return true;
   }
 
   if (commandEquals(command, "TEST HUNT TARGET")) {
-    printObjectHuntTarget();
+    printMatrixHuntTarget();
     return true;
   }
 
   if (commandEquals(command, "TEST HUNT")) {
     runBluetoothTestHunt();
+    return true;
+  }
+
+  if (commandEquals(command, "TEST FOLLOW START")) {
+    runBluetoothMatrixFollowStart();
+    return true;
+  }
+
+  if (commandEquals(command, "TEST FOLLOW STOP")) {
+    stopMatrixFollowDiagnostic("operator_stop");
+    printMatrixFollowStatus();
+    return true;
+  }
+
+  if (commandEquals(command, "TEST FOLLOW STATUS")) {
+    printMatrixFollowStatus();
+    return true;
+  }
+
+  if (commandHasPrefix(command, "TEST FOLLOW")) {
+    Serial2.println("ERROR usage: TEST FOLLOW START|STOP|STATUS");
     return true;
   }
 

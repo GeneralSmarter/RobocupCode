@@ -15,7 +15,6 @@ enum SafePivotStepResult {
 };
 
 bool publishNavigationMotion(float forwardSpeed, float turnSpeed);
-bool ownerIsObjectHunt(NavigationGoalOwner owner);
 void finishNavigationGoal(bool success, PlannerStopReason reason,
                           const char* detail);
 SafePivotStepResult commandSafePivotStep(

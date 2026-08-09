@@ -6,13 +6,20 @@ void startWeightSearchTest();
 bool isWeightSearchActive();
 void cancelWeightSearch(const char* detail);
 void updateWeightSearch();
-bool tryStartRouteWeightInterrupt(float routeTargetX, float routeTargetY,
+bool tryStartRouteWeightInterrupt(int routeIndex,
+                                  float segmentStartX,
+                                  float segmentStartY,
+                                  float routeTargetX,
+                                  float routeTargetY,
                                   bool currentActionIsSearch);
 bool startSearchWaypointApproach(float searchX, float searchY,
                                  float approachOriginX,
                                  float approachOriginY,
                                  const char* detail);
 void beginWaypointWeightSearch(float searchX, float searchY,
+                               int resumeRouteIndex,
+                               bool resumeValid,
+                               float resumeX, float resumeY,
                                const char* detail);
 
 enum WeightSearchResult {

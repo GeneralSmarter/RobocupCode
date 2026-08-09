@@ -103,7 +103,9 @@ void loop() {
   recordMainLoopPhaseDuration("bluetooth_rx", phaseStartedUs);
 
   phaseStartedUs = micros();
-  if (robotRunEnabled && !isManualDriveActive()) {
+  if (isMatrixFollowDiagnosticActive()) {
+    updateMatrixFollowDiagnostic();
+  } else if (robotRunEnabled && !isManualDriveActive()) {
     updateMissionController();
   } else if (!isManualDriveActive()) {
     motorStopRequested = true;

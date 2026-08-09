@@ -406,6 +406,49 @@ static void capturePlannerEpochView(PlannerEpoch &epoch) {
   plannerMapCaptureCollisionSnapshot(epoch.collision);
 }
 
+bool pickupTrajectoryCommandSafe(float forwardTicks, float turnTicks,
+                                 const MatrixTargetObservation &target) {
+  PlannerEpoch epoch = {};
+  capturePlannerEpochView(epoch);
+  // The selected weight is the intentional capture object. Clear only map
+  // cells spatially attributable to that latched track; this is not a general
+  // collision bypass and cannot erase walls, ramps, or unrelated returns.
+  const float exclusionRadiusM =
+    max(0.025f, target.widthMm * 0.0005f) + LOCAL_MAP_CELL_M * 0.75f;
+  for (int cellY = 0; cellY < LOCAL_MAP_CELLS; cellY++) {
+    for (int cellX = 0; cellX < LOCAL_MAP_CELLS; cellX++) {
+      const float cellWorldX = epoch.collision.originX +
+        (cellX + 0.5f) * LOCAL_MAP_CELL_M;
+      const float cellWorldY = epoch.collision.originY +
+        (cellY + 0.5f) * LOCAL_MAP_CELL_M;
+      if (hypotf(cellWorldX - target.worldX,
+                 cellWorldY - target.worldY) <= exclusionRadiusM) {
+        const int bit = cellY * LOCAL_MAP_CELLS + cellX;
+        epoch.collision.occupied[bit >> 3] &=
+          (uint8_t)~(1U << (bit & 7));
+      }
+    }
+  }
+  const float goalDistanceM = 1.0f;
+  const float goalX = robotX + cosf(epoch.startHeadingRad) * goalDistanceM;
+  const float goalY = robotY + sinf(epoch.startHeadingRad) * goalDistanceM;
+  float minimumClearanceMm = 0.0f;
+  float closestGoalDistanceM = 0.0f;
+  float headingAtClosestGoalRad = 0.0f;
+  float finalX = 0.0f;
+  float finalY = 0.0f;
+  float finalHeadingRad = 0.0f;
+  float arrivalTimeS = -1.0f;
+  float safeTravelM = 0.0f;
+  float maximumUnknownFraction = 0.0f;
+  CandidateRejectReason rejectReason = CANDIDATE_REJECT_NONE;
+  return rolloutCandidate(
+    epoch, forwardTicks, turnTicks, goalX, goalY,
+    minimumClearanceMm, closestGoalDistanceM, headingAtClosestGoalRad,
+    finalX, finalY, finalHeadingRad, arrivalTimeS, safeTravelM,
+    maximumUnknownFraction, rejectReason);
+}
+
 static void recordPlannerSlice(unsigned long sliceStartedUs) {
   unsigned long sliceUs = micros() - sliceStartedUs;
   plannerContext.plannerEpoch.accumulatedWorkUs += sliceUs;

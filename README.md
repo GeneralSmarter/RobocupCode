@@ -10,8 +10,10 @@ confidence map plus thresholded persistent arena memory; a footprint-aware
 receding-horizon controller selects a safe
 differential-drive arc toward the active waypoint.  There is no fixed
 reverse/turn/bypass/rejoin script and no outer-fan wall-follow fallback. The
-four-ray front fan has no true side coverage; reverse safety uses the separate
-SEN0628 rear matrix. Invalid, stale, or blind space is never treated as clear.
+four-ray front fan has no true side coverage. Reverse safety uses three
+independent rear VL53L1X channels; the front SEN0628 matrix supplies
+supplemental collision vetoes and weight perception. Invalid, stale, or blind
+direction-relevant safety evidence is never treated as clear.
 
 Read [ROBOT_CODEBASE_AUDIT.md](docs/ROBOT_CODEBASE_AUDIT.md) before planning
 new navigation or mission work. It records the full 2026-07 audit, including
@@ -20,16 +22,13 @@ the stop-ship safety findings that supersede the older navigation test plans.
 P0 status: P0-01 turn convention, P0-02 motion authority/disarm, P0-07 hard
 collision override, and P0-08 field-GOTO command suppression are fixed in
 software. P0-03 is partially fixed and still depends on real sensor coverage.
-P0-04 fake rear is intentionally deferred; P0-05 sensor safety proof remains
-open. P0-06 phase 1 is implemented, with coherent snapshots and physical
-watchdog timing still to follow. Operator decision, 2026-07-14: current
-obstacle testing may use `RANGE_FAKE_REAR` as explicit temporary test
-scaffolding. Do not treat those runs as proof of rear safety or competition
-readiness.
+P0-04's temporary rear channel has been removed in software; physical rear
+coverage and stop/clear calibration remain open P0-05 evidence. P0-06 phase 1
+is implemented, with physical watchdog timing still to follow. Do not treat
+simulator results as proof of rear safety or competition readiness.
 
-Current verification baseline: warning-enabled Teensy compile PASS, simulator
-and firmware/WASM 47/47 PASS, Python 141 PASS with one intentional skip, and
-Python `compileall` PASS.
+The migration baseline and latest validation results are recorded in
+[FRONT_MATRIX_THREE_REAR_IMPLEMENTATION_STATUS.md](docs/FRONT_MATRIX_THREE_REAR_IMPLEMENTATION_STATUS.md).
 
 The field GOTO desktop UI is preview-only. Field clicks do not send `TEST ARM`
 or `TEST GOTO`; the SE(2) transform, status preflight, bounds preview, and
@@ -147,8 +146,8 @@ Available commands:
 - `FBASE <left_us> <right_us>` - set temporary forward motor base pulses.
 - `FBASE RESET` - restore the default forward motor base pulses.
 - `ESCAPE ON` / `ESCAPE OFF` / `ESCAPE STATUS` - enable, disable, or report
-  reverse-repositioning policy. Physical motion still requires the SEN0628
-  rear sensor to be initialized, valid, fresh, and non-blocked.
+  reverse-repositioning policy. Physical motion still requires all three rear
+  VL53L1X channels to be initialized, valid, fresh, coherent, and non-blocked.
 - `EMERGENCY ON` / `EMERGENCY OFF` / `EMERGENCY STATUS` - enable, disable,
   or report the ultimate scan/relocate/retry recovery policy for this boot.
   Policy changes are rejected while a navigation goal is active.
@@ -161,14 +160,16 @@ Available commands:
 - `TEST ESCAPE <metres>` - no-path/recovery diagnostic. It remains neutral on
   the physical build until trusted rear coverage is installed.
 - `TEST FAN` or `FAN` - print the high forward ToF fan sector table.
-- `TEST OBJECT` or `OBJECT` - print the object/weight ToF table and current
-  object-candidate summary. This never moves the motors.
-- `TEST HUNT TARGET` - print the estimated pickup target without moving.
-- `TEST HUNT` - after `TEST ARM`, lock the fresh confirmed weight target and
-  give the local planner a pickup goal `150 mm` forward of the estimated weight
-  point. Hunt goals add a small speed boost during that final carry-through
-  zone and complete near the biased target without requiring the normal
-  point-goal final heading.
+- `TEST REAR` or `REAR` - print all three rear VL53L1X states and aggregate.
+- `TEST MATRIX` or `MATRIX` - print the 8x8 front frame and weight evidence.
+  `TEST OBJECT` remains a command alias only; there is no old object-ToF path.
+- `TEST HUNT TARGET` - print the confirmed static matrix track without moving.
+- `TEST HUNT` - after `TEST ARM`, latch that track, request the normal 2600
+  ticks/s forward ceiling, steer from the matrix, perform the configurable
+  assumed 30 mm funnel handoff, and maintain at least 150 mm unconfirmed feed.
+  It never confirms payload or material.
+- `TEST FOLLOW START|STOP|STATUS` - explicit-start bounded matrix-follow
+  diagnostic. It never performs the pickup handoff.
 - `TEST SEARCH` - after `TEST ARM`, run the same short waypoint-style weight
   search using the current robot pose as the temporary search waypoint.
 - `TEST SIDE <seconds>` - sample the avoidance side choice once per second
@@ -208,8 +209,8 @@ It evaluates short differential-drive trajectories against the local map and
 the measured footprint, then naturally returns toward the active target as
 soon as the target direction is safe. `ESCAPE ON` / `ESCAPE OFF` controls the
 reverse-repositioning policy, but cannot bypass the trusted-rear capability or
-the final motor-safety gate. The installed fake rear channel is diagnostic
-only, so physical reverse remains disabled.
+the final motor-safety gate. Physical reverse requires all three installed rear
+channels to be live, coherent, valid, and clear.
 
 All four forward-facing fan rays form a diagonal footprint guard. A sudden
 close valid endpoint pauses motion for confirmation, while a confirmed close
@@ -249,11 +250,10 @@ scenario imports use `emergencyScanEnabled`. Both reject changes during an
 active goal, and both default to the shared `PLANNER_EMERGENCY_SCAN_ENABLED`
 value.
 
-The WASM simulator supplies a raycast rear channel and exercises this exact
-RobotCode policy. Production rear motion now depends on the installed SEN0628
-matrix being connected, initialized, valid, fresh within its tighter timeout,
-and non-blocked. The legacy `RANGE_FAKE_REAR` name is only the compatibility
-slot used to publish that real sensor state.
+The WASM simulator supplies three independently faultable rear rays and all 64
+front-matrix rays. Production rear motion depends on every rear channel being
+connected, valid, fresh within the sample-skew bound, and non-blocked. There is
+no temporary rear compatibility alias.
 
 Use the smallest test that exercises the feature being changed:
 
@@ -394,35 +394,22 @@ The active V7 firmware has one scheduled navigation path and one periodic
 motor-output owner. Historical V2-V4 sketches remain in the workspace for
 comparison, but they are not part of the V7 build.
 
-## Weight ToF Stage
+## Front Matrix Weight Stage
 
 See [CURRENT_STATE_AND_NEXT_STEPS.md](docs/CURRENT_STATE_AND_NEXT_STEPS.md) for
 the current object/search checklist, and
 [ROBOT_CODEBASE_AUDIT.md](docs/ROBOT_CODEBASE_AUDIT.md) for the broader safety
 and architecture concerns around object detection.
 
-The object stage is separate from the VL53L0X navigation fan: four VL53L1X
-object/weight ToFs are mounted at fixed distances from the robot centreline
-and angled 20 degrees inward toward the intake/centreline. The current logical
-layout is left/right LOW and UPPER columns.
+The SEN0628 publishes pose- and attitude-stamped immutable 64-cell frames.
+Collision evidence and weight perception are separate consumers: valid close
+matrix cells may veto motion, while unknown/no-return cells do not establish
+known-clear space. Weight tracking is advisory until the navigation interface
+latches a confirmed static track.
 
-The architecture is enabled with
-`OBJECT_TOF_ENABLED = true`. `TEST OBJECT` prints the object ToF table without
-moving the robot. If the subsystem is disabled again, the reserved object XSHUT
-pins are held low so unconfigured VL53L1X devices do not interfere with the
-navigation fan on the I2C bus.
-
-Current measured object wiring is in the robot's frame: `XSHUT4=object_right_upper`,
-`XSHUT5=object_left_upper`, `XSHUT6=object_right_low`, and
-`XSHUT7=object_left_low`. Both columns are `91.4 mm` forward of the
-wheel-midpoint frame and `60.6 mm` from centreline. LOW sensors are `55 mm`
-from the floor and UPPER sensors are `120 mm`; left yaw is `-20 deg`, right yaw
-is `+20 deg`.
-
-Before folding this into autonomous collection, collect `TEST OBJECT` and/or
-`TOFReturnSignalExperiment/TOFReturnSignalExperiment.ino` samples on the
-VL53L1X channels outside the stable navigation behaviour. The logs should
-include range status, distance, return signal rate, ambient rate, and derived
-signal features for walls, ramps, steel weights, plastic weights, and
-lighting/angle changes. If the classes overlap, keep return signal as a
-confidence feature only, not as a safety or material decision.
+Stationary characterization and later motion calibration still require fresh,
+explicit hardware permission. The provisional 30 mm handoff, 150 mm feed,
+classification dimensions, rear stop/clear distances, and prediction bounds
+must be replaced or confirmed from saved physical frames before acceptance.
+See [INTERNAL_FUNNEL_TOF_INTEGRATION_GUIDE.md](docs/INTERNAL_FUNNEL_TOF_INTEGRATION_GUIDE.md)
+for the future payload-confirmation boundary.

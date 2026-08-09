@@ -1,5 +1,11 @@
 ﻿# Robot Codebase Audit
 
+Migration update, 2026-08-06: the historical `RANGE_FAKE_REAR`, rear SEN0628,
+and four object-facing VL53L1X paths described below have been superseded in
+software by three rear VL53L1X channels and one front SEN0628 matrix. Physical
+coverage, thresholds, stopping distance, and pickup calibration are still
+unverified; see `FRONT_MATRIX_THREE_REAR_IMPLEMENTATION_STATUS.md`.
+
 Full audit report for the RoboCup robot workspace. Generated 2026-07-14 from the completed Codex audit goal.
 
 Current note, 2026-07-30: this remains the safety audit and historical defect

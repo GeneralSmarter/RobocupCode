@@ -14,6 +14,7 @@ struct PlannerContext {
   float localMapOriginX;
   float localMapOriginY;
   uint32_t lastRearEvidenceFrameSequence;
+  uint32_t lastFrontMatrixEvidenceFrameSequence;
   int8_t arenaMemoryChallenge[ARENA_MEMORY_BITS];
   uint8_t arenaMemoryOccupied[ARENA_MEMORY_BYTES];
   uint8_t arenaMemoryKnownClear[ARENA_MEMORY_BYTES];
@@ -26,6 +27,7 @@ struct PlannerContext {
   float turnLastCommandDirection;
   bool pointAlignTurnActive;
   float pointAlignTurnDirection;
+  unsigned long frontInvalidSinceMs;
   unsigned long turnSideInvalidSinceMs;
   unsigned long turnSweepInvalidSinceMs;
   bool reverseRecoveryActive;

@@ -11,7 +11,7 @@
 // Interacts with:
 //   Included through Robot.h by all modules. Bluetooth.cpp prints many of
 //   these fields, navigation modules consume navigation and planner structs,
-//   TofSensors.cpp fills RangeSensorState, ObjectDetection.cpp fills object
+//   ToF modules fill RangeSensorState and immutable matrix/rear observations;
 //   structs, and MotorControl.cpp enforces MotionAuthority.
 // Control flow:
 //   No executable runtime logic except small constexpr policy checks and
@@ -22,10 +22,10 @@
 
 #include <Arduino.h>
 
-// Physical fan sensors come first and match FAN_SENSOR_GEOMETRY indices.
+// Physical fan sensors come first and match FRONT_FAN_CONFIG indices.
 // RANGE_FRONT/RANGE_LEFT/RANGE_RIGHT are derived aggregate views; there is no
-// physical front-centre ToF in this layout. RANGE_FAKE_REAR is a temporary
-// compatibility name for the physical rear matrix ToF range slot.
+// physical front-centre single-zone ToF in this layout. Rear and front-matrix
+// aggregate slots are live derived safety evidence, not physical sensors.
 enum RangeSensorId {
   RANGE_RIGHT_OUTER,
   RANGE_RIGHT_INNER,
@@ -34,8 +34,97 @@ enum RangeSensorId {
   RANGE_FRONT,
   RANGE_RIGHT,
   RANGE_LEFT,
-  RANGE_FAKE_REAR,
+  RANGE_REAR_AGGREGATE,
+  RANGE_FRONT_MATRIX_AGGREGATE,
   RANGE_SENSOR_COUNT
+};
+
+enum SensorI2cBus {
+  SENSOR_I2C_PRIMARY,
+  SENSOR_I2C_SECONDARY
+};
+
+struct SensorMountPose {
+  float xMm;
+  float yMm;
+  float zMm;
+  float yawDeg;
+  float pitchDeg;
+  float rollDeg;
+};
+
+struct FrontFanSensorConfig {
+  const char* name;
+  SensorMountPose mount;
+  byte xshutChannel;
+  uint8_t i2cAddress;
+};
+
+enum RearTofId {
+  REAR_TOF_LEFT,
+  REAR_TOF_CENTRE,
+  REAR_TOF_RIGHT,
+  REAR_TOF_COUNT
+};
+
+struct RearTofConfig {
+  const char* name;
+  SensorMountPose mount;
+  SensorI2cBus bus;
+  byte xshutChannel;
+  uint8_t i2cAddress;
+  uint8_t roiWidth;
+  uint8_t roiHeight;
+  float horizontalFovDeg;
+  float verticalFovDeg;
+  uint32_t timingBudgetUs;
+  unsigned long samplePeriodMs;
+  uint16_t validMinimumMm;
+  uint16_t validMaximumMm;
+  uint16_t stopDistanceMm;
+  uint16_t clearDistanceMm;
+};
+
+struct RearTofState {
+  bool connected;
+  bool valid;
+  bool stale;
+  bool blocked;
+  uint16_t distanceMm;
+  uint8_t rangeStatus;
+  float signalMcps;
+  float ambientMcps;
+  uint32_t sequence;
+  unsigned long acquiredMs;
+  unsigned long timeoutCount;
+  unsigned long invalidCount;
+};
+
+struct FrontMatrixConfig {
+  const char* name;
+  SensorMountPose mount;
+  SensorI2cBus bus;
+  uint8_t i2cAddress;
+  uint8_t rows;
+  uint8_t columns;
+  float horizontalFovDeg;
+  float verticalFovDeg;
+  uint8_t gridRotationQuarterTurns;
+  bool flipRows;
+  bool flipColumns;
+  uint64_t safetyCellMask;
+  uint64_t perceptionCellMask;
+};
+
+struct RangeRayObservation {
+  float originXmm;
+  float originYmm;
+  float originZmm;
+  float yawDeg;
+  float pitchDeg;
+  uint16_t distanceMm;
+  uint32_t sequence;
+  unsigned long acquiredMs;
 };
 
 struct RobotFootprintGeometry {
@@ -65,76 +154,6 @@ struct RangeSensorState {
   unsigned long lastReadMs;
   unsigned long timeoutCount;
   unsigned long invalidCount;
-};
-
-enum ObjectTofId {
-  OBJECT_LEFT_LOW,
-  OBJECT_LEFT_UPPER,
-  OBJECT_RIGHT_LOW,
-  OBJECT_RIGHT_UPPER,
-  OBJECT_TOF_COUNT
-};
-
-enum ObjectTofRole {
-  OBJECT_ROLE_LOW,
-  OBJECT_ROLE_UPPER
-};
-
-// Object detection is advisory for search/hunt behavior, not a safety input.
-enum ObjectCandidateKind {
-  OBJECT_CANDIDATE_DISABLED,
-  OBJECT_CANDIDATE_NONE,
-  OBJECT_CANDIDATE_UNKNOWN,
-  OBJECT_CANDIDATE_WEIGHT_SIZED,
-  OBJECT_CANDIDATE_TALL_OBSTACLE
-};
-
-struct ObjectSensorGeometry {
-  float xMm;
-  float yMm;
-  float zMm;
-  float yawDeg;
-  float pitchDeg;
-  ObjectTofRole role;
-};
-
-struct ObjectSensorState {
-  const char* name;
-  ObjectTofRole role;
-  uint16_t distanceMm;
-  bool valid;
-  bool stale;
-  bool connected;
-  unsigned long lastReadMs;
-  unsigned long timeoutCount;
-  unsigned long invalidCount;
-  uint8_t rangeStatus;
-  float signalMcps;
-  float ambientMcps;
-};
-
-struct ObjectCandidateState {
-  ObjectCandidateKind kind;
-  const char* reason;
-  bool confirmed;
-  int directionHint;
-  uint16_t rangeMm;
-  uint8_t confirmCount;
-  unsigned long lastUpdateMs;
-};
-
-struct ObjectTargetEstimate {
-  // robotXmm/robotYmm are in the robot body frame; worldX/worldY are the same
-  // target transformed into the odometry frame at the time of estimation.
-  bool valid;
-  float robotXmm;
-  float robotYmm;
-  float worldX;
-  float worldY;
-  uint16_t rangeMm;
-  uint8_t sourceMask;
-  const char* reason;
-  unsigned long lastUpdateMs;
 };
 
 enum AvoidTurnChoice {
@@ -169,6 +188,118 @@ enum MotionAuthority {
   MOTION_AUTHORITY_MANUAL
 };
 
+enum FrontMatrixCellState {
+  FRONT_MATRIX_CELL_UNKNOWN,
+  FRONT_MATRIX_CELL_VALID
+};
+
+struct FrontMatrixFrame {
+  uint16_t distanceMm[64];
+  FrontMatrixCellState cellState[64];
+  bool valid;
+  uint32_t sequence;
+  unsigned long acquiredMs;
+  float robotX;
+  float robotY;
+  float robotHeadingDeg;
+  float pitchDeg;
+  float rollDeg;
+  uint8_t gridRotationQuarterTurns;
+  bool flipRows;
+  bool flipColumns;
+};
+
+enum MatrixEvidenceKind {
+  MATRIX_EVIDENCE_NONE,
+  MATRIX_EVIDENCE_WEIGHT_CANDIDATE,
+  MATRIX_EVIDENCE_RAMP_LIKE,
+  MATRIX_EVIDENCE_WALL_LIKE,
+  MATRIX_EVIDENCE_DYNAMIC_LOW_OBJECT,
+  MATRIX_EVIDENCE_MIXED_OR_OCCLUDED,
+  MATRIX_EVIDENCE_UNKNOWN
+};
+
+struct MatrixTargetObservation {
+  bool valid;
+  bool confirmedStatic;
+  uint32_t trackId;
+  uint32_t frameSequence;
+  unsigned long acquiredMs;
+  uint64_t sourceCellMask;
+  MatrixEvidenceKind evidence;
+  float robotXmm;
+  float robotYmm;
+  float worldX;
+  float worldY;
+  float widthMm;
+  float heightMm;
+  float column;
+  float columnError;
+  float directGapMm;
+  float apparentSpeedMps;
+};
+
+struct RouteResumeContext {
+  bool valid;
+  int routeIndex;
+  float segmentStartX;
+  float segmentStartY;
+  float segmentEndX;
+  float segmentEndY;
+  float alongSegmentProgressM;
+  float interruptX;
+  float interruptY;
+  uint32_t trackId;
+};
+
+enum PickupTrackingPhase {
+  PICKUP_TRACKING_IDLE,
+  PICKUP_TRACKING_FULL_SPEED,
+  PICKUP_TRACKING_FINAL_APPROACH_PREDICT,
+  PICKUP_TRACKING_HANDOFF_ASSUMED,
+  PICKUP_TRACKING_FEEDING_UNCONFIRMED,
+  PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED,
+  PICKUP_TRACKING_FAILED
+};
+
+enum PickupTrackingOutcome {
+  PICKUP_OUTCOME_NONE,
+  PICKUP_OUTCOME_RUNNING,
+  PICKUP_OUTCOME_WEIGHT_FUNNEL_HANDOFF_ASSUMED,
+  PICKUP_OUTCOME_FEED_COMPLETE_UNCONFIRMED,
+  PICKUP_OUTCOME_TARGET_LOST,
+  PICKUP_OUTCOME_FINAL_APPROACH_ESTIMATE_EXPIRED,
+  PICKUP_OUTCOME_INACCESSIBLE_TARGET,
+  PICKUP_OUTCOME_FEED_INTERRUPTED,
+  PICKUP_OUTCOME_NAVIGATION_FAILED
+};
+
+struct PickupTrackingStatus {
+  PickupTrackingPhase phase;
+  PickupTrackingOutcome outcome;
+  uint32_t trackId;
+  float bestGapMm;
+  float columnError;
+  float remainingFeedMm;
+  bool usingPredictedGap;
+  const char* detail;
+};
+
+enum MatrixFollowDiagnosticPhase {
+  MATRIX_FOLLOW_IDLE,
+  MATRIX_FOLLOW_SLOW_SCAN,
+  MATRIX_FOLLOW_ACQUIRE_STATIC_WEIGHT,
+  MATRIX_FOLLOW_LOCKED_TRACK,
+  MATRIX_FOLLOW_BOUNDED_REACQUIRE,
+  MATRIX_FOLLOW_STOPPED
+};
+
+struct MatrixFollowDiagnosticStatus {
+  MatrixFollowDiagnosticPhase phase;
+  uint32_t trackId;
+  const char* detail;
+};
+
 // Tells the final motor writer how to realise an accepted chassis command.
 // Navigation selects this explicitly so motor control never reads private
 // navigation-goal state.
@@ -176,7 +307,8 @@ enum MotionCommandMode {
   MOTION_COMMAND_STANDARD,
   MOTION_COMMAND_NAV_DRIVE,
   MOTION_COMMAND_NAV_TURN,
-  MOTION_COMMAND_NAV_SCAN_TURN
+  MOTION_COMMAND_NAV_SCAN_TURN,
+  MOTION_COMMAND_NAV_PICKUP_TRACK
 };
 
 constexpr bool motionAuthorityAllows(MotionAuthority active,

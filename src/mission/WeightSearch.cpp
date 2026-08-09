@@ -6,9 +6,9 @@
 // Weight-search mission component
 // =====================================================
 // Responsibility:
-//   Owns the object/weight search mini-state-machine and its route interrupt.
+//   Owns the matrix-weight search mini-state-machine and its route interrupt.
 // Interacts with:
-//   Navigation.h receives point and turn goals. ObjectDetection.cpp supplies
+//   Navigation.h receives point, turn, and pickup-tracking goals. The front matrix supplies
 //   candidate/target state. RouteMission.cpp owns route dispatch and consumes
 //   typed search results. Bluetooth.cpp starts tests and prints telemetry.
 // Control flow:
@@ -54,6 +54,8 @@ static float weightSearchAnchorX = 0.0;
 static float weightSearchAnchorY = 0.0;
 static WeightSearchPhase weightSearchConfirmResumePhase = WEIGHT_SEARCH_IDLE;
 static const char* weightSearchConfirmDetail = "confirm";
+static MatrixTargetObservation weightSearchTarget = {};
+static RouteResumeContext weightRouteResume = {};
 static WeightSearchStatus weightSearchStatus = {
   WEIGHT_SEARCH_RESULT_IDLE,
   WEIGHT_SEARCH_ORIGIN_NONE,
@@ -81,6 +83,8 @@ void initializeWeightSearch() {
   weightSearchHuntStartedMs = 0;
   weightInterruptLastMs = 0;
   weightSearchTurnStarted = false;
+  weightSearchTarget = {};
+  weightRouteResume = {};
   weightSearchStatus = {
     WEIGHT_SEARCH_RESULT_IDLE,
     WEIGHT_SEARCH_ORIGIN_NONE,
@@ -150,6 +154,21 @@ static void completeWeightSearch(const char* eventName, const char* detail) {
   navigationClearResult();
 }
 
+static void completeWeightSearchRouteBlended(const char* detail) {
+  sendBluetoothEvent("weight_search_route_blended", detail);
+  const WeightSearchOrigin completedOrigin =
+    weightSearchMode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
+      ? WEIGHT_SEARCH_ORIGIN_WAYPOINT
+      : WEIGHT_SEARCH_ORIGIN_ROUTE_INTERRUPT;
+  weightSearchStatus = {
+    WEIGHT_SEARCH_RESULT_COMPLETED,
+    completedOrigin,
+    detail
+  };
+  clearWeightSearchState();
+  weightInterruptLastMs = millis();
+}
+
 static void failWeightSearch(const char* detail) {
   // Fail closed on object-hunt/search faults. The current implementation does
   // not try to continue the mission after a hunt failure.
@@ -173,9 +192,12 @@ static void failWeightSearch(const char* detail) {
 static bool searchTargetVisible() {
   // Consume the timestamped snapshot maintained by updateRobotController().
   // A route-interrupt check must never pause active motion to force new reads.
-  return objectCandidate.kind == OBJECT_CANDIDATE_WEIGHT_SIZED &&
-         objectCandidate.confirmed &&
-         isObjectTargetFresh();
+  MatrixTargetObservation observation;
+  if (!getMatrixTargetObservation(observation)) {
+    return false;
+  }
+  weightSearchTarget = observation;
+  return true;
 }
 
 static bool weightInterruptCooldownActive() {
@@ -203,6 +225,9 @@ static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
   weightSearchStatus.detail = detail;
   weightSearchAnchorX = anchorX;
   weightSearchAnchorY = anchorY;
+  if (mode == WEIGHT_SEARCH_MODE_TEST) {
+    weightRouteResume = {};
+  }
   motorStopRequested = true;
   requestMotionStop();
   setWeightSearchPhase(alignToWaypoint ? WEIGHT_SEARCH_ALIGN_CENTER
@@ -210,6 +235,9 @@ static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
 }
 
 static void beginRouteWeightInterrupt(WeightSearchMode mode,
+                                      int routeIndex,
+                                      float segmentStartX,
+                                      float segmentStartY,
                                       float anchorX, float anchorY,
                                       const char* detail) {
   // Cancels the route-owned goal before beginning an opportunistic object
@@ -227,17 +255,33 @@ static void beginRouteWeightInterrupt(WeightSearchMode mode,
   weightSearchStatus.detail = detail;
   weightSearchAnchorX = anchorX;
   weightSearchAnchorY = anchorY;
+  const float segmentDx = anchorX - segmentStartX;
+  const float segmentDy = anchorY - segmentStartY;
+  const float segmentLength = hypotf(segmentDx, segmentDy);
+  const float along = segmentLength > 0.001f
+    ? ((robotX - segmentStartX) * segmentDx +
+       (robotY - segmentStartY) * segmentDy) / segmentLength
+    : 0.0f;
+  weightRouteResume = {
+    true, routeIndex, segmentStartX, segmentStartY,
+    anchorX, anchorY, constrain(along, 0.0f, segmentLength),
+    robotX, robotY, weightSearchTarget.trackId
+  };
   sendBluetoothEvent("weight_interrupt_start", detail);
   beginSearchTargetConfirm(detail, WEIGHT_SEARCH_IDLE);
 }
 
 static void lockSearchTarget(const char* detail) {
-  // Converts the current confirmed object target into a normal point goal.
-  // The navigation controller handles pickup carry-through for object-hunt
-  // owners.
+  // Starts the nonblocking matrix tracking goal with a latched track and the
+  // exact route context that must resume after the assumed funnel handoff.
   sendBluetoothEvent("weight_search_target_locked", detail);
-  if (!navigationGoToPickup(objectTargetEstimate.worldX,
-                            objectTargetEstimate.worldY)) {
+  if (!searchTargetVisible()) {
+    failWeightSearch("locked_target_not_fresh");
+    return;
+  }
+  weightRouteResume.trackId = weightSearchTarget.trackId;
+  if (!navigationStartPickupTracking(weightSearchTarget,
+                                     weightRouteResume)) {
     failWeightSearch("hunt_goal_rejected");
     return;
   }
@@ -253,11 +297,8 @@ static void beginSearchTargetConfirm(const char* detail,
   weightSearchConfirmResumePhase = resumePhase;
   weightSearchConfirmDetail = detail;
 
-  float rawTargetXmm = objectTargetEstimate.robotXmm - OBJECT_PICKUP_OVERSHOOT_MM;
-  if (rawTargetXmm < 50.0f) {
-    rawTargetXmm = objectTargetEstimate.robotXmm;
-  }
-  float targetBearingDeg = atan2f(objectTargetEstimate.robotYmm, rawTargetXmm) *
+  float targetBearingDeg = atan2f(weightSearchTarget.robotYmm,
+                                  weightSearchTarget.robotXmm) *
                            RAD_TO_DEG;
 
   if (fabs(targetBearingDeg) <= WEIGHT_SEARCH_CONFIRM_TURN_MIN_DEG) {
@@ -512,20 +553,29 @@ void updateWeightSearch() {
       break;
 
     case WEIGHT_SEARCH_HUNTING: {
-      float dx = robotX - weightSearchAnchorX;
-      float dy = robotY - weightSearchAnchorY;
-      float deviationM = sqrtf(dx * dx + dy * dy);
-      if (deviationM > WEIGHT_SEARCH_MAX_ROUTE_DEVIATION_M) {
-        navigationCancel();
-        failWeightSearch("max_route_deviation");
-        break;
+      MatrixTargetObservation latestTarget;
+      if (getMatrixTargetObservation(latestTarget) &&
+          latestTarget.trackId == weightSearchTarget.trackId) {
+        weightSearchTarget = latestTarget;
+        navigationUpdatePickupTracking(latestTarget);
       }
-      if (millis() - weightSearchHuntStartedMs > WEIGHT_SEARCH_HUNT_TIMEOUT_MS) {
+      PickupTrackingStatus pickup = navigationGetPickupTrackingStatus();
+      const bool handoffOrFeed =
+        pickup.phase == PICKUP_TRACKING_HANDOFF_ASSUMED ||
+        pickup.phase == PICKUP_TRACKING_FEEDING_UNCONFIRMED ||
+        pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED;
+      if (!handoffOrFeed &&
+          millis() - weightSearchHuntStartedMs > WEIGHT_SEARCH_HUNT_TIMEOUT_MS) {
         navigationCancel();
         failWeightSearch("hunt_timeout");
         break;
       }
       NavigationStatus navigation = navigationGetStatus();
+      if (pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED &&
+          navigation.state == NAVIGATION_RUNNING) {
+        completeWeightSearchRouteBlended(pickup.detail);
+        break;
+      }
       if (navigation.state == NAVIGATION_RUNNING) {
         break;
       }
@@ -534,11 +584,19 @@ void updateWeightSearch() {
           weightSearchMode == WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME
             ? "weight_interrupt_hunt_success"
             : "weight_search_hunt_success",
-          "object_hunt_complete");
+          pickup.detail);
         break;
       }
       if (navigation.state == NAVIGATION_FAILED) {
-        failWeightSearch("object_hunt_failed");
+        if (weightSearchMode == WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME) {
+          resumeInterruptedRoute("weight_interrupt_hunt_abandoned",
+                                 pickup.detail);
+        } else if (weightSearchMode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT) {
+          completeWeightSearch("weight_search_hunt_abandoned",
+                               pickup.detail);
+        } else {
+          failWeightSearch(pickup.detail);
+        }
       }
       break;
     }
@@ -585,7 +643,10 @@ bool startSearchWaypointApproach(float searchX, float searchY,
   return navigationGoTo(standoffX, standoffY);
 }
 
-bool tryStartRouteWeightInterrupt(float routeTargetX, float routeTargetY,
+bool tryStartRouteWeightInterrupt(int routeIndex,
+                                  float segmentStartX,
+                                  float segmentStartY,
+                                  float routeTargetX, float routeTargetY,
                                   bool currentActionIsSearch) {
   // Opportunistic route interrupt: if a confirmed object appears during a
   // route-owned navigation goal, pause the route and handle one target.
@@ -596,18 +657,39 @@ bool tryStartRouteWeightInterrupt(float routeTargetX, float routeTargetY,
     return false;
   }
 
-  WeightSearchMode mode = currentActionIsSearch
-    ? WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
-    : WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME;
-  beginRouteWeightInterrupt(mode, routeTargetX, routeTargetY,
-                            mode == WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT
-                              ? "search_waypoint_interrupt"
+  WeightSearchMode mode = WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME;
+  const float targetCrossTrackM = fabs(
+    (weightSearchTarget.worldX - segmentStartX) *
+      (routeTargetY - segmentStartY) -
+    (weightSearchTarget.worldY - segmentStartY) *
+      (routeTargetX - segmentStartX)) /
+    max(0.001f, hypotf(routeTargetX - segmentStartX,
+                       routeTargetY - segmentStartY));
+  const float interceptDistanceM = hypotf(
+    weightSearchTarget.worldX - robotX,
+    weightSearchTarget.worldY - robotY);
+  if (targetCrossTrackM > WEIGHT_INTERRUPT_MAX_CROSSTRACK_M ||
+      interceptDistanceM * 2.0f > WEIGHT_INTERRUPT_MAX_ADDED_DISTANCE_M) {
+    return false;
+  }
+  beginRouteWeightInterrupt(mode, routeIndex,
+                            segmentStartX, segmentStartY,
+                            routeTargetX, routeTargetY,
+                            currentActionIsSearch
+                              ? "search_waypoint_enroute_interrupt"
                               : "route_interrupt");
   return true;
 }
 
 void beginWaypointWeightSearch(float searchX, float searchY,
+                               int resumeRouteIndex,
+                               bool resumeValid,
+                               float resumeX, float resumeY,
                                const char* detail) {
+  weightRouteResume = {
+    resumeValid, resumeRouteIndex, searchX, searchY,
+    resumeX, resumeY, 0.0f, robotX, robotY, 0
+  };
   beginWeightSearch(WEIGHT_SEARCH_MODE_SEARCH_WAYPOINT, true,
                     searchX, searchY, detail);
 }

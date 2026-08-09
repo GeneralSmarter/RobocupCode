@@ -73,8 +73,12 @@ static bool consumeFinishedWeightSearch() {
     return false;
   }
 
-  navigationClearResult();
-  routeGoalPending = false;
+  const bool routeAlreadyRunning =
+    navigationGetStatus().state == NAVIGATION_RUNNING;
+  if (!routeAlreadyRunning) {
+    navigationClearResult();
+    routeGoalPending = false;
+  }
   if (search.result == WEIGHT_SEARCH_RESULT_FAILED) {
     clearWeightSearchResult();
     setRobotState(END_MATCH);
@@ -89,6 +93,11 @@ static bool consumeFinishedWeightSearch() {
 
   if (search.origin == WEIGHT_SEARCH_ORIGIN_WAYPOINT) {
     currentRouteIndex++;
+  }
+  if (routeAlreadyRunning) {
+    routeGoalPending = true;
+    clearWeightSearchResult();
+    return true;
   }
   routePauseUntilMs = millis() + WAYPOINT_ACTION_PAUSE_MS;
   clearWeightSearchResult();
@@ -110,6 +119,9 @@ void updateRouteMission() {
   if (navigation.state == NAVIGATION_RUNNING) {
     if (routeGoalPending && currentRouteIndex < ROUTE_POINT_COUNT &&
         tryStartRouteWeightInterrupt(
+          currentRouteIndex,
+          currentRouteIndex > 0 ? ROUTE[currentRouteIndex - 1].x : robotX,
+          currentRouteIndex > 0 ? ROUTE[currentRouteIndex - 1].y : robotY,
           ROUTE[currentRouteIndex].x,
           ROUTE[currentRouteIndex].y,
           currentActionIsSearch())) {
@@ -129,7 +141,13 @@ void updateRouteMission() {
     navigationClearResult();
     routeGoalPending = false;
     if (waypoint.action == MISSION_ACTION_SEARCH) {
-      beginWaypointWeightSearch(waypoint.x, waypoint.y,
+      const bool resumeValid = currentRouteIndex + 1 < ROUTE_POINT_COUNT;
+      beginWaypointWeightSearch(
+                                waypoint.x, waypoint.y,
+                                currentRouteIndex + 1,
+                                resumeValid,
+                                resumeValid ? ROUTE[currentRouteIndex + 1].x : 0.0f,
+                                resumeValid ? ROUTE[currentRouteIndex + 1].y : 0.0f,
                                 missionActionName(waypoint.action));
       return;
     }
@@ -172,4 +190,3 @@ void updateRouteMission() {
 
   routeGoalPending = navigationGoTo(waypoint.x, waypoint.y);
 }
-
