@@ -65,6 +65,9 @@ struct PickupTrackingRuntime {
   float feedLastY;
   float captureHeadingDeg;
   unsigned long phaseStartedMs;
+  uint32_t lastPayloadSequence;
+  uint8_t payloadNearSampleCount;
+  bool payloadConfirmationWindowOpen;
 };
 
 // Mutable goal storage and lifecycle helpers are private to navigation.
@@ -83,5 +86,23 @@ void clearNavigationGoalResult();
 bool setEmergencyScanPolicyEnabled(bool enabled);
 bool isEmergencyScanPolicyEnabled();
 void clearLocalMap();
+
+enum SafePivotStepResult {
+  SAFE_PIVOT_STEP_PUBLISHED,
+  SAFE_PIVOT_STEP_REVALIDATING,
+  SAFE_PIVOT_STEP_SIDE_INVALID,
+  SAFE_PIVOT_STEP_SWEEP_INVALID,
+  SAFE_PIVOT_STEP_SWEEP_BLOCKED,
+  SAFE_PIVOT_STEP_STUCK,
+  SAFE_PIVOT_STEP_PUBLICATION_VETOED
+};
+
+bool publishNavigationMotion(float forwardSpeed, float turnSpeed);
+void finishNavigationGoal(bool success, PlannerStopReason reason,
+                          const char* detail);
+SafePivotStepResult commandSafePivotStep(
+  float turnTarget, const char* motionPlanReason,
+  const char* sideRevalidatePlanReason,
+  const char* sweepRevalidatePlanReason);
 
 #endif

@@ -1,6 +1,7 @@
 ﻿#include "../../Robot.h"
 #include "NavigationInternal.h"
 #include "NavigationRuntime.h"
+#include "PlannerEpochLifecycle.h"
 
 // =====================================================
 // Navigation goal lifecycle and local-planner orchestration
@@ -33,7 +34,6 @@
 #include "PlannerContext.h"
 #include "PlannerCollision.h"
 #include "ForwardTrajectoryPlanner.h"
-#include "NavigationControllerInternal.h"
 #include "PlannerMap.h"
 #include "PlannerProgress.h"
 #include "PlannerDebug.h"
@@ -82,10 +82,7 @@ void resetReversePlannerEpoch() {
 void closePlannerEpoch() {
   // Marks the current epoch complete and records its age for telemetry. The
   // chosen command, if any, has already been published before this is called.
-  plannerContext.plannerEpoch.active = false;
-  plannerContext.plannerEpoch.awaitingRevalidation = false;
-  plannerTelemetry.plannerEpochActive = false;
-  plannerTelemetry.plannerEpochAgeMs = millis() - plannerContext.plannerEpoch.startedMs;
+  closePlannerEpochState(plannerContext.plannerEpoch);
 }
 
 void resetGeometricNoPathEvidence() {
@@ -190,7 +187,9 @@ static bool obstacleProgressStalled(float localGoalX, float localGoalY,
 static void transitionPickupToSavedRoute(PickupTrackingOutcome outcome,
                                          const char* detail) {
   pickupTrackingRuntime.status.phase =
-    PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED;
+    outcome == PICKUP_OUTCOME_FEED_COMPLETE_CONFIRMED
+      ? PICKUP_TRACKING_FEED_COMPLETE_CONFIRMED
+      : PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED;
   pickupTrackingRuntime.status.outcome = outcome;
   pickupTrackingRuntime.status.remainingFeedMm = 0.0f;
   pickupTrackingRuntime.status.detail = detail;
@@ -218,6 +217,42 @@ static void transitionPickupToSavedRoute(PickupTrackingOutcome outcome,
   plannerTelemetry.planReason = "pickup_feed_route_resume";
   plannerTelemetry.replanReason = detail;
   plannerTelemetry.safeStopReason = "";
+}
+
+static void updatePayloadConfirmation() {
+  PickupTrackingRuntime &runtime = pickupTrackingRuntime;
+  if (!runtime.payloadConfirmationWindowOpen) return;
+
+  PayloadTofObservation observation;
+  const bool current = getPayloadTofObservation(observation);
+  if (observation.sequence <= runtime.lastPayloadSequence) {
+    if (!current) {
+      runtime.status.payloadEvidence = PAYLOAD_UNKNOWN;
+      runtime.payloadNearSampleCount = 0;
+    }
+    return;
+  }
+  runtime.lastPayloadSequence = observation.sequence;
+
+  if (!current ||
+      observation.distanceMm > PAYLOAD_TOF_CONFIG.confirmationMaximumMm) {
+    runtime.status.payloadEvidence = PAYLOAD_UNKNOWN;
+    runtime.payloadNearSampleCount = 0;
+    return;
+  }
+
+  if (runtime.status.payloadEvidence == PAYLOAD_PRESENT_UNCLASSIFIED) return;
+  if (runtime.payloadNearSampleCount < 255) {
+    runtime.payloadNearSampleCount++;
+  }
+  if (runtime.payloadNearSampleCount == 1) {
+    runtime.status.payloadEvidence = PAYLOAD_CAPTURE_ENTRY_SEEN;
+    sendBluetoothEvent("payload_entry_seen", "bottom_tof_near");
+  }
+  if (runtime.payloadNearSampleCount >= PAYLOAD_TOF_CONFIRM_SAMPLES) {
+    runtime.status.payloadEvidence = PAYLOAD_PRESENT_UNCLASSIFIED;
+    sendBluetoothEvent("payload_confirmed", "present_unclassified");
+  }
 }
 
 static void failPickupTracking(PickupTrackingOutcome outcome,
@@ -249,6 +284,7 @@ void updatePickupTrackingGoal() {
 
   if (runtime.status.phase == PICKUP_TRACKING_FEEDING_UNCONFIRMED ||
       runtime.status.phase == PICKUP_TRACKING_HANDOFF_ASSUMED) {
+    updatePayloadConfirmation();
     const float captureHeadingRad = runtime.captureHeadingDeg * DEG_TO_RAD;
     const float stepX = robotX - runtime.feedLastX;
     const float stepY = robotY - runtime.feedLastY;
@@ -263,9 +299,13 @@ void updatePickupTrackingGoal() {
       0.0f, PICKUP_MIN_FORWARD_FEED_DISTANCE_MM - runtime.feedProgressMm);
 
     if (runtime.feedProgressMm >= PICKUP_MIN_FORWARD_FEED_DISTANCE_MM) {
+      const bool payloadConfirmed = runtime.status.payloadEvidence ==
+        PAYLOAD_PRESENT_UNCLASSIFIED;
       transitionPickupToSavedRoute(
-        PICKUP_OUTCOME_FEED_COMPLETE_UNCONFIRMED,
-        "feed_distance_complete_unconfirmed");
+        payloadConfirmed ? PICKUP_OUTCOME_FEED_COMPLETE_CONFIRMED
+                         : PICKUP_OUTCOME_FEED_COMPLETE_UNCONFIRMED,
+        payloadConfirmed ? "feed_distance_complete_payload_present"
+                         : "feed_distance_complete_unconfirmed");
       return;
     }
     if (now - runtime.phaseStartedMs > PICKUP_FEED_TIMEOUT_MS) {
@@ -291,7 +331,6 @@ void updatePickupTrackingGoal() {
     plannerTelemetry.planReason = "pickup_feeding_unconfirmed";
     if (!pickupTrajectoryCommandSafe(
           WEIGHT_HUNT_MAX_SPEED_TPS, turn, runtime.observation)) {
-      motorStopRequested = true;
       requestMotionStop();
       plannerTelemetry.replanReason = "pickup_feed_corridor_veto";
       return;
@@ -388,6 +427,12 @@ void updatePickupTrackingGoal() {
     runtime.feedLastY = robotY;
     runtime.captureHeadingDeg = navigationHeadingDeg();
     runtime.phaseStartedMs = now;
+    PayloadTofObservation payloadSnapshot;
+    getPayloadTofObservation(payloadSnapshot);
+    runtime.lastPayloadSequence = payloadSnapshot.sequence;
+    runtime.payloadNearSampleCount = 0;
+    runtime.payloadConfirmationWindowOpen = true;
+    runtime.status.payloadEvidence = PAYLOAD_UNKNOWN;
     sendBluetoothEvent("weight_funnel_handoff_assumed",
                        "matrix_30mm_no_payload_confirmation");
   }
@@ -416,7 +461,6 @@ SafePivotStepResult commandSafePivotStep(
       sendBluetoothEvent("turn_side_revalidate",
                          "motors_stopped_for_fresh_sample");
     }
-    motorStopRequested = true;
     requestMotionStop();
     if (now - plannerContext.turnSideInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
       plannerTelemetry.planReason = sideRevalidatePlanReason;
@@ -433,7 +477,6 @@ SafePivotStepResult commandSafePivotStep(
       sendBluetoothEvent("turn_sweep_revalidate",
                          "motors_stopped_for_fresh_sample");
     }
-    motorStopRequested = true;
     requestMotionStop();
     if (now - plannerContext.turnSweepInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
       plannerTelemetry.planReason = sweepRevalidatePlanReason;
@@ -507,7 +550,6 @@ static bool commandPointAlignmentTurn(float headingErrorDeg) {
       plannerContext.turnSideInvalidSinceMs = now;
       sendBluetoothEvent("turn_side_revalidate", "point_align_sensor_recheck");
     }
-    motorStopRequested = true;
     requestMotionStop();
     if (now - plannerContext.turnSideInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
       plannerTelemetry.planReason = "point_align_side_revalidating";
@@ -524,7 +566,6 @@ static bool commandPointAlignmentTurn(float headingErrorDeg) {
       plannerContext.turnSweepInvalidSinceMs = now;
       sendBluetoothEvent("turn_sweep_revalidate", "point_align_sensor_recheck");
     }
-    motorStopRequested = true;
     requestMotionStop();
     if (now - plannerContext.turnSweepInvalidSinceMs < PLANNER_TURN_SENSOR_REVALIDATE_MS) {
       plannerTelemetry.planReason = "point_align_sweep_revalidating";
@@ -591,7 +632,6 @@ static void updatePointGoal() {
     if (plannerContext.frontInvalidSinceMs == 0) {
       plannerContext.frontInvalidSinceMs = now;
     }
-    motorStopRequested = true;
     requestMotionStop();
     plannerTelemetry.stopReason = PLANNER_STOP_FRONT_INVALID;
     plannerTelemetry.safeStopReason = "front_sensor_invalid";
@@ -721,7 +761,6 @@ static void updatePointGoal() {
   float localGoalY = 0.0f;
   if (avoidanceActive) {
     if (!buildObstacleLocalGoal(localGoalX, localGoalY)) {
-      motorStopRequested = true;
       requestMotionStop();
       resetPlannerEpoch();
       plannerContext.lastForwardNoPathWasGeometric = true;
@@ -775,7 +814,6 @@ static void updatePointGoal() {
   }
   if (avoidanceActive &&
       obstacleProgressStalled(localGoalX, localGoalY, localGoalDistanceM)) {
-    motorStopRequested = true;
     requestMotionStop();
     if (canStartSafeReverse()) {
       startEvidenceDrivenReverse("obstacle_local_goal_stalled");
@@ -824,7 +862,6 @@ static void updatePointGoal() {
     return;
   }
 
-  motorStopRequested = true;
   requestMotionStop();
   reportPlannerStopIfChanged();
   if (!currentPlannerFailureIsGeometricNoPath()) {
@@ -1031,7 +1068,6 @@ void updateNavigationRuntime() {
       // ToF/I2C failure mode. Pause for one confirmation sample; do not map it
       // as a wall unless the sensor repeats it.
       immediateSafetyStop = true;
-      motorStopRequested = true;
       requestMotionStop();
       plannerTelemetry.stopReason = PLANNER_STOP_NONE;
       plannerTelemetry.safeStopReason = "tof_close_revalidating";
@@ -1041,7 +1077,6 @@ void updateNavigationRuntime() {
     if (!immediateSafetyStop && navigationGoal.active &&
         isRangeSensorBlocked(RANGE_FRONT)) {
       immediateSafetyStop = true;
-      motorStopRequested = true;
       requestMotionStop();
       plannerTelemetry.stopReason = PLANNER_STOP_FRONT_BLOCKED;
       plannerTelemetry.safeStopReason = "front_blocked";
@@ -1064,7 +1099,6 @@ void updateNavigationRuntime() {
       // clearance rather than turn radius, so it can stop an imminent clip
       // without wrongly forbidding a pre-aligned narrow straight passage.
       immediateSafetyStop = true;
-      motorStopRequested = true;
       requestMotionStop();
       plannerTelemetry.stopReason = PLANNER_STOP_NO_SAFE_TRAJECTORY;
       plannerTelemetry.safeStopReason = "diagonal_clearance";

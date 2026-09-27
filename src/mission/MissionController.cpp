@@ -20,6 +20,7 @@
 
 static bool endMatchSafetyTransitionActive = false;
 static bool returnHomeGoalPending = false;
+static unsigned long returnHomeRetryAfterMs = 0;
 
 void updateMissionController() {
   // Dispatches only implemented mission states. Obstacle avoidance and
@@ -47,6 +48,7 @@ void runInitState() {
   motorStopRequested = true;
   initializeRouteMission();
   returnHomeGoalPending = false;
+  returnHomeRetryAfterMs = 0;
   endMatchPrinted = false;
   navigationClearResult();
 
@@ -73,8 +75,8 @@ void runFollowPathState() {
 
 void runReturnHomeState() {
   // Assigns a single navigation point goal at world origin and waits for its
-  // result. Failure remains visible rather than starting an unproven mission
-  // recovery.
+  // result. Normal mode leaves failure visible and neutral; competition mode
+  // resubmits the same goal after a neutral handoff.
   NavigationStatus navigation = navigationGetStatus();
   if (!returnHomeGoalPending && navigation.state == NAVIGATION_IDLE) {
     Serial.println(
@@ -83,17 +85,40 @@ void runReturnHomeState() {
     return;
   }
 
+  if (returnHomeGoalPending && navigation.state == NAVIGATION_FAILED) {
+    if (!isCompetitionModeEnabled()) {
+      // Preserve the typed failure and neutral output for normal operation.
+      return;
+    }
+    const unsigned long now = millis();
+    if (returnHomeRetryAfterMs == 0) {
+      returnHomeRetryAfterMs = now + COMPETITION_RETRY_PAUSE_MS;
+      requestMotionStop();
+      sendBluetoothEvent("competition_home_retry_wait", navigation.detail);
+      return;
+    }
+    if (now < returnHomeRetryAfterMs) {
+      requestMotionStop();
+      return;
+    }
+    navigationClearResult();
+    returnHomeGoalPending = false;
+    returnHomeRetryAfterMs = 0;
+    sendBluetoothEvent("competition_home_retry", "navigation_failed");
+    return;
+  }
+
   if (returnHomeGoalPending && navigation.state == NAVIGATION_REACHED) {
     Serial.println("RETURN_HOME complete.");
     navigationClearResult();
     returnHomeGoalPending = false;
+    returnHomeRetryAfterMs = 0;
     setRobotState(END_MATCH);
   }
 }
 
 void runEndMatchState() {
   // END_MATCH is the normal stopped terminal state.
-  motorStopRequested = true;
   requestMotionStop();
   robotRunEnabled = false;
 

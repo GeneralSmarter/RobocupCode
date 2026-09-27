@@ -108,7 +108,6 @@ void loop() {
   } else if (robotRunEnabled && !isManualDriveActive()) {
     updateMissionController();
   } else if (!isManualDriveActive()) {
-    motorStopRequested = true;
     requestMotionStop();
   }
   recordMainLoopPhaseDuration("state_machine", phaseStartedUs);

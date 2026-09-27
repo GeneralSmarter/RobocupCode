@@ -22,20 +22,38 @@
 enum WeightSearchPhase {
   WEIGHT_SEARCH_IDLE,
   WEIGHT_SEARCH_ALIGN_CENTER,
-  WEIGHT_SEARCH_SETTLE_CENTER,
-  WEIGHT_SEARCH_CHECK_CENTER,
-  WEIGHT_SEARCH_TURN_LEFT,
-  WEIGHT_SEARCH_SETTLE_LEFT,
-  WEIGHT_SEARCH_CHECK_LEFT,
-  WEIGHT_SEARCH_TURN_RIGHT,
-  WEIGHT_SEARCH_SETTLE_RIGHT,
-  WEIGHT_SEARCH_CHECK_RIGHT,
-  WEIGHT_SEARCH_RETURN_CENTER,
+  // One turn/settle/check triplet walks the sweep table below, replacing the
+  // four hand-written copies this machine used to carry.
+  WEIGHT_SEARCH_SWEEP_TURN,
+  WEIGHT_SEARCH_SWEEP_SETTLE,
+  WEIGHT_SEARCH_SWEEP_CHECK,
   WEIGHT_SEARCH_CONFIRM_TURN,
   WEIGHT_SEARCH_SETTLE_CONFIRM,
   WEIGHT_SEARCH_CHECK_CONFIRM,
   WEIGHT_SEARCH_HUNTING
 };
+
+// The scan pattern as data. Each stop is the relative turn that reaches it and
+// the telemetry label used for its target-check window; a null label marks the
+// closing return-to-centre, which is travelled but not searched.
+struct WeightSearchSweepStop {
+  float turnDeg;
+  const char* label;
+};
+
+static const WeightSearchSweepStop WEIGHT_SEARCH_SWEEP[] = {
+  {0.0f, "center"},
+  {WEIGHT_SEARCH_SWEEP_DEG, "left"},
+  {-2.0f * WEIGHT_SEARCH_SWEEP_DEG, "right"},
+  {WEIGHT_SEARCH_SWEEP_DEG, nullptr},
+};
+
+static const int WEIGHT_SEARCH_SWEEP_COUNT =
+  (int)(sizeof(WEIGHT_SEARCH_SWEEP) / sizeof(WEIGHT_SEARCH_SWEEP[0]));
+
+// Sentinel for weightSearchConfirmResumeIndex: this confirm came from a route
+// interrupt rather than a sweep stop, so a failed confirm resumes the route.
+static const int WEIGHT_SEARCH_RESUME_ROUTE = -1;
 
 enum WeightSearchMode {
   WEIGHT_SEARCH_MODE_NONE,
@@ -52,7 +70,8 @@ static unsigned long weightInterruptLastMs = 0;
 static bool weightSearchTurnStarted = false;
 static float weightSearchAnchorX = 0.0;
 static float weightSearchAnchorY = 0.0;
-static WeightSearchPhase weightSearchConfirmResumePhase = WEIGHT_SEARCH_IDLE;
+static int weightSearchSweepIndex = 0;
+static int weightSearchConfirmResumeIndex = WEIGHT_SEARCH_RESUME_ROUTE;
 static const char* weightSearchConfirmDetail = "confirm";
 static MatrixTargetObservation weightSearchTarget = {};
 static RouteResumeContext weightRouteResume = {};
@@ -83,6 +102,8 @@ void initializeWeightSearch() {
   weightSearchHuntStartedMs = 0;
   weightInterruptLastMs = 0;
   weightSearchTurnStarted = false;
+  weightSearchSweepIndex = 0;
+  weightSearchConfirmResumeIndex = WEIGHT_SEARCH_RESUME_ROUTE;
   weightSearchTarget = {};
   weightRouteResume = {};
   weightSearchStatus = {
@@ -122,7 +143,6 @@ static void resumeInterruptedRoute(const char* eventName, const char* detail) {
   };
   clearWeightSearchState();
   weightInterruptLastMs = millis();
-  motorStopRequested = true;
   requestMotionStop();
   navigationClearResult();
   sendBluetoothEvent("weight_interrupt_resume_route", detail);
@@ -149,7 +169,6 @@ static void completeWeightSearch(const char* eventName, const char* detail) {
     weightInterruptLastMs = millis();
     sendBluetoothEvent("weight_interrupt_resume_route", detail);
   }
-  motorStopRequested = true;
   requestMotionStop();
   navigationClearResult();
 }
@@ -184,7 +203,6 @@ static void failWeightSearch(const char* detail) {
     detail
   };
   clearWeightSearchState();
-  motorStopRequested = true;
   requestMotionStop();
   navigationClearResult();
 }
@@ -205,8 +223,7 @@ static bool weightInterruptCooldownActive() {
          millis() - weightInterruptLastMs < WEIGHT_INTERRUPT_COOLDOWN_MS;
 }
 
-static void beginSearchTargetConfirm(const char* detail,
-                                     WeightSearchPhase resumePhase);
+static void beginSearchTargetConfirm(const char* detail, int resumeIndex);
 
 static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
                               float anchorX, float anchorY,
@@ -228,10 +245,10 @@ static void beginWeightSearch(WeightSearchMode mode, bool alignToWaypoint,
   if (mode == WEIGHT_SEARCH_MODE_TEST) {
     weightRouteResume = {};
   }
-  motorStopRequested = true;
   requestMotionStop();
+  weightSearchSweepIndex = 0;
   setWeightSearchPhase(alignToWaypoint ? WEIGHT_SEARCH_ALIGN_CENTER
-                                        : WEIGHT_SEARCH_SETTLE_CENTER);
+                                        : WEIGHT_SEARCH_SWEEP_TURN);
 }
 
 static void beginRouteWeightInterrupt(WeightSearchMode mode,
@@ -268,7 +285,7 @@ static void beginRouteWeightInterrupt(WeightSearchMode mode,
     robotX, robotY, weightSearchTarget.trackId
   };
   sendBluetoothEvent("weight_interrupt_start", detail);
-  beginSearchTargetConfirm(detail, WEIGHT_SEARCH_IDLE);
+  beginSearchTargetConfirm(detail, WEIGHT_SEARCH_RESUME_ROUTE);
 }
 
 static void lockSearchTarget(const char* detail) {
@@ -289,12 +306,11 @@ static void lockSearchTarget(const char* detail) {
   setWeightSearchPhase(WEIGHT_SEARCH_HUNTING);
 }
 
-static void beginSearchTargetConfirm(const char* detail,
-                                     WeightSearchPhase resumePhase) {
+static void beginSearchTargetConfirm(const char* detail, int resumeIndex) {
   // If the detected object is not centered, turn toward its estimated bearing
   // before locking the hunt target. The turn angle is clamped so a noisy target
   // estimate cannot demand a large spin.
-  weightSearchConfirmResumePhase = resumePhase;
+  weightSearchConfirmResumeIndex = resumeIndex;
   weightSearchConfirmDetail = detail;
 
   float targetBearingDeg = atan2f(weightSearchTarget.robotYmm,
@@ -319,11 +335,10 @@ static void beginSearchTargetConfirm(const char* detail,
   setWeightSearchPhase(WEIGHT_SEARCH_CONFIRM_TURN);
 }
 
-static bool checkSearchTargetWindow(const char* detail,
-                                    WeightSearchPhase resumePhase) {
+static bool checkSearchTargetWindow(const char* detail, int resumeIndex) {
   sendBluetoothEvent("weight_search_check", detail);
   if (searchTargetVisible()) {
-    beginSearchTargetConfirm(detail, resumePhase);
+    beginSearchTargetConfirm(detail, resumeIndex);
     return false;
   }
   return millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_CONFIRM_MS;
@@ -346,7 +361,6 @@ void cancelWeightSearch(const char* detail) {
   weightSearchStatus.result = WEIGHT_SEARCH_RESULT_FAILED;
   weightSearchStatus.detail = detail;
   clearWeightSearchState();
-  motorStopRequested = true;
   requestMotionStop();
   navigationClearResult();
   sendBluetoothEvent("weight_search_hunt_failed", detail);
@@ -389,14 +403,14 @@ static void updateWeightSearchAlignment() {
   float dx = weightSearchAnchorX - robotX;
   float dy = weightSearchAnchorY - robotY;
   if (sqrtf(dx * dx + dy * dy) <= 0.001f) {
-    setWeightSearchPhase(WEIGHT_SEARCH_SETTLE_CENTER);
+    setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_TURN);
     return;
   }
 
   float targetHeadingDeg = atan2f(dy, dx) * RAD_TO_DEG;
   float relativeTurnDeg = wrapAngle(targetHeadingDeg - navigationHeadingDeg());
   if (fabs(relativeTurnDeg) <= TURN_TOLERANCE_DEG) {
-    setWeightSearchPhase(WEIGHT_SEARCH_SETTLE_CENTER);
+    setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_TURN);
     return;
   }
 
@@ -418,7 +432,7 @@ static void updateWeightSearchAlignment() {
 
   if (navigation.state == NAVIGATION_REACHED) {
     navigationClearResult();
-    setWeightSearchPhase(WEIGHT_SEARCH_SETTLE_CENTER);
+    setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_TURN);
     return;
   }
 
@@ -437,68 +451,51 @@ void updateWeightSearch() {
       updateWeightSearchAlignment();
       break;
 
-    case WEIGHT_SEARCH_SETTLE_CENTER:
-      motorStopRequested = true;
+    case WEIGHT_SEARCH_SWEEP_TURN: {
+      const WeightSearchSweepStop &stop =
+        WEIGHT_SEARCH_SWEEP[weightSearchSweepIndex];
+      if (stop.label == nullptr) {
+        // Closing leg: travel back to centre, then report no target found.
+        if (updateWeightSearchTurn(stop.turnDeg, WEIGHT_SEARCH_IDLE) &&
+            weightSearchPhase == WEIGHT_SEARCH_IDLE) {
+          completeWeightSearch("weight_search_no_target", "sweep_complete");
+        }
+      } else if (stop.turnDeg == 0.0f) {
+        // The first stop is the pose the scan already starts from.
+        setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_SETTLE);
+      } else {
+        updateWeightSearchTurn(stop.turnDeg, WEIGHT_SEARCH_SWEEP_SETTLE);
+      }
+      break;
+    }
+
+    case WEIGHT_SEARCH_SWEEP_SETTLE:
       requestMotionStop();
       if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
-        setWeightSearchPhase(WEIGHT_SEARCH_CHECK_CENTER);
+        setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_CHECK);
       }
       break;
 
-    case WEIGHT_SEARCH_CHECK_CENTER:
-      if (checkSearchTargetWindow("center", WEIGHT_SEARCH_TURN_LEFT)) {
+    case WEIGHT_SEARCH_SWEEP_CHECK: {
+      const int nextIndex = weightSearchSweepIndex + 1;
+      if (checkSearchTargetWindow(
+            WEIGHT_SEARCH_SWEEP[weightSearchSweepIndex].label, nextIndex)) {
+        // checkSearchTargetWindow() can latch a target and jump straight to
+        // HUNTING; only advance the sweep when it has not.
         if (weightSearchPhase != WEIGHT_SEARCH_HUNTING) {
-          setWeightSearchPhase(WEIGHT_SEARCH_TURN_LEFT);
+          if (nextIndex < WEIGHT_SEARCH_SWEEP_COUNT) {
+            weightSearchSweepIndex = nextIndex;
+            setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_TURN);
+          } else {
+            // Unreachable with the current table, whose last stop is the
+            // unsearched return leg. Kept so a table edit that ends on a
+            // searched stop finishes the scan instead of stalling here.
+            completeWeightSearch("weight_search_no_target", "sweep_complete");
+          }
         }
       }
       break;
-
-    case WEIGHT_SEARCH_TURN_LEFT:
-      updateWeightSearchTurn(WEIGHT_SEARCH_SWEEP_DEG, WEIGHT_SEARCH_SETTLE_LEFT);
-      break;
-
-    case WEIGHT_SEARCH_SETTLE_LEFT:
-      motorStopRequested = true;
-      requestMotionStop();
-      if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
-        setWeightSearchPhase(WEIGHT_SEARCH_CHECK_LEFT);
-      }
-      break;
-
-    case WEIGHT_SEARCH_CHECK_LEFT:
-      if (checkSearchTargetWindow("left", WEIGHT_SEARCH_TURN_RIGHT)) {
-        if (weightSearchPhase != WEIGHT_SEARCH_HUNTING) {
-          setWeightSearchPhase(WEIGHT_SEARCH_TURN_RIGHT);
-        }
-      }
-      break;
-
-    case WEIGHT_SEARCH_TURN_RIGHT:
-      updateWeightSearchTurn(-2.0 * WEIGHT_SEARCH_SWEEP_DEG, WEIGHT_SEARCH_SETTLE_RIGHT);
-      break;
-
-    case WEIGHT_SEARCH_SETTLE_RIGHT:
-      motorStopRequested = true;
-      requestMotionStop();
-      if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
-        setWeightSearchPhase(WEIGHT_SEARCH_CHECK_RIGHT);
-      }
-      break;
-
-    case WEIGHT_SEARCH_CHECK_RIGHT:
-      if (checkSearchTargetWindow("right", WEIGHT_SEARCH_RETURN_CENTER)) {
-        if (weightSearchPhase != WEIGHT_SEARCH_HUNTING) {
-          setWeightSearchPhase(WEIGHT_SEARCH_RETURN_CENTER);
-        }
-      }
-      break;
-
-    case WEIGHT_SEARCH_RETURN_CENTER:
-      if (updateWeightSearchTurn(WEIGHT_SEARCH_SWEEP_DEG, WEIGHT_SEARCH_IDLE) &&
-          weightSearchPhase == WEIGHT_SEARCH_IDLE) {
-        completeWeightSearch("weight_search_no_target", "sweep_complete");
-      }
-      break;
+    }
 
     case WEIGHT_SEARCH_CONFIRM_TURN:
       if (navigationGetStatus().state == NAVIGATION_RUNNING) {
@@ -511,7 +508,7 @@ void updateWeightSearch() {
       }
       if (navigationGetStatus().state == NAVIGATION_FAILED) {
         navigationClearResult();
-        if (weightSearchConfirmResumePhase == WEIGHT_SEARCH_IDLE) {
+        if (weightSearchConfirmResumeIndex == WEIGHT_SEARCH_RESUME_ROUTE) {
           if (weightSearchMode == WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME) {
             resumeInterruptedRoute("weight_interrupt_confirm_lost", "confirm_turn_failed");
           } else {
@@ -520,12 +517,12 @@ void updateWeightSearch() {
           break;
         }
         sendBluetoothEvent("weight_search_scan_skipped", "confirm_turn_failed");
-        setWeightSearchPhase(weightSearchConfirmResumePhase);
+        weightSearchSweepIndex = weightSearchConfirmResumeIndex;
+        setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_TURN);
       }
       break;
 
     case WEIGHT_SEARCH_SETTLE_CONFIRM:
-      motorStopRequested = true;
       requestMotionStop();
       if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_SETTLE_MS) {
         setWeightSearchPhase(WEIGHT_SEARCH_CHECK_CONFIRM);
@@ -539,7 +536,7 @@ void updateWeightSearch() {
         break;
       }
       if (millis() - weightSearchPhaseStartedMs >= WEIGHT_SEARCH_CONFIRM_MS) {
-        if (weightSearchConfirmResumePhase == WEIGHT_SEARCH_IDLE) {
+        if (weightSearchConfirmResumeIndex == WEIGHT_SEARCH_RESUME_ROUTE) {
           if (weightSearchMode == WEIGHT_SEARCH_MODE_ROUTE_INTERRUPT_RESUME) {
             resumeInterruptedRoute("weight_interrupt_confirm_lost", "confirm_lost");
           } else {
@@ -548,7 +545,8 @@ void updateWeightSearch() {
           break;
         }
         sendBluetoothEvent("weight_search_no_target", "confirm_lost");
-        setWeightSearchPhase(weightSearchConfirmResumePhase);
+        weightSearchSweepIndex = weightSearchConfirmResumeIndex;
+        setWeightSearchPhase(WEIGHT_SEARCH_SWEEP_TURN);
       }
       break;
 
@@ -563,7 +561,8 @@ void updateWeightSearch() {
       const bool handoffOrFeed =
         pickup.phase == PICKUP_TRACKING_HANDOFF_ASSUMED ||
         pickup.phase == PICKUP_TRACKING_FEEDING_UNCONFIRMED ||
-        pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED;
+        pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED ||
+        pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_CONFIRMED;
       if (!handoffOrFeed &&
           millis() - weightSearchHuntStartedMs > WEIGHT_SEARCH_HUNT_TIMEOUT_MS) {
         navigationCancel();
@@ -571,7 +570,8 @@ void updateWeightSearch() {
         break;
       }
       NavigationStatus navigation = navigationGetStatus();
-      if (pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED &&
+      if ((pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED ||
+           pickup.phase == PICKUP_TRACKING_FEED_COMPLETE_CONFIRMED) &&
           navigation.state == NAVIGATION_RUNNING) {
         completeWeightSearchRouteBlended(pickup.detail);
         break;

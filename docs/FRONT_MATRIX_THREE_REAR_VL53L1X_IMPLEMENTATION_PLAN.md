@@ -1,8 +1,11 @@
 # Front Matrix and Three-Rear-VL53L1X Implementation Plan
 
-Status: proposed sensor-migration and hunt plan. The simulator already contains
-partial upper-sensor height-filtering work, but this sensor migration and hunt
-firmware have not been implemented or physically validated.
+Status: completed implementation plan retained as context. The migration and
+hunt firmware described here were implemented; see
+`FRONT_MATRIX_THREE_REAR_IMPLEMENTATION_STATUS.md` and current source. The
+operator later reported that the current robot has been run physically and
+works. Statements below are preserved as the plan and evidence requirements at
+the time, not as an active backlog or a claim about current physical status.
 
 ## 1. Outcome
 

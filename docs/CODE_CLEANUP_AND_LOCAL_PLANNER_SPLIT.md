@@ -1,5 +1,10 @@
 # Code Cleanup Record and Local Planner Split Plan
 
+> **Completed implementation record.** The plan below explains the cleanup and
+> split that produced the current modular navigation architecture. Its proposed
+> follow-ups are context only and must not be treated as current priorities.
+> See `../../HANDOFF.md` for current authority.
+
 Generated 2026-07-29 as a read-only source audit. No production, simulator, UI,
 mission, or test source was changed during this audit.
 

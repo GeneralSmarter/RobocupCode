@@ -1,7 +1,7 @@
 ﻿#include "../../Robot.h"
 #include "NavigationInternal.h"
+#include "PlannerEpochLifecycle.h"
 #include "ForwardTrajectoryPlanner.h"
-#include "NavigationControllerInternal.h"
 #include "ObstacleContext.h"
 #include "PlannerCollision.h"
 #include "PlannerContext.h"
@@ -450,16 +450,8 @@ bool pickupTrajectoryCommandSafe(float forwardTicks, float turnTicks,
 }
 
 static void recordPlannerSlice(unsigned long sliceStartedUs) {
-  unsigned long sliceUs = micros() - sliceStartedUs;
-  plannerContext.plannerEpoch.accumulatedWorkUs += sliceUs;
-  plannerTelemetry.plannerSliceUs = sliceUs;
-  plannerTelemetry.plannerSliceMaxUs =
-    max(plannerTelemetry.plannerSliceMaxUs, sliceUs);
-  plannerTelemetry.plannerEpochWorkUs = plannerContext.plannerEpoch.accumulatedWorkUs;
-  plannerTelemetry.plannerEpochMaxWorkUs =
-    max(plannerTelemetry.plannerEpochMaxWorkUs,
-        plannerContext.plannerEpoch.accumulatedWorkUs);
-  recordMainLoopPhaseDuration("planner_slice", sliceStartedUs);
+  recordPlannerEpochSlice(plannerContext.plannerEpoch, sliceStartedUs,
+                          "planner_slice");
 }
 
 static void notePlannerPending() {
@@ -519,15 +511,8 @@ static TrajectoryPlanResult beginPlannerEpoch(float goalX, float goalY) {
   // Captures a coherent planning snapshot for one local point goal.
   // goalX/goalY are world metres for the current local target, which may be a
   // lookahead point, side-escape waypoint, or final waypoint.
-  memset(&plannerContext.plannerEpoch, 0, sizeof(plannerContext.plannerEpoch));
+  beginPlannerEpochState(plannerContext.plannerEpoch, goalX, goalY);
   plannerContext.lastForwardNoPathWasGeometric = false;
-  plannerContext.plannerEpoch.active = true;
-  plannerContext.plannerEpoch.startedMs = millis();
-  plannerContext.plannerEpoch.goalStartedMs = navigationGoal.startedMs;
-  plannerContext.plannerEpoch.authority = navigationGoal.authority;
-  plannerContext.plannerEpoch.goalX = goalX;
-  plannerContext.plannerEpoch.goalY = goalY;
-  plannerContext.plannerEpoch.bestScore = -1000000.0f;
   capturePlannerEpochView(plannerContext.plannerEpoch);
 
   float dx = goalX - plannerContext.plannerEpoch.startX;
@@ -555,12 +540,7 @@ static TrajectoryPlanResult beginPlannerEpoch(float goalX, float goalY) {
 
   plannerTelemetry.speedCapTicksPerSec = plannerContext.plannerEpoch.speedCap;
   plannerTelemetry.localGoalDistanceM = plannerContext.plannerEpoch.localGoalDistanceM;
-  plannerTelemetry.candidateCount = 0;
-  plannerTelemetry.plannerCandidatesProcessed = 0;
-  plannerTelemetry.plannerYieldCount = 0;
-  plannerTelemetry.plannerEpochWorkUs = 0;
-  plannerTelemetry.plannerEpochAgeMs = 0;
-  plannerTelemetry.plannerEpochActive = true;
+  resetPlannerEpochTelemetry();
   plannerContext.lastFootprintRejectWorldX = 0.0f;
   plannerContext.lastFootprintRejectWorldY = 0.0f;
   plannerContext.lastFootprintRejectCellX = -1;
@@ -603,26 +583,13 @@ TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
     return beginResult;
   }
 
-  if (plannerContext.plannerEpoch.goalStartedMs != navigationGoal.startedMs ||
-      plannerContext.plannerEpoch.authority != navigationGoal.authority) {
+  if (plannerEpochOwnerChanged(plannerContext.plannerEpoch)) {
     resetPlannerEpoch();
     return TRAJECTORY_PLAN_ABORTED;
   }
 
-  unsigned long now = millis();
-  plannerTelemetry.plannerEpochAgeMs = now - plannerContext.plannerEpoch.startedMs;
-  plannerTelemetry.plannerCommandAgeMs = plannerContext.lastPlannerCommandPublishedMs == 0
-    ? 0 : now - plannerContext.lastPlannerCommandPublishedMs;
-  if (!plannerContext.plannerEpoch.commandStoppedForAge && isMotorCommandLeaseArmed() &&
-      plannerTelemetry.plannerCommandAgeMs >= PLANNER_COMMAND_MAX_AGE_MS) {
-    stopMotors();
-    plannerContext.plannerEpoch.commandStoppedForAge = true;
-    plannerTelemetry.safeStopReason = "planner_command_age_guard";
-  }
-  if (now - plannerContext.plannerEpoch.startedMs > PLANNER_EPOCH_MAX_AGE_MS) {
-    stopMotors();
-    closePlannerEpoch();
-    finishNavigationGoal(false, PLANNER_STOP_ABORTED, "planner_epoch_timeout");
+  if (servicePlannerEpochAgeGuards(plannerContext.plannerEpoch,
+                                   "planner_epoch_timeout")) {
     return TRAJECTORY_PLAN_ABORTED;
   }
 
@@ -631,9 +598,7 @@ TrajectoryPlanResult selectTrajectory(float goalX, float goalY) {
     unsigned long sliceStartedUs = micros();
     uint8_t processedThisSlice = 0;
     while (plannerContext.plannerEpoch.candidateIndex < totalCandidates) {
-      if (processedThisSlice > 0 &&
-          (processedThisSlice >= PLANNER_MAX_CANDIDATES_PER_SLICE ||
-           micros() - sliceStartedUs >= PLANNER_SLICE_BUDGET_US)) {
+      if (plannerSliceBudgetReached(processedThisSlice, sliceStartedUs)) {
         break;
       }
       int candidateIndex = plannerContext.plannerEpoch.candidateIndex++;

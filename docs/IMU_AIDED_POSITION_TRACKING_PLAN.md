@@ -1,14 +1,22 @@
 # IMU-Aided Position Tracking Implementation Plan
 
-Status: research and implementation plan only  
+Status: retained supporting plan; not implemented and not authorized without
+an explicit user request.
 Date: 2026-07-29  
 Scope: `RobotCode`, estimator-specific simulator support, telemetry, and tests  
 Physical status: no upload, serial connection, arming, or movement was performed
 
-Current note, 2026-07-30: this is still a research plan, not implemented
-firmware behavior. File paths below have been updated for the post-cleanup
+Current note, 2026-08-11: this remains a research plan, not implemented
+firmware behavior. It is the prediction/health layer for
+`TOF_DOMINANT_WALL_ANCHORED_LOCALIZATION_PLAN.md`, not a competing standalone
+localization priority. File paths below have been updated for the post-cleanup
 folder layout where practical; source hashes in the repository-finding section
 remain historical evidence from the original research pass.
+
+The operator reports that the current robot has been run physically and works.
+That later statement does not mean this proposed estimator was implemented, and
+the physical acceptance gates below are planning context rather than an active
+task list.
 
 ## Decision
 

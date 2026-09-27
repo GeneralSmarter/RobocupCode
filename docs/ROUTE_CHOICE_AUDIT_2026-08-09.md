@@ -1,5 +1,9 @@
 # Route Choice Audit — 2026-08-09
 
+> **Completed implementation/evidence record.** The baseline plan and residual
+> opportunities below are retained for diagnosis, not as an active backlog.
+> Current priorities are defined only by `../../HANDOFF.md`.
+
 ## Implemented outcome and change review
 
 This section records the implementation performed after the baseline audit

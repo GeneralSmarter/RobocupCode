@@ -51,7 +51,49 @@ const unsigned long TELEMETRY_DUPLICATE_EVENT_LIMIT_MS = 250;
 const unsigned long TELEMETRY_MOTION_INTERVAL_MS = 100;
 const unsigned long TELEMETRY_FULL_INTERVAL_MS = 1000;
 const char NAV_TELEMETRY_SCHEMA_VERSION[] = "3";
-const size_t NAV_TELEMETRY_FIELD_COUNT = 61;
+
+// The CSV column list, and the single place it is written. Bluetooth.cpp emits
+// this verbatim as the header row, and sendBluetoothMotionRow() must print its
+// values in exactly this order. The host side keeps the matching canonical list
+// in SerialCommandUI/navigation_evidence.py.
+//
+// Some column names are frozen history: the wall_* group predates the current
+// receding-horizon planner, which maps its closest typed state into them.
+// Renaming any column is a schema change and needs NAV_TELEMETRY_SCHEMA_VERSION
+// bumped plus the host list and saved regression logs updated.
+constexpr char NAV_TELEMETRY_HEADER[] =
+  "row_type,schema_version,seq,event,detail,ms,build,state,run,test_armed,"
+  "x_m,y_m,theta_deg,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,"
+  "fan2_valid,fan3_valid,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,"
+  "blocked,motor_l_us,motor_r_us,wall_phase,wall_bypass_side,wall_nearest_mm,"
+  "wall_phase_elapsed_s,wall_end_reads,wall_distance_past_end_m,"
+  "route_lateral_error_m,planner_v_tps,planner_w_tps,"
+  "planner_min_clearance_mm,planner_speed_cap_tps,planner_arc_result,"
+  "planner_stop,wheel_target_l_tps,wheel_target_r_tps,wheel_rate_l_tps,"
+  "wheel_rate_r_tps,imu_raw_cw_deg,nav_yaw_deg,motor_mode,motion_authority,"
+  "lease_trips,loop_max_ms,loop_misses,loop_worst_phase,loop_worst_phase_us,"
+  "telemetry_queued_rows,telemetry_queued_bytes,telemetry_dropped_rows,"
+  "telemetry_rate_limited_events,planner_slice_max_us,planner_command_age_ms,"
+  "planner_global_goal_distance_m";
+
+// Derived, not hand-maintained: a miscount here used to be possible only to
+// catch downstream, because the count and the header were written separately.
+constexpr size_t navTelemetryFieldCount(const char* header) {
+  size_t fields = 1;
+  for (const char* cursor = header; *cursor != '\0'; cursor++) {
+    if (*cursor == ',') {
+      fields++;
+    }
+  }
+  return fields;
+}
+
+constexpr size_t NAV_TELEMETRY_FIELD_COUNT =
+  navTelemetryFieldCount(NAV_TELEMETRY_HEADER);
+
+static_assert(navTelemetryFieldCount(NAV_TELEMETRY_HEADER) == 61,
+              "Telemetry schema v3 has 61 columns; bump the schema version and "
+              "update navigation_evidence.py before changing the column count");
 
 // 115200 baud with 8N1 framing carries at most 11,520 bytes/s. Keep normal
 // logging below 60% so navigation rows and event bursts cannot
@@ -99,8 +141,11 @@ const int LEFT_ENC_B  = 5;
 const int RIGHT_ENC_A = 2;
 const int RIGHT_ENC_B = 3;
 
-const int LEFT_ENCODER_SIGN  = 1;
-const int RIGHT_ENCODER_SIGN = -1;
+// The installed encoders count negative while their physical wheels move
+// forward. Normalize both channels here so the PID and odometry share the
+// canonical forward-positive convention.
+const int LEFT_ENCODER_SIGN  = -1;
+const int RIGHT_ENCODER_SIGN = 1;
 
 const float TICKS_PER_METRE = 9125.0;
 
@@ -144,18 +189,16 @@ const unsigned long WEIGHT_SEARCH_SETTLE_MS = 200;
 const unsigned long WEIGHT_SEARCH_CONFIRM_MS = 300;
 const unsigned long WEIGHT_SEARCH_HUNT_TIMEOUT_MS = 5000;
 const unsigned long WEIGHT_INTERRUPT_COOLDOWN_MS = 1000;
-const float WEIGHT_SEARCH_MAX_ROUTE_DEVIATION_M = 0.85;
+// Mission-level retry handoff. A retry never bypasses navigation safety; it
+// only prevents a competition route from terminating on one typed failure.
+const unsigned long COMPETITION_RETRY_PAUSE_MS = 750;
 const float MATRIX_FOLLOW_SCAN_DEG = 30.0f;
 const float MATRIX_FOLLOW_MAX_TARGET_TRAVEL_M = 0.50f;
 const unsigned long MATRIX_FOLLOW_LOSS_STOP_MS = 300;
 const unsigned long MATRIX_FOLLOW_REACQUIRE_TIMEOUT_MS = 2500;
 
-// Three rear VL53L1X sensors replace the former four-channel object array.
-// Wiring reuses the measured harness allocation: XSHUT7/5/6 are
-// left/centre/right and XSHUT4 remains held in reset and reserved.
-const bool REAR_TOF_ENABLED = true;
-const byte REAR_TOF_RESERVED_XSHUT = 4;
-const uint8_t REAR_TOF_RESERVED_ADDRESS = 0x37;
+// Three rear VL53L1X sensors use XSHUT7/5/6. XSHUT4 and address 0x37 are
+// assigned to the independent internal-funnel payload-confirmation ToF below.
 const uint8_t REAR_TOF_ROI_WIDTH = 16;
 const uint8_t REAR_TOF_ROI_HEIGHT = 16;
 const uint32_t REAR_TOF_TIMING_BUDGET_US = 50000;
@@ -214,13 +257,6 @@ static_assert(REAR_TOF_CONFIG[0].bus == SENSOR_I2C_PRIMARY &&
                 REAR_TOF_CONFIG[1].bus == SENSOR_I2C_PRIMARY &&
                 REAR_TOF_CONFIG[2].bus == SENSOR_I2C_PRIMARY,
               "All rear VL53L1X sensors must remain on the primary bus");
-static_assert(REAR_TOF_CONFIG[0].xshutChannel != REAR_TOF_RESERVED_XSHUT &&
-                REAR_TOF_CONFIG[1].xshutChannel != REAR_TOF_RESERVED_XSHUT &&
-                REAR_TOF_CONFIG[2].xshutChannel != REAR_TOF_RESERVED_XSHUT &&
-                REAR_TOF_CONFIG[0].i2cAddress != REAR_TOF_RESERVED_ADDRESS &&
-                REAR_TOF_CONFIG[1].i2cAddress != REAR_TOF_RESERVED_ADDRESS &&
-                REAR_TOF_CONFIG[2].i2cAddress != REAR_TOF_RESERVED_ADDRESS,
-              "Reserved rear XSHUT/address must remain unused");
 static_assert(REAR_TOF_CONFIG[0].mount.xMm == REAR_TOF_CONFIG[2].mount.xMm &&
                 REAR_TOF_CONFIG[0].mount.yMm ==
                   -REAR_TOF_CONFIG[2].mount.yMm &&
@@ -233,6 +269,41 @@ static_assert(sensorGeometryFinite(REAR_TOF_CONFIG[0].mount.xMm) &&
                 sensorGeometryFinite(REAR_TOF_CONFIG[2].mount.yMm),
               "Rear geometry must be finite");
 
+// Internal-funnel payload confirmation. This channel is deliberately absent
+// from RangeSensorId: it is not navigation, map, collision, or motor-safety
+// evidence. The approximately 10 mm desired confirmation point is represented
+// by a provisional <=15 mm band until physical traces establish the sensor's
+// dependable short-range behavior.
+const unsigned long PAYLOAD_TOF_SAMPLE_PERIOD_MS = 50;
+const unsigned long PAYLOAD_TOF_STALE_TIMEOUT_MS = 250;
+const unsigned long PAYLOAD_TOF_RECONNECT_INTERVAL_MS = 1000;
+const uint8_t PAYLOAD_TOF_CONFIRM_SAMPLES = 3;
+constexpr PayloadTofConfig PAYLOAD_TOF_CONFIG = {
+  "payload_bottom", {-38.8f, 0.0f, 25.0f, 0.0f, 0.0f, 0.0f},
+  SENSOR_I2C_PRIMARY, 4, 0x37, 20000,
+  PAYLOAD_TOF_SAMPLE_PERIOD_MS, 4, 250, 15
+};
+static_assert(PAYLOAD_TOF_CONFIG.bus == SENSOR_I2C_PRIMARY,
+              "Payload ToF must remain on the primary I2C bus");
+static_assert(PAYLOAD_TOF_CONFIG.confirmationMaximumMm >=
+                PAYLOAD_TOF_CONFIG.validMinimumMm &&
+              PAYLOAD_TOF_CONFIG.confirmationMaximumMm <=
+                PAYLOAD_TOF_CONFIG.validMaximumMm,
+              "Payload confirmation band must be inside the valid range");
+static_assert(REAR_TOF_CONFIG[0].xshutChannel !=
+                PAYLOAD_TOF_CONFIG.xshutChannel &&
+              REAR_TOF_CONFIG[1].xshutChannel !=
+                PAYLOAD_TOF_CONFIG.xshutChannel &&
+              REAR_TOF_CONFIG[2].xshutChannel !=
+                PAYLOAD_TOF_CONFIG.xshutChannel &&
+              REAR_TOF_CONFIG[0].i2cAddress !=
+                PAYLOAD_TOF_CONFIG.i2cAddress &&
+              REAR_TOF_CONFIG[1].i2cAddress !=
+                PAYLOAD_TOF_CONFIG.i2cAddress &&
+              REAR_TOF_CONFIG[2].i2cAddress !=
+                PAYLOAD_TOF_CONFIG.i2cAddress,
+              "Payload and rear ToF identities must remain unique");
+
 const int FRONT_STOP_DISTANCE_MM  = 180;
 const int FRONT_CLEAR_DISTANCE_MM = 230;
 
@@ -243,10 +314,13 @@ const unsigned long TOF_STALE_TIMEOUT_MS = 750;
 const int FRONT_BLOCK_CONFIRM_READS = 2;
 const int FRONT_CLEAR_CONFIRM_READS = 3;
 
-// Front SEN0628 configuration. The explicit identity transform replaces the
-// old implicit 180-degree rear-mount correction. The matrix begins as
-// supplemental blocking evidence: valid close cells can veto motion, while
-// unknown/no-return cells never establish known-clear space.
+// Front SEN0628 configuration. Raw row zero is the physically lowest-looking
+// row on the installed module. Flip rows before applying the vertical FoV so
+// ground returns are evaluated as downward rays and discarded by the existing
+// height filter, rather than being mistaken for close upright obstacles.
+// The matrix begins as supplemental blocking evidence: valid close cells can
+// veto motion, while unknown/no-return cells never establish known-clear
+// space.
 const uint8_t FRONT_MATRIX_TOF_I2C_ADDRESS = 0x33;
 const uint16_t FRONT_MATRIX_TOF_VALID_MIN_MM = 20;
 const uint16_t FRONT_MATRIX_TOF_VALID_MAX_MM = 3999;
@@ -260,15 +334,22 @@ const unsigned long FRONT_MATRIX_TOF_MODE_TIMEOUT_MS = 1000;
 const unsigned long FRONT_MATRIX_TOF_MODE_SETTLE_MS = 5000;
 const unsigned long FRONT_MATRIX_TOF_RECONNECT_INTERVAL_MS = 1000;
 constexpr uint64_t FRONT_MATRIX_ALL_CELLS_MASK = UINT64_MAX;
-// Each column contributes one selected, height-filtered ray to the planner.
-// The independent safety and perception consumers continue to inspect all
-// 64 cells rather than reducing the frame to these eight map observations.
+// The matrix's forward wall evidence is deliberately limited to the two
+// central cells in its top logical row (row 0, columns 3 and 4). The physical
+// module is still being characterized, so off-centre/low cells must not turn
+// broad floor or chassis returns into a forward wall veto. The independent
+// four-ray fan remains the primary forward safety coverage.
+constexpr uint64_t FRONT_MATRIX_WALL_MASK =
+  (UINT64_C(1) << 3) | (UINT64_C(1) << 4);
+constexpr uint64_t FRONT_MATRIX_BOTTOM_HALF_MASK = UINT64_C(0xFFFFFFFF00000000);
+// The lower half remains reserved for short weight-sized-object perception and
+// does not establish collision evidence.
 constexpr uint8_t FRONT_MATRIX_MAP_COLUMN_MASK = 0xFF;
 constexpr FrontMatrixConfig FRONT_MATRIX_CONFIG = {
-  "front_matrix", {67.140f, 0.0f, 96.0f, 0.0f, 0.0f, 0.0f},
+  "front_matrix", {125.0f, 0.0f, 96.0f, 0.0f, 0.0f, 0.0f}, //was 67.140f
   SENSOR_I2C_SECONDARY, FRONT_MATRIX_TOF_I2C_ADDRESS,
-  8, 8, 60.0f, 60.0f, 0, false, false,
-  FRONT_MATRIX_ALL_CELLS_MASK, FRONT_MATRIX_ALL_CELLS_MASK
+  8, 8, 60.0f, 60.0f, 0, true, false,
+  FRONT_MATRIX_WALL_MASK, FRONT_MATRIX_BOTTOM_HALF_MASK
 };
 static_assert(FRONT_MATRIX_CONFIG.rows == 8 &&
                 FRONT_MATRIX_CONFIG.columns == 8,
@@ -277,9 +358,12 @@ static_assert(FRONT_MATRIX_CONFIG.gridRotationQuarterTurns < 4,
               "Front matrix grid rotation must be 0/90/180/270 degrees");
 static_assert(FRONT_MATRIX_CONFIG.bus == SENSOR_I2C_SECONDARY,
               "Front matrix must remain on Wire1/secondary bus");
-static_assert(FRONT_MATRIX_CONFIG.safetyCellMask == UINT64_MAX &&
-                FRONT_MATRIX_CONFIG.perceptionCellMask == UINT64_MAX,
-              "Initial front matrix safety/perception masks cover all cells");
+static_assert((FRONT_MATRIX_WALL_MASK & FRONT_MATRIX_BOTTOM_HALF_MASK) == 0,
+              "Matrix wall and weight zones must not overlap");
+static_assert(FRONT_MATRIX_CONFIG.safetyCellMask == FRONT_MATRIX_WALL_MASK &&
+                FRONT_MATRIX_CONFIG.perceptionCellMask ==
+                  FRONT_MATRIX_BOTTOM_HALF_MASK,
+              "Only the top-centre matrix cells are wall evidence; lower rows are weight-only");
 static_assert(FRONT_MATRIX_MAP_COLUMN_MASK != 0,
               "At least one front matrix column must seed obstacle endpoints");
 static_assert(sensorGeometryFinite(FRONT_MATRIX_CONFIG.mount.xMm) &&
@@ -287,9 +371,9 @@ static_assert(sensorGeometryFinite(FRONT_MATRIX_CONFIG.mount.xMm) &&
                 sensorGeometryFinite(FRONT_MATRIX_CONFIG.mount.zMm),
               "Front matrix geometry must be finite");
 
-// Matrix perception/hunt starting values. Geometry-derived values are narrow
-// enough to reject broad walls and ramps in deterministic fixtures; physical
-// characterization must tune them before motion acceptance.
+// Matrix perception/hunt starting values. Only the lower matrix half feeds
+// this classifier; wall/ramp classification is intentionally disabled until
+// the front-matrix mounting is physically characterized.
 const float MATRIX_WEIGHT_MIN_WIDTH_MM = 25.0f;
 const float MATRIX_WEIGHT_MAX_WIDTH_MM = 85.0f;
 const float MATRIX_WEIGHT_MIN_HEIGHT_MM = 35.0f;
@@ -359,6 +443,23 @@ static_assert(FRONT_FAN_CONFIG[0].xshutChannel !=
               FRONT_FAN_CONFIG[2].xshutChannel !=
                 FRONT_FAN_CONFIG[3].xshutChannel,
               "Front fan XSHUT channels must remain unique");
+static_assert(FRONT_FAN_CONFIG[0].xshutChannel !=
+                PAYLOAD_TOF_CONFIG.xshutChannel &&
+              FRONT_FAN_CONFIG[1].xshutChannel !=
+                PAYLOAD_TOF_CONFIG.xshutChannel &&
+              FRONT_FAN_CONFIG[2].xshutChannel !=
+                PAYLOAD_TOF_CONFIG.xshutChannel &&
+              FRONT_FAN_CONFIG[3].xshutChannel !=
+                PAYLOAD_TOF_CONFIG.xshutChannel &&
+              FRONT_FAN_CONFIG[0].i2cAddress !=
+                PAYLOAD_TOF_CONFIG.i2cAddress &&
+              FRONT_FAN_CONFIG[1].i2cAddress !=
+                PAYLOAD_TOF_CONFIG.i2cAddress &&
+              FRONT_FAN_CONFIG[2].i2cAddress !=
+                PAYLOAD_TOF_CONFIG.i2cAddress &&
+              FRONT_FAN_CONFIG[3].i2cAddress !=
+                PAYLOAD_TOF_CONFIG.i2cAddress,
+              "Payload and front-fan ToF identities must remain unique");
 
 constexpr FanSensorGeometry FAN_SENSOR_GEOMETRY[4] = {
   {FRONT_FAN_CONFIG[0].mount.xMm, FRONT_FAN_CONFIG[0].mount.yMm,
@@ -645,7 +746,7 @@ const int PLANNER_REVERSE_CLEAR_EVIDENCE_THRESHOLD = 20;
 // rear rays. Occupied cells, stale/blocked rear coverage and the hard
 // footprint margin remain non-bypassable.
 const unsigned long PLANNER_REVERSE_UNKNOWN_RAMP_MS = 3000;
-constexpr float PLANNER_REVERSE_MAX_UNKNOWN_FRACTION = 0.20;
+constexpr float PLANNER_REVERSE_MAX_UNKNOWN_FRACTION = 0.30;
 const float PLANNER_REVERSE_FORWARD_RECHECK_DISTANCE_M = 0.12;
 static_assert(PLANNER_REVERSE_UNKNOWN_RAMP_MS > 0,
               "Reverse unknown allowance ramp must be nonzero");

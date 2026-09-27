@@ -17,7 +17,9 @@ static constexpr int ROUTE_POINT_COUNT =
 
 static int currentRouteIndex = 0;
 static unsigned long routePauseUntilMs = 0;
+static unsigned long routeRetryAfterMs = 0;
 static bool routeGoalPending = false;
+static bool competitionModeEnabled = false;
 
 static const char* missionActionName(MissionAction action) {
   switch (action) {
@@ -44,7 +46,25 @@ static void printCompletedAction(MissionAction action) {
 void resetRouteMission() {
   currentRouteIndex = 0;
   routePauseUntilMs = 0;
+  routeRetryAfterMs = 0;
   routeGoalPending = false;
+}
+
+bool setCompetitionModeEnabled(bool enabled) {
+  // Policy changes are allowed only while the robot is stopped. This keeps a
+  // running goal's retry semantics stable until an explicit STOP/restart.
+  if (robotRunEnabled || motionAuthority != MOTION_AUTHORITY_NONE ||
+      navigationGetStatus().state == NAVIGATION_RUNNING ||
+      lastLeftMotorUs != STOP_US || lastRightMotorUs != STOP_US ||
+      isMotorCommandLeaseArmed()) {
+    return false;
+  }
+  competitionModeEnabled = enabled;
+  return true;
+}
+
+bool isCompetitionModeEnabled() {
+  return competitionModeEnabled;
 }
 
 void initializeRouteMission() {
@@ -80,6 +100,19 @@ static bool consumeFinishedWeightSearch() {
     routeGoalPending = false;
   }
   if (search.result == WEIGHT_SEARCH_RESULT_FAILED) {
+    if (competitionModeEnabled &&
+        search.origin != WEIGHT_SEARCH_ORIGIN_TEST) {
+      if (search.origin == WEIGHT_SEARCH_ORIGIN_WAYPOINT) {
+        // Search is an optional scoring action. A failed hunt must not end the
+        // match; advance past that action and keep the route alive.
+        currentRouteIndex++;
+      }
+      routePauseUntilMs = millis() + COMPETITION_RETRY_PAUSE_MS;
+      sendBluetoothEvent(
+        "competition_search_continue", "weight_search_failed");
+      clearWeightSearchResult();
+      return true;
+    }
     clearWeightSearchResult();
     setRobotState(END_MATCH);
     return true;
@@ -131,8 +164,26 @@ void updateRouteMission() {
   }
 
   if (routeGoalPending && navigation.state == NAVIGATION_FAILED) {
-    // Keep the typed navigation failure visible and neutral. Mission policy
-    // can later decide whether to skip, retry, or end the match.
+    if (competitionModeEnabled) {
+      const unsigned long now = millis();
+      if (routeRetryAfterMs == 0) {
+        routeRetryAfterMs = now + COMPETITION_RETRY_PAUSE_MS;
+        requestMotionStop();
+        sendBluetoothEvent("competition_route_retry_wait",
+                           navigation.detail);
+        return;
+      }
+      if (now < routeRetryAfterMs) {
+        requestMotionStop();
+        return;
+      }
+      navigationClearResult();
+      routeGoalPending = false;
+      routeRetryAfterMs = 0;
+      sendBluetoothEvent("competition_route_retry", "navigation_failed");
+      return;
+    }
+    // Keep the typed navigation failure visible and neutral in normal mode.
     return;
   }
 
@@ -140,6 +191,7 @@ void updateRouteMission() {
     const Waypoint &waypoint = ROUTE[currentRouteIndex];
     navigationClearResult();
     routeGoalPending = false;
+    routeRetryAfterMs = 0;
     if (waypoint.action == MISSION_ACTION_SEARCH) {
       const bool resumeValid = currentRouteIndex + 1 < ROUTE_POINT_COUNT;
       beginWaypointWeightSearch(
@@ -163,7 +215,6 @@ void updateRouteMission() {
 
   if (routePauseUntilMs != 0) {
     if (millis() < routePauseUntilMs) {
-      motorStopRequested = true;
       requestMotionStop();
       return;
     }

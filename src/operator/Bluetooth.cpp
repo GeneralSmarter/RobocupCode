@@ -402,6 +402,7 @@ static void printBluetoothHelp() {
   Serial2.println("  HELP or H      show this help");
   Serial2.println("  BUILD          print firmware build label");
   Serial2.println("  START          start robot navigation");
+  Serial2.println("  COMPETITION ON/OFF/STATUS  retry route failures until STOP");
   Serial2.println("  STATUS or P    print robot status");
   Serial2.println("  LOOP RESET     reset loop-gap diagnostics while motors are neutral");
   Serial2.println("  STREAM ON      send status as fast as the telemetry loop allows");
@@ -425,6 +426,7 @@ static void printBluetoothHelp() {
   Serial2.println("  TEST FAN       print high fan ToF sector readings");
   Serial2.println("  TEST REAR      print three-rear-VL53L1X safety telemetry");
   Serial2.println("  TEST MATRIX    print front matrix and weight evidence");
+  Serial2.println("  TEST PAYLOAD   print internal-funnel payload ToF evidence");
   Serial2.println("  TEST HUNT TARGET  print latched matrix target without moving");
   Serial2.println("  TEST HUNT      track a confirmed matrix target after TEST ARM");
   Serial2.println("  TEST FOLLOW START|STOP|STATUS  bounded matrix follow diagnostic");
@@ -476,6 +478,8 @@ void sendBluetoothStatus() {
   Serial2.print(ROBOT_BUILD_LABEL);
   Serial2.print(" run=");
   Serial2.print(robotRunEnabled ? 1 : 0);
+  Serial2.print(" competition=");
+  Serial2.print(isCompetitionModeEnabled() ? 1 : 0);
   Serial2.print(" testArmed=");
   Serial2.print(bluetoothTestArmed ? 1 : 0);
   Serial2.print(" manualArmed=");
@@ -688,7 +692,7 @@ void sendBluetoothStatus() {
 
 static void sendBluetoothCsvHeader() {
   beginTelemetryRow();
-  Serial2.println("row_type,schema_version,seq,event,detail,ms,build,state,run,test_armed,x_m,y_m,theta_deg,fan0_mm,fan1_mm,fan2_mm,fan3_mm,fan0_valid,fan1_valid,fan2_valid,fan3_valid,fan0_age_ms,fan1_age_ms,fan2_age_ms,fan3_age_ms,blocked,motor_l_us,motor_r_us,wall_phase,wall_bypass_side,wall_nearest_mm,wall_phase_elapsed_s,wall_end_reads,wall_distance_past_end_m,route_lateral_error_m,planner_v_tps,planner_w_tps,planner_min_clearance_mm,planner_speed_cap_tps,planner_arc_result,planner_stop,wheel_target_l_tps,wheel_target_r_tps,wheel_rate_l_tps,wheel_rate_r_tps,imu_raw_cw_deg,nav_yaw_deg,motor_mode,motion_authority,lease_trips,loop_max_ms,loop_misses,loop_worst_phase,loop_worst_phase_us,telemetry_queued_rows,telemetry_queued_bytes,telemetry_dropped_rows,telemetry_rate_limited_events,planner_slice_max_us,planner_command_age_ms,planner_global_goal_distance_m");
+  Serial2.println(NAV_TELEMETRY_HEADER);
   commitTelemetryRow(TELEMETRY_HEADER_BUDGET_BYTES);
 }
 
@@ -1051,7 +1055,6 @@ static void recordBluetoothNavigationSubmission(bool accepted,
   sendBluetoothEvent("navigation_goal_rejected", detail);
   bluetoothTurnTruthActive = false;
   robotRunEnabled = false;
-  motorStopRequested = true;
   requestMotionStop();
   setRobotState(END_MATCH);
 }
@@ -1188,15 +1191,23 @@ static void runBluetoothTestSearch() {
   startWeightSearchTest();
 }
 
-static void runBluetoothTestAvoid(float distanceMetres) {
-  // TEST AVOID is a straight-ahead point goal intended to exercise normal
-  // planner obstacle response, not a separate scripted avoidance routine.
+// TEST AVOID and TEST ESCAPE are the same action: a straight-ahead point goal
+// that exercises the normal planner, not a scripted routine. They differ only
+// in the diagnostic they are aimed at, which is carried by the goal kind and
+// the operator-facing wording.
+static void runBluetoothTestBearingPoint(float distanceMetres,
+                                         const char* commandName,
+                                         const char* okPrefix,
+                                         const char* okSuffix,
+                                         const char* startEvent,
+                                         const char* detail,
+                                         NavigationTestPointKind kind) {
   if (!requireBluetoothTestArm()) {
     return;
   }
 
   if (distanceMetres < TEST_AVOID_MIN_METRES || distanceMetres > TEST_AVOID_MAX_METRES) {
-    printFloatRangeError("TEST AVOID", TEST_AVOID_MIN_METRES, TEST_AVOID_MAX_METRES);
+    printFloatRangeError(commandName, TEST_AVOID_MIN_METRES, TEST_AVOID_MAX_METRES);
     return;
   }
 
@@ -1205,7 +1216,7 @@ static void runBluetoothTestAvoid(float distanceMetres) {
   float targetX = robotX + cos(headingRad) * distanceMetres;
   float targetY = robotY + sin(headingRad) * distanceMetres;
 
-  Serial2.print("OK test avoid ");
+  Serial2.print(okPrefix);
   Serial2.print(distanceMetres, 3);
   Serial2.print(" m toward x=");
   Serial2.print(targetX, 3);
@@ -1213,47 +1224,27 @@ static void runBluetoothTestAvoid(float distanceMetres) {
   Serial2.print(targetY, 3);
   Serial2.print(" heading=");
   Serial2.print(headingDeg, 2);
-  Serial2.println(" deg.");
+  Serial2.println(okSuffix);
 
   beginBluetoothTestMotion();
-  sendBluetoothEvent("test_avoid_start", "manual");
+  sendBluetoothEvent(startEvent, "manual");
   recordBluetoothNavigationSubmission(
-    navigationStartTestPoint(targetX, targetY, NAVIGATION_TEST_AVOID),
-    "test_avoid");
+    navigationStartTestPoint(targetX, targetY, kind), detail);
+}
+
+static void runBluetoothTestAvoid(float distanceMetres) {
+  runBluetoothTestBearingPoint(
+    distanceMetres, "TEST AVOID", "OK test avoid ", " deg.",
+    "test_avoid_start", "test_avoid", NAVIGATION_TEST_AVOID);
 }
 
 static void runBluetoothTestEscape(float distanceMetres) {
-  // TEST ESCAPE uses the same point goal as TEST AVOID but is intended for
-  // front-blocked reverse-recovery diagnostics.
-  if (!requireBluetoothTestArm()) {
-    return;
-  }
-
-  if (distanceMetres < TEST_AVOID_MIN_METRES || distanceMetres > TEST_AVOID_MAX_METRES) {
-    printFloatRangeError("TEST ESCAPE", TEST_AVOID_MIN_METRES, TEST_AVOID_MAX_METRES);
-    return;
-  }
-
-  float headingDeg = navigationHeadingDeg();
-  float headingRad = headingDeg * PI / 180.0;
-  float targetX = robotX + cos(headingRad) * distanceMetres;
-  float targetY = robotY + sin(headingRad) * distanceMetres;
-
-  Serial2.print("OK test escape scan ");
-  Serial2.print(distanceMetres, 3);
-  Serial2.print(" m toward x=");
-  Serial2.print(targetX, 3);
-  Serial2.print(" y=");
-  Serial2.print(targetY, 3);
-  Serial2.print(" heading=");
-  Serial2.print(headingDeg, 2);
-  Serial2.println(" deg. Reverse repositioning still requires trusted rear coverage.");
-
-  beginBluetoothTestMotion();
-  sendBluetoothEvent("test_escape_start", "manual");
-  recordBluetoothNavigationSubmission(
-    navigationStartTestPoint(targetX, targetY, NAVIGATION_TEST_ESCAPE),
-    "test_escape");
+  // Aimed at front-blocked reverse-recovery diagnostics; the reverse leg still
+  // depends on trusted rear coverage, hence the extra operator note.
+  runBluetoothTestBearingPoint(
+    distanceMetres, "TEST ESCAPE", "OK test escape scan ",
+    " deg. Reverse repositioning still requires trusted rear coverage.",
+    "test_escape_start", "test_escape", NAVIGATION_TEST_ESCAPE);
 }
 
 static void runBluetoothTestSide(float durationSeconds) {
@@ -1286,7 +1277,6 @@ static void updateBluetoothTestSide() {
   }
 
   unsigned long now = millis();
-  motorStopRequested = true;
   requestMotionStop();
 
   if (now >= sideTestNextSampleMs) {
@@ -1413,7 +1403,6 @@ static void updateBluetoothNavigationTest() {
   }
   bluetoothNavigationTestActive = false;
   robotRunEnabled = false;
-  motorStopRequested = true;
   requestMotionStop();
   setRobotState(END_MATCH);
   Serial.println(navigation.state == NAVIGATION_REACHED
@@ -1573,7 +1562,6 @@ static void finishBluetoothTurnPulseTest() {
   turnPulseCoasting = false;
   bluetoothManualActive = false;
   robotRunEnabled = false;
-  motorStopRequested = true;
   requestMotionStop();
   setRobotState(END_MATCH);
   Serial2.print("TURNPULSE complete: final_nav_heading_delta_deg=");
@@ -1669,7 +1657,6 @@ static void updateBluetoothTurnPulseTest() {
     if (now >= turnPulseEndMs) {
       turnPulseCoasting = true;
       bluetoothManualActive = false;
-      motorStopRequested = true;
       requestMotionStop();
       Serial2.println("TURNPULSE drive phase complete; logging coast.");
     }
@@ -1816,6 +1803,41 @@ static bool handleCoreBluetoothCommand(const char* command) {
 
   if (commandEquals(command, "BUILD")) {
     printBluetoothBuild();
+    return true;
+  }
+
+  if (commandEquals(command, "COMPETITION ON")) {
+    if (!setCompetitionModeEnabled(true)) {
+      Serial2.println(
+        "ERROR COMPETITION requires neutral motors and no active mission; set it before START.");
+      return true;
+    }
+    Serial2.println(
+      "OK competition mode ON. Route and home failures will retry until STOP; safety gates remain active.");
+    sendBluetoothEvent("competition_mode_set", "on");
+    return true;
+  }
+
+  if (commandEquals(command, "COMPETITION OFF")) {
+    if (!setCompetitionModeEnabled(false)) {
+      Serial2.println(
+        "ERROR COMPETITION requires neutral motors and no active mission; use STOP first.");
+      return true;
+    }
+    Serial2.println("OK competition mode OFF. Typed failures remain visible and neutral.");
+    sendBluetoothEvent("competition_mode_set", "off");
+    return true;
+  }
+
+  if (commandEquals(command, "COMPETITION STATUS")) {
+    Serial2.print("COMPETITION ");
+    Serial2.println(isCompetitionModeEnabled() ? "ON" : "OFF");
+    return true;
+  }
+
+  if (commandHasPrefix(command, "COMPETITION")) {
+    Serial2.println(
+      "ERROR usage: COMPETITION ON, COMPETITION OFF, or COMPETITION STATUS");
     return true;
   }
 
@@ -2168,6 +2190,25 @@ static bool handleManualBluetoothCommand(const char* command) {
   return false;
 }
 
+// TEST commands taking exactly one float argument. Adding one is a table row;
+// the parse, the usage error, and the dispatch are shared. Entries must not be
+// prefixes of one another, since dispatch is prefix-matched.
+struct SingleFloatTestCommand {
+  const char* name;
+  const char* usageArgument;
+  void (*run)(float);
+};
+
+static const SingleFloatTestCommand SINGLE_FLOAT_TEST_COMMANDS[] = {
+  {"TEST DRIVE", " <metres>", runBluetoothTestDrive},
+  {"TEST AVOID", " <metres>", runBluetoothTestAvoid},
+  {"TEST ESCAPE", " <metres>", runBluetoothTestEscape},
+  {"TEST SIDE", " <seconds>", runBluetoothTestSide},
+};
+
+static const size_t SINGLE_FLOAT_TEST_COMMAND_COUNT =
+  sizeof(SINGLE_FLOAT_TEST_COMMANDS) / sizeof(SINGLE_FLOAT_TEST_COMMANDS[0]);
+
 static bool handleTestMotionBluetoothCommand(const char* command) {
   // TEST motion and diagnostics. Motion-producing commands call
   // requireBluetoothTestArm(); stationary diagnostics such as TEST FAN/OBJECT
@@ -2186,15 +2227,21 @@ static bool handleTestMotionBluetoothCommand(const char* command) {
     return true;
   }
 
-  if (commandHasPrefix(command, "TEST DRIVE")) {
-    float distanceMetres = 0.0;
-
-    if (!parseFloatArgument(commandArgument(command, "TEST DRIVE"), distanceMetres)) {
-      Serial2.println("ERROR usage: TEST DRIVE <metres>");
+  // Every single-argument TEST command parses identically and differs only in
+  // its usage text and handler, so they are dispatched from one table.
+  for (size_t i = 0; i < SINGLE_FLOAT_TEST_COMMAND_COUNT; i++) {
+    const SingleFloatTestCommand &entry = SINGLE_FLOAT_TEST_COMMANDS[i];
+    if (!commandHasPrefix(command, entry.name)) {
+      continue;
+    }
+    float value = 0.0;
+    if (!parseFloatArgument(commandArgument(command, entry.name), value)) {
+      Serial2.print("ERROR usage: ");
+      Serial2.print(entry.name);
+      Serial2.println(entry.usageArgument);
       return true;
     }
-
-    runBluetoothTestDrive(distanceMetres);
+    entry.run(value);
     return true;
   }
 
@@ -2211,42 +2258,6 @@ static bool handleTestMotionBluetoothCommand(const char* command) {
     return true;
   }
 
-  if (commandHasPrefix(command, "TEST AVOID")) {
-    float distanceMetres = 0.0;
-
-    if (!parseFloatArgument(commandArgument(command, "TEST AVOID"), distanceMetres)) {
-      Serial2.println("ERROR usage: TEST AVOID <metres>");
-      return true;
-    }
-
-    runBluetoothTestAvoid(distanceMetres);
-    return true;
-  }
-
-  if (commandHasPrefix(command, "TEST ESCAPE")) {
-    float distanceMetres = 0.0;
-
-    if (!parseFloatArgument(commandArgument(command, "TEST ESCAPE"), distanceMetres)) {
-      Serial2.println("ERROR usage: TEST ESCAPE <metres>");
-      return true;
-    }
-
-    runBluetoothTestEscape(distanceMetres);
-    return true;
-  }
-
-  if (commandHasPrefix(command, "TEST SIDE")) {
-    float durationSeconds = 0.0;
-
-    if (!parseFloatArgument(commandArgument(command, "TEST SIDE"), durationSeconds)) {
-      Serial2.println("ERROR usage: TEST SIDE <seconds>");
-      return true;
-    }
-
-    runBluetoothTestSide(durationSeconds);
-    return true;
-  }
-
   if (commandEquals(command, "TEST FAN") || commandEquals(command, "FAN")) {
     printFanTelemetry();
     return true;
@@ -2260,6 +2271,17 @@ static bool handleTestMotionBluetoothCommand(const char* command) {
 
   if (commandEquals(command, "TEST REAR") || commandEquals(command, "REAR")) {
     printRearTofStatus();
+    return true;
+  }
+
+  if (commandEquals(command, "TEST PAYLOAD") ||
+      commandEquals(command, "PAYLOAD")) {
+    printPayloadTofStatus();
+    PickupTrackingStatus pickup = navigationGetPickupTrackingStatus();
+    Serial2.print("payload_capture,attempt=");
+    Serial2.print(pickup.captureAttemptId);
+    Serial2.print(",evidence=");
+    Serial2.println((int)pickup.payloadEvidence);
     return true;
   }
 

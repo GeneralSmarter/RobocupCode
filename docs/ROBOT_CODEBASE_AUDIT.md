@@ -1,5 +1,12 @@
 ﻿# Robot Codebase Audit
 
+> **Historical/context-only snapshot (2026-07).** This audit is retained as
+> diagnostic evidence. Its P0/P1 ordering, recommended architecture, scoring
+> strategy, and remaining work are not the current project backlog. Many items
+> were later implemented, superseded, rejected, or deprioritized. Consult a
+> finding only when the user requests related work; current authority is
+> `../../HANDOFF.md` and `README.md` in this directory.
+
 Migration update, 2026-08-06: the historical `RANGE_FAKE_REAR`, rear SEN0628,
 and four object-facing VL53L1X paths described below have been superseded in
 software by three rear VL53L1X channels and one front SEN0628 matrix. Physical

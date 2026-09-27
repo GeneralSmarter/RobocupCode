@@ -141,8 +141,6 @@ void prepareRearTofPinsForStartup() {
     io.pinMode(REAR_TOF_CONFIG[i].xshutChannel, OUTPUT);
     io.digitalWrite(REAR_TOF_CONFIG[i].xshutChannel, LOW);
   }
-  io.pinMode(REAR_TOF_RESERVED_XSHUT, OUTPUT);
-  io.digitalWrite(REAR_TOF_RESERVED_XSHUT, LOW);
 }
 
 void connectRearTofArray() {

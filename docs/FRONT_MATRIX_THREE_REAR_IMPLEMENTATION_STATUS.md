@@ -2,6 +2,13 @@
 
 Date: 2026-08-09 (Pacific/Auckland)
 
+> **Completed implementation record.** This file preserves the migration-time
+> software evidence and its then-unrun physical gates. The operator later
+> reported on 2026-08-11 that the current robot has been run physically and
+> works. Do not reinterpret the historical “no physical action during this
+> task” wording as the current project status, and do not treat remaining gates
+> here as an automatic backlog.
+
 ## Baseline identity
 
 - Git source commit: `c8a81822f567f7d982f46d3a862046fa84c7e676`

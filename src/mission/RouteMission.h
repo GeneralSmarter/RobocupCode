@@ -6,5 +6,7 @@ void updateRouteMission();
 void resetRouteMission();
 int routeMissionDisplayIndex();
 int routeMissionPointCount();
+bool setCompetitionModeEnabled(bool enabled);
+bool isCompetitionModeEnabled();
 
 #endif

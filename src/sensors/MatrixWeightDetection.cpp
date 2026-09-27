@@ -17,8 +17,6 @@ struct MatrixTrackState {
 
 struct ColumnProfile {
   bool weightStep;
-  bool wallLike;
-  bool rampLike;
   float nearestLowMm;
   float nearestRobotXmm;
   float nearestRobotYmm;
@@ -162,7 +160,6 @@ const char* matrixEvidenceKindName(MatrixEvidenceKind kind) {
   switch (kind) {
     case MATRIX_EVIDENCE_NONE: return "none";
     case MATRIX_EVIDENCE_WEIGHT_CANDIDATE: return "weight_candidate";
-    case MATRIX_EVIDENCE_RAMP_LIKE: return "ramp_like";
     case MATRIX_EVIDENCE_WALL_LIKE: return "wall_like";
     case MATRIX_EVIDENCE_DYNAMIC_LOW_OBJECT: return "dynamic_low_object";
     case MATRIX_EVIDENCE_MIXED_OR_OCCLUDED: return "mixed_or_occluded";
@@ -179,28 +176,32 @@ void updateMatrixWeightDetection() {
   ColumnProfile profiles[8] = {};
   bool anyLowEvidence = false;
   bool anyWallEvidence = false;
-  bool anyRampEvidence = false;
   for (uint8_t column = 0; column < 8; column++) {
     ColumnProfile &profile = profiles[column];
     profile.nearestLowMm = 1000000.0f;
     profile.minimumHeightMm = 1000000.0f;
     profile.maximumHeightMm = -1000000.0f;
     float nearestUpperMm = 1000000.0f;
-    float minimumRowRangeMm = 1000000.0f;
-    float maximumRowRangeMm = 0.0f;
-    uint8_t validProfilePoints = 0;
     for (uint8_t row = 0; row < 8; row++) {
       const uint8_t index = row * 8U + column;
-      if ((FRONT_MATRIX_CONFIG.perceptionCellMask &
-           (UINT64_C(1) << index)) == 0 ||
+      const uint64_t cellBit = UINT64_C(1) << index;
+      const bool wallZone =
+        (FRONT_MATRIX_CONFIG.safetyCellMask & cellBit) != 0;
+      const bool weightZone =
+        (FRONT_MATRIX_CONFIG.perceptionCellMask & cellBit) != 0;
+      if ((!wallZone && !weightZone) ||
           frame.cellState[index] != FRONT_MATRIX_CELL_VALID) continue;
       const MatrixPointMm point = reconstructMatrixPoint(
         frame, row, column, frame.distanceMm[index]);
       const float horizontalMm = point.horizontalRange;
       const float hitHeightMm = point.z;
-      minimumRowRangeMm = min(minimumRowRangeMm, horizontalMm);
-      maximumRowRangeMm = max(maximumRowRangeMm, horizontalMm);
-      validProfilePoints++;
+      if (wallZone) {
+        // The upper half is the wall reference. It is deliberately never
+        // considered as a weight source or smooth-ramp evidence.
+        nearestUpperMm = min(nearestUpperMm, horizontalMm);
+        anyWallEvidence = true;
+        continue;
+      }
       if (hitHeightMm >= MATRIX_WEIGHT_MIN_HEIGHT_MM * 0.5f &&
           hitHeightMm <= MATRIX_WEIGHT_MAX_HEIGHT_MM) {
         anyLowEvidence = true;
@@ -219,16 +220,6 @@ void updateMatrixWeightDetection() {
     if (profile.lowMask == 0) continue;
     profile.weightStep = nearestUpperMm < 1000000.0f &&
       nearestUpperMm - profile.nearestLowMm >= MATRIX_WEIGHT_MIN_DEPTH_STEP_MM;
-    profile.wallLike = nearestUpperMm < 1000000.0f &&
-      fabsf(nearestUpperMm - profile.nearestLowMm) <
-        MATRIX_WEIGHT_MIN_DEPTH_STEP_MM;
-    // A smooth depth sweep through several height samples is ramp evidence;
-    // unlike a weight, it has no abrupt low-to-upper depth discontinuity.
-    profile.rampLike = validProfilePoints >= 3 && !profile.weightStep &&
-      maximumRowRangeMm - minimumRowRangeMm >=
-        MATRIX_WEIGHT_MIN_DEPTH_STEP_MM;
-    anyWallEvidence = anyWallEvidence || profile.wallLike;
-    anyRampEvidence = anyRampEvidence || profile.rampLike;
   }
 
   MatrixCandidate candidates[4] = {};
@@ -316,10 +307,9 @@ void updateMatrixWeightDetection() {
       }
     } else {
       matrixTrack = {};
-      invalidateTarget(anyRampEvidence ? MATRIX_EVIDENCE_RAMP_LIKE :
-        (anyWallEvidence ? MATRIX_EVIDENCE_WALL_LIKE :
-         (anyLowEvidence ? MATRIX_EVIDENCE_MIXED_OR_OCCLUDED :
-                           MATRIX_EVIDENCE_NONE)), frame.sequence);
+      invalidateTarget(anyWallEvidence ? MATRIX_EVIDENCE_WALL_LIKE :
+        (anyLowEvidence ? MATRIX_EVIDENCE_MIXED_OR_OCCLUDED :
+                          MATRIX_EVIDENCE_NONE), frame.sequence);
     }
     return;
   }

@@ -1,11 +1,18 @@
 ﻿# RobotCode
 
-Current RoboCup robot firmware for Teensy 4.0.
+Current RoboCup robot firmware for Teensy 4.0. Workspace status and retained
+future work are controlled by the root `HANDOFF.md`; documentation roles are
+indexed in [docs/README.md](docs/README.md).
+
+The operator reports that the current robot has been run physically and works.
+That is the current baseline statement, not standing permission for another
+serial session, arming, or movement test. Firmware upload is separately
+pre-authorized (operator decision, 2026-08-12): upload during physical testing,
+skip it during code-only work.
 
 V7 uses a scheduled, safety-supervised local planner. Runtime sensor polling is
-phase-1 nonblocking, with a motor command lease and loop-deadline telemetry;
-coherent sensor snapshots and physical watchdog timing remain follow-ups. The
-four forward navigation ToFs are VL53L0X sensors and build a rolling local
+nonblocking, with a motor command lease and loop-deadline telemetry. The four
+forward navigation ToFs are VL53L0X sensors and build a rolling local
 confidence map plus thresholded persistent arena memory; a footprint-aware
 receding-horizon controller selects a safe
 differential-drive arc toward the active waypoint.  There is no fixed
@@ -15,30 +22,31 @@ independent rear VL53L1X channels; the front SEN0628 matrix supplies
 supplemental collision vetoes and weight perception. Invalid, stale, or blind
 direction-relevant safety evidence is never treated as clear.
 
-Read [ROBOT_CODEBASE_AUDIT.md](docs/ROBOT_CODEBASE_AUDIT.md) before planning
-new navigation or mission work. It records the full 2026-07 audit, including
-the stop-ship safety findings that supersede the older navigation test plans.
+The July [codebase audit](docs/ROBOT_CODEBASE_AUDIT.md) is historical diagnostic
+context, not an active P0/P1 backlog. Many findings were later implemented,
+superseded, rejected, or deprioritized. Use it only when a current request
+relates to one of its problems.
 
-P0 status: P0-01 turn convention, P0-02 motion authority/disarm, P0-07 hard
-collision override, and P0-08 field-GOTO command suppression are fixed in
-software. P0-03 is partially fixed and still depends on real sensor coverage.
-P0-04's temporary rear channel has been removed in software; physical rear
-coverage and stop/clear calibration remain open P0-05 evidence. P0-06 phase 1
-is implemented, with physical watchdog timing still to follow. Do not treat
-simulator results as proof of rear safety or competition readiness.
-
-The migration baseline and latest validation results are recorded in
-[FRONT_MATRIX_THREE_REAR_IMPLEMENTATION_STATUS.md](docs/FRONT_MATRIX_THREE_REAR_IMPLEMENTATION_STATUS.md).
+Fresh payload-integration checks on 2026-09-21: Teensy compile passed at
+169,784 bytes FLASH code; Python reported 151 passed and 2 skipped; compileall
+passed. The 8 focused pickup/payload simulator cases pass, including an exact
+seeded-trace check that payload faults cannot perturb ordinary navigation. The
+full current-worktree simulator run reports 64 passed and 13 failed; every
+failure is a general planner scenario outside the payload path, so the broad
+navigation suite is not currently green. The rebuilt WASM artifact matches the
+current RobotCode/bridge source hash:
+`47ae3c8ea9c1188dd5ad72debf0d3454219590250d198f8c15f74365c079ab26`.
 
 The field GOTO desktop UI is preview-only. Field clicks do not send `TEST ARM`
-or `TEST GOTO`; the SE(2) transform, status preflight, bounds preview, and
-explicit confirmation flow are not yet implemented.
+or `TEST GOTO`. Any future field-command work is context only unless explicitly
+requested.
 
 ## Read First
 
+- [Root handoff](../HANDOFF.md)
+- [Documentation index](docs/README.md)
 - [Current state and next steps](docs/CURRENT_STATE_AND_NEXT_STEPS.md)
-- [Robot codebase audit](docs/ROBOT_CODEBASE_AUDIT.md)
-- [Code cleanup record and LocalPlanner split plan](docs/CODE_CLEANUP_AND_LOCAL_PLANNER_SPLIT.md)
+- [Navigation design](../NAVIGATION_DESIGN.md)
 
 ## Files
 
@@ -134,6 +142,12 @@ Available commands:
 - `HELP` - show commands.
 - `BUILD` - print the firmware build label.
 - `START` - begin navigation from the waiting state.
+- `COMPETITION ON` / `COMPETITION OFF` / `COMPETITION STATUS` - select the
+  stopped-only competition mission policy. When enabled, route and return-home
+  navigation failures are retried indefinitely after a neutral handoff, and a
+  failed optional weight search continues the route. `STOP`, the motor
+  watchdog, motion authority, sensor freshness, and collision gates still stop
+  the robot; this switch does not force unsafe motion. Set it before `START`.
 - `STATUS` - print state, pose, ToF readings, encoder counts, and flags.
 - `STREAM ON` / `STREAM OFF` - enable or disable one status line per second.
 - `CSV ON` / `CSV OFF` - enable or disable CSV telemetry rows.
@@ -163,11 +177,16 @@ Available commands:
 - `TEST REAR` or `REAR` - print all three rear VL53L1X states and aggregate.
 - `TEST MATRIX` or `MATRIX` - print the 8x8 front frame and weight evidence.
   `TEST OBJECT` remains a command alias only; there is no old object-ToF path.
+- `TEST PAYLOAD` or `PAYLOAD` - print the internal-funnel bottom VL53L1X
+  observation plus the active capture-attempt id and payload-evidence state.
+  This sensor never controls motion, mapping, or collision safety.
 - `TEST HUNT TARGET` - print the confirmed static matrix track without moving.
 - `TEST HUNT` - after `TEST ARM`, latch that track, request the normal 2600
   ticks/s forward ceiling, steer from the matrix, perform the configurable
-  assumed 30 mm funnel handoff, and maintain at least 150 mm unconfirmed feed.
-  It never confirms payload or material.
+  assumed 30 mm funnel handoff, and maintain at least 150 mm feed. During that
+  existing feed, the internal-funnel bottom ToF can confirm a present,
+  unclassified payload from fresh consecutive near readings. It never confirms
+  material or count, and it never changes the feed motion.
 - `TEST FOLLOW START|STOP|STATUS` - explicit-start bounded matrix-follow
   diagnostic. It never performs the pickup handoff.
 - `TEST SEARCH` - after `TEST ARM`, run the same short waypoint-style weight
@@ -383,7 +402,8 @@ Normal waypoint travel assigns a local target up to `0.35 m` ahead on the line
 to the waypoint. Every 40 ms, the local planner evaluates footprint-safe
 differential-drive arcs against the confidence map and chooses the best one.
 The 0.8 s rollout is only a safety/prediction horizon: a point goal completes
-immediately on entering the `60 mm` arrival circle, so the controller does
+immediately on entering the `65 mm` arrival circle
+(`WAYPOINT_TOLERANCE_M`), so the controller does
 not deliberately crawl merely because a hypothetical arc would continue past
 the target. Scripted `PAUSE` and `HOME` route actions use short `250 ms`
 settles for route tests.
@@ -407,9 +427,15 @@ matrix cells may veto motion, while unknown/no-return cells do not establish
 known-clear space. Weight tracking is advisory until the navigation interface
 latches a confirmed static track.
 
-Stationary characterization and later motion calibration still require fresh,
-explicit hardware permission. The provisional 30 mm handoff, 150 mm feed,
-classification dimensions, rear stop/clear distances, and prediction bounds
-must be replaced or confirmed from saved physical frames before acceptance.
-See [INTERNAL_FUNNEL_TOF_INTEGRATION_GUIDE.md](docs/INTERNAL_FUNNEL_TOF_INTEGRATION_GUIDE.md)
-for the future payload-confirmation boundary.
+The internal-funnel bottom VL53L1X is mounted provisionally at
+`(-38.8, 0, 25) mm` in the robot frame on XSHUT4/address `0x37`. It is a
+payload-evidence sensor only and is intentionally absent from the navigation
+range-sensor set. Three fresh consecutive readings in the provisional `4-15
+mm` band confirm `PAYLOAD_PRESENT_UNCLASSIFIED` for the active capture attempt;
+physical characterization must validate or replace that band.
+
+The operator reports that the current physical implementation works. Existing
+configuration values remain the active baseline unless the user explicitly
+requests characterization or retuning. See
+[INTERNAL_FUNNEL_TOF_INTEGRATION_GUIDE.md](docs/INTERNAL_FUNNEL_TOF_INTEGRATION_GUIDE.md)
+for the implementation boundary and remaining physical-characterization gate.

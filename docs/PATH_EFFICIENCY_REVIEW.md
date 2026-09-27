@@ -1,5 +1,9 @@
 # Path Efficiency Review
 
+> **Completed implementation/evidence record.** “Remaining opportunities” and
+> other suggestions below are context only, not retained future work. Consult
+> them only for a related user request.
+
 ## Scope
 
 This review covers deterministic firmware/WASM navigation behavior for the

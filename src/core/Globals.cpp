@@ -76,6 +76,7 @@ VL53L0X rightInnerTOF;
 VL53L0X leftInnerTOF;
 VL53L0X leftOuterTOF;
 VL53L1X rearTofs[REAR_TOF_COUNT];
+VL53L1X payloadTof;
 
 RearTofState rearTofStates[REAR_TOF_COUNT] = {
   {false, false, true, true, RANGE_NO_READING_MM,
@@ -84,6 +85,11 @@ RearTofState rearTofStates[REAR_TOF_COUNT] = {
    SENSOR_RANGE_STATUS_UNKNOWN, 0.0f, 0.0f, 0, 0, 0, 0},
   {false, false, true, true, RANGE_NO_READING_MM,
    SENSOR_RANGE_STATUS_UNKNOWN, 0.0f, 0.0f, 0, 0, 0, 0}
+};
+
+PayloadTofObservation payloadTofObservation = {
+  false, false, true, RANGE_NO_READING_MM,
+  SENSOR_RANGE_STATUS_UNKNOWN, 0.0f, 0.0f, 0, 0
 };
 
 FrontMatrixFrame frontMatrixFrame = {};

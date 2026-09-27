@@ -1,9 +1,8 @@
 #include "../../Robot.h"
 #include "FrontMatrixPolicy.h"
 
-// Front SEN0628 I/O remains in this historical file path so the Arduino build
-// and existing project structure stay stable. All public names and runtime
-// ownership are front-matrix-specific.
+// Front SEN0628 I/O driver: connection, frame polling, and the
+// column-clearance/weight-perception rays consumed by the planner.
 namespace {
 
 const uint8_t FRONT_MATRIX_COMMAND_SET_MODE = 1;

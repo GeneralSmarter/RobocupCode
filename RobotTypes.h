@@ -100,6 +100,37 @@ struct RearTofState {
   unsigned long invalidCount;
 };
 
+struct PayloadTofConfig {
+  const char* name;
+  SensorMountPose mount;
+  SensorI2cBus bus;
+  byte xshutChannel;
+  uint8_t i2cAddress;
+  uint32_t timingBudgetUs;
+  unsigned long samplePeriodMs;
+  uint16_t validMinimumMm;
+  uint16_t validMaximumMm;
+  uint16_t confirmationMaximumMm;
+};
+
+struct PayloadTofObservation {
+  bool connected;
+  bool valid;
+  bool stale;
+  uint16_t distanceMm;
+  uint8_t rangeStatus;
+  float signalMcps;
+  float ambientMcps;
+  uint32_t sequence;
+  unsigned long acquiredMs;
+};
+
+enum PayloadEvidenceState {
+  PAYLOAD_UNKNOWN,
+  PAYLOAD_CAPTURE_ENTRY_SEEN,
+  PAYLOAD_PRESENT_UNCLASSIFIED
+};
+
 struct FrontMatrixConfig {
   const char* name;
   SensorMountPose mount;
@@ -212,7 +243,6 @@ struct FrontMatrixFrame {
 enum MatrixEvidenceKind {
   MATRIX_EVIDENCE_NONE,
   MATRIX_EVIDENCE_WEIGHT_CANDIDATE,
-  MATRIX_EVIDENCE_RAMP_LIKE,
   MATRIX_EVIDENCE_WALL_LIKE,
   MATRIX_EVIDENCE_DYNAMIC_LOW_OBJECT,
   MATRIX_EVIDENCE_MIXED_OR_OCCLUDED,
@@ -259,7 +289,9 @@ enum PickupTrackingPhase {
   PICKUP_TRACKING_HANDOFF_ASSUMED,
   PICKUP_TRACKING_FEEDING_UNCONFIRMED,
   PICKUP_TRACKING_FEED_COMPLETE_UNCONFIRMED,
-  PICKUP_TRACKING_FAILED
+  PICKUP_TRACKING_FAILED,
+  // Appended to preserve the numeric values used by saved simulator traces.
+  PICKUP_TRACKING_FEED_COMPLETE_CONFIRMED
 };
 
 enum PickupTrackingOutcome {
@@ -271,7 +303,9 @@ enum PickupTrackingOutcome {
   PICKUP_OUTCOME_FINAL_APPROACH_ESTIMATE_EXPIRED,
   PICKUP_OUTCOME_INACCESSIBLE_TARGET,
   PICKUP_OUTCOME_FEED_INTERRUPTED,
-  PICKUP_OUTCOME_NAVIGATION_FAILED
+  PICKUP_OUTCOME_NAVIGATION_FAILED,
+  // Appended to preserve the numeric values used by saved simulator traces.
+  PICKUP_OUTCOME_FEED_COMPLETE_CONFIRMED
 };
 
 struct PickupTrackingStatus {
@@ -282,6 +316,8 @@ struct PickupTrackingStatus {
   float columnError;
   float remainingFeedMm;
   bool usingPredictedGap;
+  uint32_t captureAttemptId;
+  PayloadEvidenceState payloadEvidence;
   const char* detail;
 };
 
@@ -372,6 +408,12 @@ struct PlannerDebugSnapshot {
   float obstacleMaxLateralM;
   float obstacleGoalX;
   float obstacleGoalY;
+  // Reject-reason counts from the most recently closed reverse-recovery
+  // epoch. Diagnoses *why* reverse recovery cannot find a candidate, which
+  // the STATUS/CSV stream does not otherwise expose.
+  int reverseRejectedRear;
+  int reverseRejectedFootprint;
+  int reverseRejectedEvidence;
 };
 
 struct PlannerTelemetry {

@@ -26,7 +26,10 @@ PlannerDebugSnapshot getPlannerDebugSnapshot() {
     plannerContext.obstacleContext.minLateralM,
     plannerContext.obstacleContext.maxLateralM,
     obstacleGoalX,
-    obstacleGoalY
+    obstacleGoalY,
+    plannerContext.reversePlannerEpoch.rejectedRear,
+    plannerContext.reversePlannerEpoch.rejectedFootprint,
+    plannerContext.reversePlannerEpoch.rejectedEvidence
   };
   return snapshot;
 }

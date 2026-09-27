@@ -294,6 +294,7 @@ void connectTOFSensors() {
     io.digitalWrite(fanXshutPins[i], LOW);
   }
   prepareRearTofPinsForStartup();
+  preparePayloadTofPinForStartup();
 
   delay(100);
 
@@ -301,6 +302,7 @@ void connectTOFSensors() {
   connectRightInnerTOF();
   connectLeftInnerTOF();
   connectLeftOuterTOF();
+  connectPayloadTofSensor();
   connectRearTofArray();
   connectFrontMatrixSensor();
 }
@@ -409,6 +411,7 @@ void updateFanTOFSensors() {
   updateL0XFanSensor(RANGE_LEFT_INNER, leftInnerTOF);
   updateL0XFanSensor(RANGE_LEFT_OUTER, leftOuterTOF);
   updateRearTofArray();
+  updatePayloadTofSensor();
   updateFrontMatrixSensor();
   updateFrontBlockState();
 }

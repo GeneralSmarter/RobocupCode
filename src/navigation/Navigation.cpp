@@ -4,7 +4,6 @@
 #include "../../NavigationAdmin.h"
 #include "../../NavigationTest.h"
 #include "ForwardTrajectoryPlanner.h"
-#include "NavigationControllerInternal.h"
 #include "NavigationInternal.h"
 #include "ObstacleContext.h"
 #include "PlannerContext.h"
@@ -29,10 +28,12 @@ NavigationGoal navigationGoal = {
 
 PickupTrackingRuntime pickupTrackingRuntime = {
   {PICKUP_TRACKING_IDLE, PICKUP_OUTCOME_NONE, 0, 0.0f, 0.0f, 0.0f,
-   false, "idle"},
+   false, 0, PAYLOAD_UNKNOWN, "idle"},
   {}, {}, false, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
-  0.0f, 0.0f, 0.0f, 0
+  0.0f, 0.0f, 0.0f, 0, 0, 0, false
 };
+
+static uint32_t nextCaptureAttemptId = 1;
 
 static const char* ownerEventName(NavigationGoalOwner owner, bool success) {
   switch (owner) {
@@ -67,7 +68,6 @@ void finishNavigationGoal(bool success, PlannerStopReason reason,
   plannerContext.frontInvalidSinceMs = 0;
   plannerContext.reverseRecoveryRejectsReported = false;
   resetObstacleContext(success ? "goal_complete" : "goal_abort");
-  motorStopRequested = true;
   requestMotionStop();
   navigationGoal.active = false;
   navigationGoal.authority = MOTION_AUTHORITY_NONE;
@@ -91,6 +91,117 @@ void finishNavigationGoal(bool success, PlannerStopReason reason,
 
 }
 
+// Per-goal telemetry reset.
+//
+// Deliberately field-by-field rather than `plannerTelemetry = {}`: the string
+// members are static literals printed directly by STATUS/CSV, and zeroing them
+// would leave null pointers for Serial2.print(). Every field below is per-goal
+// state; the planner timing counters are owned by resetPlannerEpoch(), which
+// both goal kinds call.
+static void resetGoalTelemetry(const char* reason) {
+  plannerTelemetry.selectedForwardTicksPerSec = 0.0f;
+  plannerTelemetry.selectedTurnTicksPerSec = 0.0f;
+  plannerTelemetry.selectedCurvature = 0.0f;
+  // -1 is the "not yet measured" sentinel, not a clearance of zero.
+  plannerTelemetry.minimumSweptClearanceMm = -1.0f;
+  plannerTelemetry.speedCapTicksPerSec = 0.0f;
+  plannerTelemetry.globalGoalDistanceM = 0.0f;
+  plannerTelemetry.localGoalDistanceM = 0.0f;
+  plannerTelemetry.routeAlongProgressM = 0.0f;
+  plannerTelemetry.routeSignedLateralErrorM = 0.0f;
+  plannerTelemetry.obstacleProgressAgeS = 0.0f;
+  plannerTelemetry.cumulativeReverseDistanceM = 0.0f;
+  plannerTelemetry.obstacleBestProgressM = 0.0f;
+  plannerTelemetry.recoveryCurrentClearanceM = 0.0f;
+  plannerTelemetry.recoveryEndpointClearanceM = 0.0f;
+  plannerTelemetry.recoveryClearanceGainM = 0.0f;
+  plannerTelemetry.recoveryUnexploredScore = 0.0f;
+  plannerTelemetry.recoveryCount = 0;
+  plannerTelemetry.recoveryPlateauCount = 0;
+  plannerTelemetry.reverseRecoveryActive = false;
+  plannerTelemetry.candidateCount = 0;
+  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
+  plannerTelemetry.planReason = reason;
+  plannerTelemetry.replanReason = reason;
+  plannerTelemetry.safeStopReason = "";
+}
+
+// Per-goal planner state reset. Covers both goal kinds: point-alignment and
+// turn-brake state are only read by their own goal type, so clearing both is
+// safe and stops one goal kind inheriting the other's latches.
+static void resetGoalPlannerState() {
+  plannerContext.lastReportedStopReason = PLANNER_STOP_NONE;
+  plannerContext.lastPlannerCommandPublishedMs = 0;
+  plannerContext.reverseRecoveryActive = false;
+  plannerContext.reverseRecoveryState = {};
+  plannerContext.reverseRecoveryStepCount = 0;
+  plannerContext.reverseRecoveryRejectsReported = false;
+  plannerContext.candidateRejectsReported = false;
+  plannerContext.emergencyRecoveryState = {};
+  plannerContext.pointAlignTurnActive = false;
+  plannerContext.pointAlignTurnDirection = 0.0f;
+  plannerContext.turnBrakeActive = false;
+  plannerContext.turnBrakeUntilMs = 0;
+  plannerContext.frontInvalidSinceMs = 0;
+  plannerContext.turnSideInvalidSinceMs = 0;
+  plannerContext.turnSweepInvalidSinceMs = 0;
+  resetRecoveryBudget();
+  resetGeometricNoPathEvidence();
+}
+
+// Shared entry for every goal kind: authority guard, goal construction, and the
+// full per-goal reset. Callers set only the fields that differ (targets, and
+// the turn's initial command direction) and then publish the start event.
+//
+// This replaced two hand-maintained reset lists that had drifted apart — a turn
+// goal used to inherit the previous point goal's stop reason, candidate count
+// and recovery counters, and a point goal used to inherit a turn's brake state.
+static bool acquireNavigationGoal(NavigationGoalMode mode,
+                                  NavigationGoalOwner owner,
+                                  const char* reason,
+                                  const char* obstacleReason) {
+  if (motionAuthority != MOTION_AUTHORITY_MISSION &&
+      motionAuthority != MOTION_AUTHORITY_TEST) {
+    stopMotors();
+    plannerTelemetry.stopReason = PLANNER_STOP_ABORTED;
+    plannerTelemetry.safeStopReason = "no_motion_authority";
+    return false;
+  }
+  if (navigationGoal.active) {
+    return false;
+  }
+
+  resetPlannerEpoch();
+  resetReversePlannerEpoch();
+
+  navigationGoal.mode = mode;
+  navigationGoal.owner = owner;
+  navigationGoal.authority = motionAuthority;
+  navigationGoal.active = true;
+  navigationGoal.completed = false;
+  navigationGoal.failed = false;
+  navigationGoal.startX = robotX;
+  navigationGoal.startY = robotY;
+  navigationGoal.startYawDeg = navigationHeadingDeg();
+  navigationGoal.startedMs = millis();
+
+  // Keep cumulative encoder totals intact, but reset the control snapshots so
+  // a previous motion segment cannot create a derivative/PID kick here.
+  resetEncodersAndPID();
+  // Force a plan on the next controller pass rather than waiting for the old
+  // goal's 40 ms schedule phase.
+  lastPlannerUpdateMs = 0;
+  requestMotionStop();
+
+  resetGoalTelemetry(reason);
+  resetGoalPlannerState();
+  resetTurnStuckCheck(navigationGoal.startYawDeg);
+  resetObstacleContext(obstacleReason);
+  // Must follow requestMotionStop(), which sets the flag on the way to neutral.
+  motorStopRequested = false;
+  return true;
+}
+
 bool startNavigationPoint(float targetX, float targetY,
                           NavigationGoalOwner owner) {
   // Creates a world-frame point goal in metres.
@@ -102,87 +213,19 @@ bool startNavigationPoint(float targetX, float targetY,
   // Global effects:
   //   Resets planner epochs, recovery state, PID/encoder snapshots, goal
   //   telemetry, and schedules an immediate planner update.
-  if (motionAuthority != MOTION_AUTHORITY_MISSION &&
-      motionAuthority != MOTION_AUTHORITY_TEST) {
-    stopMotors();
-    plannerTelemetry.stopReason = PLANNER_STOP_ABORTED;
-    plannerTelemetry.safeStopReason = "no_motion_authority";
-    return false;
-  }
-  if (navigationGoal.active) {
-    return false;
-  }
+  //
   // A point goal does not mean "drive this exact line". It means repeatedly
   // choose a short safe arc that makes progress toward this world coordinate.
-  navigationGoal.mode = NAV_GOAL_POINT;
-  resetPlannerEpoch();
-  resetReversePlannerEpoch();
-  plannerContext.lastPlannerCommandPublishedMs = 0;
-  navigationGoal.owner = owner;
-  navigationGoal.authority = motionAuthority;
-  navigationGoal.active = true;
-  navigationGoal.completed = false;
-  navigationGoal.failed = false;
+  if (!acquireNavigationGoal(NAV_GOAL_POINT, owner, "goal_started",
+                             "point_goal_start")) {
+    return false;
+  }
   navigationGoal.targetX = targetX;
   navigationGoal.targetY = targetY;
-  navigationGoal.targetYawDeg = 0.0;
-  navigationGoal.startX = robotX;
-  navigationGoal.startY = robotY;
-  navigationGoal.startYawDeg = navigationHeadingDeg();
-  navigationGoal.startedMs = millis();
-  // Keep cumulative encoder totals intact, but reset the control snapshots so
-  // a previous motion segment cannot create a derivative/PID kick here.
-  resetEncodersAndPID();
-  // Force a plan on the next controller pass rather than waiting for the old
-  // goal's 40 ms schedule phase.
-  lastPlannerUpdateMs = 0;
-  motorStopRequested = true;
-  requestMotionStop();
-  // Telemetry is reset with the goal. Without this, a previous turn command
-  // can make the first point-goal CSV row look like it is steering.
-  plannerTelemetry.selectedForwardTicksPerSec = 0.0;
-  plannerTelemetry.selectedTurnTicksPerSec = 0.0;
-  plannerTelemetry.selectedCurvature = 0.0;
-  plannerTelemetry.minimumSweptClearanceMm = -1.0;
-  plannerTelemetry.speedCapTicksPerSec = 0.0;
+  navigationGoal.targetYawDeg = 0.0f;
   plannerTelemetry.globalGoalDistanceM =
     sqrtf((targetX - robotX) * (targetX - robotX) +
           (targetY - robotY) * (targetY - robotY));
-  plannerTelemetry.localGoalDistanceM = 0.0;
-  plannerTelemetry.routeAlongProgressM = 0.0;
-  plannerTelemetry.routeSignedLateralErrorM = 0.0;
-  plannerTelemetry.obstacleProgressAgeS = 0.0;
-  plannerTelemetry.cumulativeReverseDistanceM = 0.0;
-  plannerTelemetry.obstacleBestProgressM = 0.0;
-  plannerTelemetry.recoveryCurrentClearanceM = 0.0f;
-  plannerTelemetry.recoveryEndpointClearanceM = 0.0f;
-  plannerTelemetry.recoveryClearanceGainM = 0.0f;
-  plannerTelemetry.recoveryUnexploredScore = 0.0f;
-  plannerTelemetry.recoveryCount = 0;
-  plannerTelemetry.recoveryPlateauCount = 0;
-  plannerTelemetry.reverseRecoveryActive = false;
-  plannerTelemetry.candidateCount = 0;
-  plannerTelemetry.stopReason = PLANNER_STOP_NONE;
-  plannerTelemetry.planReason = "goal_started";
-  plannerContext.lastReportedStopReason = PLANNER_STOP_NONE;
-  plannerContext.reverseRecoveryActive = false;
-  plannerContext.reverseRecoveryState = {};
-  resetRecoveryBudget();
-  plannerContext.emergencyRecoveryState = {};
-  plannerContext.reverseRecoveryStepCount = 0;
-  resetGeometricNoPathEvidence();
-  plannerContext.candidateRejectsReported = false;
-  plannerContext.reverseRecoveryRejectsReported = false;
-  resetObstacleContext("point_goal_start");
-  motorStopRequested = false;
-  plannerTelemetry.replanReason = "goal_started";
-  plannerTelemetry.safeStopReason = "";
-  resetTurnStuckCheck(navigationHeadingDeg());
-  plannerContext.pointAlignTurnActive = false;
-  plannerContext.pointAlignTurnDirection = 0.0;
-  plannerContext.frontInvalidSinceMs = 0;
-  plannerContext.turnSideInvalidSinceMs = 0;
-  plannerContext.turnSweepInvalidSinceMs = 0;
   sendBluetoothEvent("navigation_goal_start", "point");
   return true;
 }
@@ -197,53 +240,18 @@ bool startNavigationTurn(float relativeTurnDeg, NavigationGoalOwner owner) {
   // Safety:
   //   updateTurnGoal() validates turn-side and full sweep sensing before each
   //   command and MotorControl.cpp checks again at output time.
-  if (motionAuthority != MOTION_AUTHORITY_MISSION &&
-      motionAuthority != MOTION_AUTHORITY_TEST) {
-    stopMotors();
-    plannerTelemetry.stopReason = PLANNER_STOP_ABORTED;
-    plannerTelemetry.safeStopReason = "no_motion_authority";
-    return false;
-  }
-  if (navigationGoal.active) {
-    return false;
-  }
+  //
   // Turns are their own direct yaw-feedback task. They do not use the map arc
   // sampler because they are intentionally in-place and run at 20 ms.
-  float startYawDeg = navigationHeadingDeg();
-  resetPlannerEpoch();
-  resetReversePlannerEpoch();
-  plannerContext.lastPlannerCommandPublishedMs = 0;
-  navigationGoal.mode = NAV_GOAL_TURN;
-  navigationGoal.owner = owner;
-  navigationGoal.authority = motionAuthority;
-  navigationGoal.active = true;
-  navigationGoal.completed = false;
-  navigationGoal.failed = false;
+  if (!acquireNavigationGoal(NAV_GOAL_TURN, owner, "turn_started",
+                             "turn_goal_start")) {
+    return false;
+  }
   navigationGoal.targetX = robotX;
   navigationGoal.targetY = robotY;
-  navigationGoal.targetYawDeg = wrapAngle(startYawDeg + relativeTurnDeg);
-  navigationGoal.startX = robotX;
-  navigationGoal.startY = robotY;
-  navigationGoal.startYawDeg = startYawDeg;
-  navigationGoal.startedMs = millis();
-  resetEncodersAndPID();
-  lastPlannerUpdateMs = 0;
-  resetTurnStuckCheck(startYawDeg);
-  plannerContext.turnBrakeActive = false;
-  plannerContext.turnBrakeUntilMs = 0;
-  plannerContext.turnLastCommandDirection = relativeTurnDeg >= 0.0 ? 1.0 : -1.0;
-  plannerContext.turnSideInvalidSinceMs = 0;
-  plannerContext.turnSweepInvalidSinceMs = 0;
-  plannerContext.reverseRecoveryActive = false;
-  plannerContext.reverseRecoveryState = {};
-  resetGeometricNoPathEvidence();
-  plannerContext.reverseRecoveryRejectsReported = false;
-  motorStopRequested = true;
-  requestMotionStop();
-  resetObstacleContext("turn_goal_start");
-  motorStopRequested = false;
-  plannerTelemetry.replanReason = "turn_started";
-  plannerTelemetry.safeStopReason = "";
+  navigationGoal.targetYawDeg =
+    wrapAngle(navigationGoal.startYawDeg + relativeTurnDeg);
+  plannerContext.turnLastCommandDirection = relativeTurnDeg >= 0.0f ? 1.0f : -1.0f;
   sendBluetoothEvent("navigation_goal_start", "turn");
   return true;
 }
@@ -256,7 +264,6 @@ void cancelNavigationGoal(PlannerStopReason reason, const char* detail) {
     navigationGoal.authority = MOTION_AUTHORITY_NONE;
     plannerTelemetry.stopReason = reason;
     plannerTelemetry.safeStopReason = detail;
-    motorStopRequested = true;
     requestMotionStop();
     return;
   }
@@ -311,14 +318,19 @@ bool navigationStartPickupTracking(const MatrixTargetObservation &target,
     0.0f,
     robotX, robotY, navigationHeadingDeg(), millis()
   };
+  PayloadTofObservation payloadSnapshot;
+  getPayloadTofObservation(payloadSnapshot);
+  const uint32_t captureAttemptId = nextCaptureAttemptId++;
+  if (nextCaptureAttemptId == 0) nextCaptureAttemptId = 1;
   pickupTrackingRuntime = {
     {PICKUP_TRACKING_FULL_SPEED, PICKUP_OUTCOME_RUNNING, target.trackId,
      target.directGapMm, target.columnError,
-     PICKUP_MIN_FORWARD_FEED_DISTANCE_MM, false, "tracking"},
+     PICKUP_MIN_FORWARD_FEED_DISTANCE_MM, false, captureAttemptId,
+     PAYLOAD_UNKNOWN, "tracking"},
     target, resume, false, target.directGapMm,
     target.worldX, target.worldY,
     0.0f, 0.0f, 0.0f, robotX, robotY,
-    navigationHeadingDeg(), millis()
+    navigationHeadingDeg(), millis(), payloadSnapshot.sequence, 0, false
   };
   setMatrixPickupTrackId(target.trackId);
   resetEncodersAndPID();
@@ -327,7 +339,6 @@ bool navigationStartPickupTracking(const MatrixTargetObservation &target,
   plannerTelemetry.planReason = "pickup_tracking_start";
   plannerTelemetry.replanReason = "pickup_tracking_start";
   plannerTelemetry.safeStopReason = "";
-  motorStopRequested = true;
   requestMotionStop();
   motorStopRequested = false;
   sendBluetoothEvent("pickup_tracking_start", "latched_static_track");

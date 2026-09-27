@@ -1,7 +1,7 @@
 ﻿#include "../../Robot.h"
 #include "NavigationInternal.h"
+#include "PlannerEpochLifecycle.h"
 #include "ForwardTrajectoryPlanner.h"
-#include "NavigationControllerInternal.h"
 #include "ObstacleContext.h"
 #include "PlannerCollision.h"
 #include "PlannerContext.h"
@@ -96,7 +96,6 @@ static bool tryBeginEmergencyRecovery(PlannerStopReason reason,
   }
   plannerContext.emergencyRecoveryState.rearFrameBaseline =
     getRearObstacleFrameSequence();
-  motorStopRequested = true;
   requestMotionStop();
   plannerTelemetry.reverseRecoveryActive = false;
   plannerTelemetry.stopReason = PLANNER_STOP_NONE;
@@ -351,25 +350,12 @@ static void captureReversePlannerEpochView(ReversePlannerEpoch &epoch) {
 }
 
 static void recordReversePlannerSlice(unsigned long sliceStartedUs) {
-  unsigned long sliceUs = micros() - sliceStartedUs;
-  plannerContext.reversePlannerEpoch.accumulatedWorkUs += sliceUs;
-  plannerTelemetry.plannerSliceUs = sliceUs;
-  plannerTelemetry.plannerSliceMaxUs =
-    max(plannerTelemetry.plannerSliceMaxUs, sliceUs);
-  plannerTelemetry.plannerEpochWorkUs =
-    plannerContext.reversePlannerEpoch.accumulatedWorkUs;
-  plannerTelemetry.plannerEpochMaxWorkUs =
-    max(plannerTelemetry.plannerEpochMaxWorkUs,
-        plannerContext.reversePlannerEpoch.accumulatedWorkUs);
-  recordMainLoopPhaseDuration("reverse_planner_slice", sliceStartedUs);
+  recordPlannerEpochSlice(plannerContext.reversePlannerEpoch, sliceStartedUs,
+                          "reverse_planner_slice");
 }
 
 static void closeReversePlannerEpoch() {
-  plannerContext.reversePlannerEpoch.active = false;
-  plannerContext.reversePlannerEpoch.awaitingRevalidation = false;
-  plannerTelemetry.plannerEpochActive = false;
-  plannerTelemetry.plannerEpochAgeMs =
-    millis() - plannerContext.reversePlannerEpoch.startedMs;
+  closePlannerEpochState(plannerContext.reversePlannerEpoch);
 }
 
 static TrajectoryPlanResult retryReversePlannerEpoch(const char* safeReason,
@@ -385,16 +371,9 @@ static TrajectoryPlanResult retryReversePlannerEpoch(const char* safeReason,
 static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
   // Captures the snapshot used to evaluate reverse recovery arcs. In the
   // simulator, rear evidence comes from the field-raycast rear channel.
-  memset(&plannerContext.reversePlannerEpoch, 0, sizeof(plannerContext.reversePlannerEpoch));
-  plannerContext.reversePlannerEpoch.active = true;
-  plannerContext.reversePlannerEpoch.startedMs = millis();
-  plannerContext.reversePlannerEpoch.goalStartedMs = navigationGoal.startedMs;
-  plannerContext.reversePlannerEpoch.authority = navigationGoal.authority;
+  beginPlannerEpochState(plannerContext.reversePlannerEpoch, goalX, goalY);
   plannerContext.reversePlannerEpoch.emergencyScanObjective =
     plannerContext.emergencyRecoveryState.phase == EMERGENCY_RECOVERY_RELOCATE;
-  plannerContext.reversePlannerEpoch.goalX = goalX;
-  plannerContext.reversePlannerEpoch.goalY = goalY;
-  plannerContext.reversePlannerEpoch.bestScore = -1000000.0f;
   plannerContext.reversePlannerEpoch.bestClearanceBand = -1;
   plannerContext.reversePlannerEpoch.previousSelectedTurn =
     plannerTelemetry.selectedTurnTicksPerSec;
@@ -407,12 +386,7 @@ static TrajectoryPlanResult beginReversePlannerEpoch(float goalX, float goalY) {
       (goalX - plannerContext.reversePlannerEpoch.startX) +
     (goalY - plannerContext.reversePlannerEpoch.startY) *
       (goalY - plannerContext.reversePlannerEpoch.startY));
-  plannerTelemetry.candidateCount = 0;
-  plannerTelemetry.plannerCandidatesProcessed = 0;
-  plannerTelemetry.plannerYieldCount = 0;
-  plannerTelemetry.plannerEpochWorkUs = 0;
-  plannerTelemetry.plannerEpochAgeMs = 0;
-  plannerTelemetry.plannerEpochActive = true;
+  resetPlannerEpochTelemetry();
   if (plannerContext.reversePlannerEpoch.speedCap <
       PLANNER_REVERSE_RECOVERY_MIN_SPEED_TPS) {
     plannerTelemetry.stopReason = PLANNER_STOP_NO_SAFE_TRAJECTORY;
@@ -441,29 +415,13 @@ TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
     }
     return beginResult;
   }
-  if (plannerContext.reversePlannerEpoch.goalStartedMs != navigationGoal.startedMs ||
-      plannerContext.reversePlannerEpoch.authority != navigationGoal.authority) {
+  if (plannerEpochOwnerChanged(plannerContext.reversePlannerEpoch)) {
     resetReversePlannerEpoch();
     return TRAJECTORY_PLAN_ABORTED;
   }
 
-  unsigned long now = millis();
-  plannerTelemetry.plannerEpochAgeMs =
-    now - plannerContext.reversePlannerEpoch.startedMs;
-  plannerTelemetry.plannerCommandAgeMs = plannerContext.lastPlannerCommandPublishedMs == 0
-    ? 0 : now - plannerContext.lastPlannerCommandPublishedMs;
-  if (!plannerContext.reversePlannerEpoch.commandStoppedForAge &&
-      isMotorCommandLeaseArmed() &&
-      plannerTelemetry.plannerCommandAgeMs >= PLANNER_COMMAND_MAX_AGE_MS) {
-    stopMotors();
-    plannerContext.reversePlannerEpoch.commandStoppedForAge = true;
-    plannerTelemetry.safeStopReason = "planner_command_age_guard";
-  }
-  if (now - plannerContext.reversePlannerEpoch.startedMs > PLANNER_EPOCH_MAX_AGE_MS) {
-    stopMotors();
-    closeReversePlannerEpoch();
-    finishNavigationGoal(false, PLANNER_STOP_ABORTED,
-                         "reverse_planner_epoch_timeout");
+  if (servicePlannerEpochAgeGuards(plannerContext.reversePlannerEpoch,
+                                   "reverse_planner_epoch_timeout")) {
     return TRAJECTORY_PLAN_ABORTED;
   }
 
@@ -473,9 +431,7 @@ TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
     unsigned long sliceStartedUs = micros();
     uint8_t processedThisSlice = 0;
     while (plannerContext.reversePlannerEpoch.candidateIndex < totalCandidates) {
-      if (processedThisSlice > 0 &&
-          (processedThisSlice >= PLANNER_MAX_CANDIDATES_PER_SLICE ||
-           micros() - sliceStartedUs >= PLANNER_SLICE_BUDGET_US)) {
+      if (plannerSliceBudgetReached(processedThisSlice, sliceStartedUs)) {
         break;
       }
       int candidateIndex = plannerContext.reversePlannerEpoch.candidateIndex++;
@@ -571,7 +527,19 @@ TrajectoryPlanResult selectReverseRecoveryTrajectory(float goalX,
   unsigned long sliceStartedUs = micros();
   if (plannerContext.reversePlannerEpoch.acceptedCount == 0) {
     recordReversePlannerSlice(sliceStartedUs);
+    // Retrying is only justified while the unknown-allowance ramp is still
+    // opening up: a stationary robot's rear evidence converges within that
+    // window, so once the ramp is complete another identical epoch cannot
+    // succeed. Without this bound the retry never terminates, and the recovery
+    // state machine cannot reach its escalation path (which needs NO_PATH) —
+    // the goal instead idles until the whole reverse-recovery time budget
+    // expires and reports a misleading "recovery_time".
+    const bool unknownAllowanceStillRamping =
+      plannerContext.reverseRecoveryStartedMs != 0 &&
+      millis() - plannerContext.reverseRecoveryStartedMs <
+        PLANNER_REVERSE_UNKNOWN_RAMP_MS;
     const bool waitingForEvidence =
+      unknownAllowanceStillRamping &&
       plannerContext.reversePlannerEpoch.rejectedEvidence > 0 &&
       plannerContext.reversePlannerEpoch.rearValid &&
       !plannerContext.reversePlannerEpoch.rearBlocked;
@@ -717,7 +685,6 @@ static bool emergencySensorsAdvancedSinceBaseline() {
 }
 
 static void abortEmergencyRecovery(const char* detail) {
-  motorStopRequested = true;
   requestMotionStop();
   sendBluetoothEvent("emergency_scan_abort", detail);
   finishNavigationGoal(false, PLANNER_STOP_EMERGENCY_SCAN_ABORTED, detail);
@@ -754,7 +721,6 @@ static void startEmergencyScanAtCurrentPose() {
 }
 
 static void enterEmergencyRelocation(const char* detail) {
-  motorStopRequested = true;
   requestMotionStop();
   resetReversePlannerEpoch();
   if (plannerContext.emergencyRecoveryState.relocationStartedMs == 0) {
@@ -775,7 +741,6 @@ static void enterEmergencyRelocation(const char* detail) {
 }
 
 static void enterEmergencyScanUnwind(const char* detail) {
-  motorStopRequested = true;
   requestMotionStop();
   resetReversePlannerEpoch();
   plannerContext.emergencyRecoveryState.phase =
@@ -793,7 +758,6 @@ static void enterEmergencyScanUnwind(const char* detail) {
 
 static void enterEmergencySensorSettle(EmergencyRecoveryPhase phase,
                                        const char* planReason) {
-  motorStopRequested = true;
   requestMotionStop();
   resetReversePlannerEpoch();
   plannerContext.reverseRecoveryActive = false;
@@ -805,7 +769,6 @@ static void enterEmergencySensorSettle(EmergencyRecoveryPhase phase,
 }
 
 static void completeEmergencyScanAndPrepareRetry() {
-  motorStopRequested = true;
   requestMotionStop();
   plannerContext.reverseRecoveryActive = false;
   plannerContext.reverseRecoveryState = {};
@@ -849,7 +812,6 @@ void updateEmergencyRecovery() {
   }
 
   if (state.phase == EMERGENCY_RECOVERY_SETTLE_CURRENT) {
-    motorStopRequested = true;
     requestMotionStop();
     if (emergencySensorsAdvancedSinceBaseline()) {
       startEmergencyScanAtCurrentPose();
@@ -878,7 +840,6 @@ void updateEmergencyRecovery() {
     float remainingDeg = state.scanTargetAccumulatedDeg -
                          state.scanAccumulatedDeg;
     if (remainingDeg <= TURN_TOLERANCE_DEG) {
-      motorStopRequested = true;
       requestMotionStop();
       state.phase = EMERGENCY_RECOVERY_SCAN_DWELL;
       state.phaseStartedMs = now;
@@ -980,7 +941,6 @@ void updateEmergencyRecovery() {
   }
 
   if (state.phase == EMERGENCY_RECOVERY_SCAN_DWELL) {
-    motorStopRequested = true;
     requestMotionStop();
     if (emergencySensorsAdvancedSinceBaseline()) {
       state.scanSector++;
@@ -1062,7 +1022,6 @@ void updateEmergencyRecovery() {
   }
 
   if (state.phase == EMERGENCY_RECOVERY_SETTLE_RELOCATED) {
-    motorStopRequested = true;
     requestMotionStop();
     if (emergencySensorsAdvancedSinceBaseline()) {
       PlannerCollisionSnapshot snapshot;

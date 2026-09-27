@@ -13,6 +13,8 @@ Archived files:
 
 Current robot documentation lives one directory up:
 
+- `../../../HANDOFF.md`
+- `../README.md`
 - `../CURRENT_STATE_AND_NEXT_STEPS.md`
 - `../ROBOT_CODEBASE_AUDIT.md`
 - `../CODE_CLEANUP_AND_LOCAL_PLANNER_SPLIT.md`
